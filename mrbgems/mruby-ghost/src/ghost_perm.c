@@ -411,7 +411,10 @@ visit_class(mrb_state *mrb, ghost_perm *P, struct RClass *c, const char *path)
       enum mrb_vtype t = mrb_type(v);
       const char *ivname = mrb_sym_name(mrb, iv[i].sym);
       if ((t == MRB_TT_CLASS || t == MRB_TT_MODULE) && const_name_p(mrb, iv[i].sym)) {
-        if (strcmp(path, "Object") == 0) snprintf(buf, sizeof(buf), "%s", ivname);
+        /* prefer the class's own name (Integer, not its alias Fixnum) */
+        mrb_value cp = mrb_class_path(mrb, mrb_class_ptr(v));
+        if (mrb_string_p(cp)) snprintf(buf, sizeof(buf), "%.*s", (int)RSTRING_LEN(cp), RSTRING_PTR(cp));
+        else if (strcmp(path, "Object") == 0) snprintf(buf, sizeof(buf), "%s", ivname);
         else snprintf(buf, sizeof(buf), "%s::%s", path, ivname);
         visit_class(mrb, P, mrb_class_ptr(v), buf);
       }

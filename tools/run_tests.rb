@@ -9,7 +9,8 @@
 #               the same process (64 and 32)
 #   A->B        ghost run on A, then ghost resume alternating B, A, B ... while
 #               the program keeps hopping; the joined output must equal the
-#               reference. A->B is 64->64, 64->32, 32->64, 32->32.
+#               reference. A->B is 64->64, 64->32, 32->64, 32->32. Every image
+#               must also read cleanly with tools/ghost_inspect.rb.
 # Annotations in the sample (lines "# ghost-test: ..."):
 #   hop-after "LINE"  the first process's output must end with LINE
 #                     (the hop happened right there)
@@ -21,6 +22,7 @@ require 'tmpdir'
 require 'fileutils'
 
 ROOT = File.expand_path('..', __dir__)
+INSPECT = File.join(ROOT, 'tools/ghost_inspect.rb')
 GHOST = {
   '64' => File.join(ROOT, 'build/mruby/host/bin/ghost'),
   '32' => File.join(ROOT, 'build/mruby/host32/bin/ghost'),
@@ -107,17 +109,21 @@ samples.each do |path|
       errs = err.dup
       hops = 0
       archs = [b, a]
+      parsed = true
       while File.exist?(img) && hops < 20 && st == 0
+        # the image must also read cleanly with the reader written from the spec
+        parsed &&= `ruby #{INSPECT} #{img}`.lines.last&.chomp == 'end'
         FileUtils.mv(img, img + '.in')
         o, e, st = run(archs[hops % 2], 'resume', '--out', img, img + '.in', dir: dir)
         out << o
         errs << e
         hops += 1
       end
-      ok = hops > 0 && out == ref && st == 0 && errs.empty?
+      ok = hops > 0 && out == ref && st == 0 && errs.empty? && parsed
       ok &&= first.lines.last&.chomp == hop_after if hop_after
       check("#{a}->#{b} (#{hops} hop#{hops == 1 ? '' : 's'})", ok,
-            "#{errs}#{diff(ref, out)}\nfirst process ended with #{first.lines.last.inspect}")
+            "#{errs}#{diff(ref, out)}\nfirst process ended with #{first.lines.last.inspect}" \
+            "#{parsed ? '' : "\ntools/ghost_inspect.rb could not read an image"}")
     end
   end
 end
