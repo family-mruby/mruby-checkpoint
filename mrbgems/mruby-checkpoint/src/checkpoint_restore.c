@@ -1559,7 +1559,9 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
   /* the VM before the Hash entries: a key's #hash may run a closure whose
      variables live on the restored stack */
   if (!r.failed) r_vm(&r);
-  /* optional sections, each with its tag */
+  /* optional sections: a tag, the length of the contents, the contents.
+     A section this reader does not know is skipped by its length; a known
+     one must fill its length exactly. The end mark END0 has no length. */
   int has_gcs = 0, has_end = 0;
   gc_settings gcs;
   while (!r.failed && r.end - r.p >= 4) {
@@ -1568,12 +1570,20 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
       has_end = 1;
       break;
     }
-    else if (memcmp(r.p, "DBG0", 4) == 0) {
-      r.p += 4;
+    const uint8_t *tag = r.p;
+    r.p += 4;
+    uint32_t len = r_u32(&r);
+    if (r.failed) break;
+    if ((size_t)(r.end - r.p) < len) {
+      rfail(&r, "section %.4s: %u bytes of contents, only %d left", (const char*)tag, len, (int)(r.end - r.p));
+      break;
+    }
+    const uint8_t *all_end = r.end, *body_end = r.p + len;
+    r.end = body_end;
+    if (memcmp(tag, "DBG0", 4) == 0) {
       r_debug(&r);
     }
-    else if (memcmp(r.p, "GCS0", 4) == 0) {
-      r.p += 4;
+    else if (memcmp(tag, "GCS0", 4) == 0) {
       has_gcs = 1;
       gcs.flags = r_u8(&r);
       gcs.interval_ratio = r_u32(&r);
@@ -1582,7 +1592,14 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
       gcs.malloc_threshold = r_u64(&r);
       gcs.debt_limit = (int64_t)r_u64(&r);
     }
-    else break;
+    else {
+      r.p = body_end;          /* not ours: skipped */
+    }
+    if (!r.failed && r.p != body_end) {
+      rfail(&r, "section %.4s: %d bytes left inside its length", (const char*)tag, (int)(body_end - r.p));
+    }
+    if (r.failed) break;
+    r.end = all_end;
   }
   if (!r.failed && !has_end) rfail(&r, "truncated image (no end mark)");
   if (!r.failed && r.p != r.end) rfail(&r, "%d bytes left after the image", (int)(r.end - r.p));

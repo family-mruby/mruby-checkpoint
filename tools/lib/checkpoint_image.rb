@@ -719,6 +719,9 @@ module CheckpointImage
 
     # -- the optional sections (§13) --
 
+    # Each optional section: tag, u32 length of the contents, the contents.
+    # A known section must fill its length exactly; one this reader does not
+    # know is skipped by its length (kept as hex). END0 has no length.
     def sections
       r = @r
       loop do
@@ -726,35 +729,38 @@ module CheckpointImage
         at = r.pos
         r.fail!('no end mark END0: the image is cut short') if r.rest < 4
         tag = r.take(4)
-        case tag
-        when 'END0'
+        if tag == 'END0'
           r.where = 'END0'
           r.fail!("#{r.rest} bytes after the end mark END0") unless r.eof?
           return
-        when 'DBG0' then @doc['sections'] << dbg0(at)
-        when 'GCS0'
-          r.where = 'sections > GCS0'
-          fl = r.u8
-          @doc['sections'] << {
-            'tag' => 'GCS0', 'offset' => at,
-            'disabled' => fl & 1 == 1, 'generational' => fl & 2 == 2, 'step_per_allocation' => fl & 4 == 4,
-            'scheduler_steps' => fl & 8 == 8, 'interval_ratio' => r.u32, 'step_ratio' => r.u32,
-            'step_limit' => r.u64.to_s, 'malloc_threshold' => r.u64.to_s, 'debt_limit' => r.i64.to_s,
-          }
-        else
-          # A section this reader does not know: the format gives it no length,
-          # so everything up to the final END0 is taken as its contents (later
-          # sections, if any, are inside it). Readers that resume refuse it.
-          r.where = "sections > #{tag.inspect}"
-          r.fail!('an unknown section and no END0 at the end of the file') unless r.slice(r.size - 4, 4) == 'END0'
-          body = r.take(r.rest - 4)
-          @doc['sections'] << {
-            'tag' => tag.match?(/\A[\x20-\x7e]{4}\z/n) ? tag : tag.unpack1('H*'),
-            'unknown' => true, 'offset' => at, 'bytes' => body.bytesize,
-            'head_hex' => body.byteslice(0, 64).unpack1('H*'), 'tail_hex' => body.bytesize > 64 ? body.byteslice(-16, 16).unpack1('H*') : nil,
-          }
-          @doc['warnings'] << "unknown section #{tag.inspect} at byte #{at}: kept as hex up to the final END0"
         end
+        name = tag.match?(/\A[\x20-\x7e]{4}\z/n) ? tag : tag.unpack1('H*')
+        r.where = "sections > #{name}"
+        len_at = r.pos
+        len = r.u32
+        r.fail!("#{len} bytes of contents, only #{r.rest} left", len_at) if len > r.rest
+        body_end = r.pos + len
+        sec =
+          case tag
+          when 'DBG0' then dbg0(at)
+          when 'GCS0'
+            fl = r.u8
+            {
+              'tag' => 'GCS0', 'offset' => at,
+              'disabled' => fl & 1 == 1, 'generational' => fl & 2 == 2, 'step_per_allocation' => fl & 4 == 4,
+              'scheduler_steps' => fl & 8 == 8, 'interval_ratio' => r.u32, 'step_ratio' => r.u32,
+              'step_limit' => r.u64.to_s, 'malloc_threshold' => r.u64.to_s, 'debt_limit' => r.i64.to_s,
+            }
+          else
+            body = r.take(len)
+            @doc['warnings'] << "unknown section #{name.inspect} at byte #{at} (#{len} bytes): skipped, kept as hex"
+            { 'tag' => name, 'unknown' => true, 'offset' => at, 'head_hex' => body.byteslice(0, 64).unpack1('H*'),
+              'tail_hex' => len > 64 ? body.byteslice(-16, 16).unpack1('H*') : nil }
+          end
+        r.where = "sections > #{name}"
+        r.fail!("the contents end at byte #{r.pos}, not at #{body_end} as the length says", len_at) unless r.pos == body_end
+        sec['length'] = len
+        @doc['sections'] << sec
       end
     end
 

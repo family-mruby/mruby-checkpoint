@@ -153,7 +153,9 @@ module CheckpointDiff
 
   # the change table (§9): globals, constants and ivars of permanent
   # objects, methods defined or removed on them, by what they change
-  def change_map(doc)
+  def ref_of(v) = v.is_a?(Hash) ? v['ref'] : nil
+
+  def change_map(doc, refs = {})
     m = {}
     doc['changes'].each do |c|
       t = c['target'] && doc['objects'][c['target'] - 1]
@@ -174,18 +176,21 @@ module CheckpointDiff
         when 'contents' then ["#{tn}.contents", c['items'] ? "[#{c['items'].map { |v| ident(doc, v) }.join(', ')}]" : (c['pairs'] ? "{#{c['pairs'].map { |k, v| "#{ident(doc, k)} => #{ident(doc, v)}" }.join(', ')}}" : c['text'].inspect)]
         end
       m[key] = val
+      refs[key] = ref_of(c['value']) || (c['method'] && c['method']['proc'])
     end
     m
   end
 
   def variables(a, b)
-    ma = change_map(a)
-    mb = change_map(b)
+    ra = {}
+    rb = {}
+    ma = change_map(a, ra)
+    mb = change_map(b, rb)
     (ma.keys + mb.keys).uniq.filter_map do |k|
       next if ma[k] == mb[k]
       # a value that is the same object in both (same path) differs only in
       # its contents, which the objects part shows
-      { 'key' => k, 'a' => ma[k], 'b' => mb[k] }
+      { 'key' => k, 'a' => ma[k], 'b' => mb[k], 'a_ref' => ra[k], 'b_ref' => rb[k] }
     end
   end
 
@@ -202,7 +207,7 @@ module CheckpointDiff
       next { 'key' => k, 'change' => 'added', 'b' => y['id'], 'frames' => y['frames'].map { |f| { 'index' => f['index'], 'change' => 'called', 'b' => frame_text(f) } } } unless x
       next { 'key' => k, 'change' => 'removed', 'a' => x['id'], 'frames' => x['frames'].map { |f| { 'index' => f['index'], 'change' => 'returned', 'a' => frame_text(f) } } } unless y
       c = { 'key' => k, 'a' => x['id'], 'b' => y['id'], 'fields' => [] }
-      %w(state vmexec current).each do |fld|
+      %w(activity vmexec current).each do |fld|
         c['fields'] << { 'field' => fld, 'a' => x[fld].to_s, 'b' => y[fld].to_s } if x[fld] != y[fld]
       end
       pa = x['prev'] && ctx_key(a, x['prev'])
@@ -237,9 +242,11 @@ module CheckpointDiff
         va = la.key?(nm) ? ident(a, la[nm]) : nil
         vb = lb.key?(nm) ? ident(b, lb[nm]) : nil
         if va != vb
-          e['locals'] << { 'name' => nm, 'a' => la.key?(nm) ? shown(a, la[nm]) : nil, 'b' => lb.key?(nm) ? shown(b, lb[nm]) : nil }
+          e['locals'] << { 'name' => nm, 'a' => la.key?(nm) ? shown(a, la[nm]) : nil, 'b' => lb.key?(nm) ? shown(b, lb[nm]) : nil,
+                           'a_ref' => ref_of(la[nm]), 'b_ref' => ref_of(lb[nm]) }
         elsif !CheckpointImage.scalar?(la[nm]) && fields(a, a['objects'][la[nm]['ref'] - 1]) != fields(b, b['objects'][lb[nm]['ref'] - 1])
-          e['locals'] << { 'name' => nm, 'a' => shown(a, la[nm]), 'b' => shown(b, lb[nm]), 'contents_changed' => true }
+          e['locals'] << { 'name' => nm, 'a' => shown(a, la[nm]), 'b' => shown(b, lb[nm]), 'contents_changed' => true,
+                           'a_ref' => ref_of(la[nm]), 'b_ref' => ref_of(lb[nm]) }
         end
       end
       sa = ident(a, f['self'])
@@ -253,11 +260,22 @@ module CheckpointDiff
     out
   end
 
+  # the wait of a Task without numbers: the Task waited for by its key, the
+  # Queue by its path
   def wait_ident(doc, w)
     case w['reason']
+    when 'sleep' then { 'reason' => 'sleep', 'ticks_left' => w['ticks_left'] }
+    when 'join' then { 'reason' => 'join', 'task' => task_key(doc, w['task']) }
+    else { 'reason' => 'queue', 'queue' => oident(doc, w['queue']), 'ticks_left' => w['ticks_left'] }
+    end
+  end
+
+  def wait_text(w)
+    return w.to_s unless w.is_a?(Hash)
+    case w['reason']
     when 'sleep' then "sleep, #{w['ticks_left']} ticks left"
-    when 'join' then "join #{task_key(doc, w['task'])}"
-    else "Task::Queue #{oident(doc, w['queue'])}#{w['ticks_left'] ? ", #{w['ticks_left']} ticks left" : ''}"
+    when 'join' then "join #{w['task']}"
+    else "Task::Queue #{w['queue']}#{w['ticks_left'] ? ", #{w['ticks_left']} ticks left" : ''}"
     end
   end
 
@@ -265,7 +283,7 @@ module CheckpointDiff
     {
       'state' => t['state'], 'queue' => t['queue'] ? "#{t['queue']} ##{t['queue_index']}" : 'main',
       'priority' => t['priority'].to_s, 'timeslice' => t['timeslice'].to_s,
-      'wait' => t['wait'] ? wait_ident(doc, t['wait']) : '-',
+      'wait' => t['wait'] ? wait_ident(doc, t['wait']) : nil,
       'value' => t['value'] ? shown(doc, t['value']) : 'nil',
       'running' => t['running'].to_s, 'host' => t['host'].to_s,
     }
@@ -348,7 +366,8 @@ module CheckpointDiff
   def text(d)
     o = +"A: #{d['a']['file']} (#{d['a']['bytes']} bytes)\nB: #{d['b']['file']} (#{d['b']['bytes']} bytes)\n"
     return o << "no differences\n" if d['same']
-    fl = ->(list, ind) { list.each { |c| o << "#{ind}#{c['field']}: #{c['a'].nil? ? '(none)' : c['a']} -> #{c['b'].nil? ? '(none)' : c['b']}\n" } }
+    fv = ->(f, x) { x.nil? ? '(none)' : (f == 'wait' ? wait_text(x) : x) }
+    fl = ->(list, ind) { list.each { |c| o << "#{ind}#{c['field']}: #{fv.(c['field'], c['a'])} -> #{fv.(c['field'], c['b'])}\n" } }
     unless d['header'].empty?
       o << "header:\n"
       fl.(d['header'], '  ')

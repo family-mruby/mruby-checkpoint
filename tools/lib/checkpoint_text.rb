@@ -81,7 +81,7 @@ module CheckpointText
       when 'GCS0'
         o << "GC settings: #{sec.reject { |k, _| %w(tag offset).include?(k) }.map { |k, x| "#{k}=#{x}" }.join(' ')}\n"
       else
-        o << "unknown section #{sec['tag']} at byte #{sec['offset']}: #{sec['bytes']} bytes up to the final END0, " \
+        o << "unknown section #{sec['tag']} at byte #{sec['offset']}: #{sec['length']} bytes, skipped, " \
              "starting #{sec['head_hex']}\n"
       end
     end
@@ -185,14 +185,30 @@ module CheckpointText
 
   # ---- call stacks, per context, in the order of a backtrace ----
 
+  ACTIVITY = {
+    'current' => 'running: the image was written here',
+    'not_started' => 'not started',
+    'yielded' => 'stopped in Fiber.yield',
+    'resuming' => 'waits for the Fiber it resumed',
+    'transferring' => 'transferred to another Fiber',
+    'finished' => 'finished',
+    'scheduler' => 'runs the Task scheduler from a C function',
+    'no_frames' => 'no frames (the host runs the scheduler)',
+    'other' => 'other',
+  }.freeze
+
+  def activity_text(doc, c)
+    t = c['task'] && doc['scheduler']['tasks'][c['task'] - 1]
+    task = t && "Task #{t['state']}#{t['queue'] ? " (#{t['queue']} queue ##{t['queue_index']})" : ''}"
+    return task if c['activity'] == 'task'
+    [ACTIVITY[c['activity']], task].compact.join(', ')
+  end
+
   def context_title(doc, c)
     t = c['task'] && doc['scheduler']['tasks'][c['task'] - 1]
-    bits = []
-    bits << "Task #{t['state']}#{t['queue'] ? ", #{t['queue']} queue ##{t['queue_index']}" : ''}" if t
-    bits << "#{c['state']}"
+    bits = [activity_text(doc, c)]
     bits << "resumed by context #{c['prev']}" if c['prev']
-    bits << 'CURRENT' if c['current']
-    bits << 'running Task' if t && t['running']
+    bits << 'the running Task' if t && t['running']
     "context #{c['id']}: #{c['key']} (#{bits.join(', ')})"
   end
 
@@ -205,11 +221,18 @@ module CheckpointText
         next
       end
       c['frames'].reverse_each do |f|
+        if f['placeholder']
+          o << "  (frame #{f['index']}: a copy of frame 0 that stands in for the call of Fiber#resume; popped when it returns)\n"
+          next
+        end
         loc = f['location'] || "(no line)#{f['method'] ? ":in #{f['method']}" : ''}"
         note = f['kind'] == 'cfunc' ? "   [C function #{f['cfunc']}, waiting]" : ''
+        note += '   [not started: starts here]' if f['not_started']
         note += '   [not in a backtrace]' if f['location'].nil? && f['kind'] == 'ruby'
         o << "  #{loc}#{note}\n"
-        if f['method'] && !(f['self'].is_a?(Hash) && f['self']['ref'] && doc['objects'][f['self']['ref'] - 1]['name'] == 'T')
+        if f['self_register']
+          o << "      self = #{v(doc, f['self'])} (from the first resume; until then R0 holds #{v(doc, f['self_register'])})\n"
+        elsif f['method'] && !(f['self'].is_a?(Hash) && f['self']['ref'] && doc['objects'][f['self']['ref'] - 1]['name'] == 'T')
           o << "      self = #{v(doc, f['self'])}\n"
         end
         f['locals'].each do |l|
@@ -276,7 +299,7 @@ module CheckpointText
     o << "contexts:\n"
     doc['contexts'].each do |c|
       top = c['frames'].last
-      o << "  #{context_title(doc, c)}#{top ? " at #{top['location'] || '?'}" : ''}\n"
+      o << "  #{context_title(doc, c)}#{top ? " at #{top['location'] || '?'}#{top['not_started'] ? ' (not started)' : ''}" : ''}\n"
     end
     o
   end

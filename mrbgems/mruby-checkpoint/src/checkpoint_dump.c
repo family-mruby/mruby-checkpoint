@@ -1418,7 +1418,9 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     uint32_t ndbg = 0;
     for (uint32_t i = 1; i <= d.nirep; i++) ndbg += (uint32_t)w_debug_irep(&d, &dbg, i);
     if (ndbg > 0) {
+      /* every optional section: tag, length of the contents, contents */
       gb_bytes(mrb, out, "DBG0", 4);
+      gb_u32(mrb, out, (uint32_t)(4 + dbg.len));
       gb_u32(mrb, out, ndbg);
       gb_bytes(mrb, out, dbg.p, dbg.len);
     }
@@ -1426,6 +1428,7 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     /* the GC settings, when the program changed them */
     if (memcmp(&gcs, &d.P->gc, sizeof(gcs)) != 0) {
       gb_bytes(mrb, out, "GCS0", 4);
+      gb_u32(mrb, out, 1 + 4 + 4 + 8 + 8 + 8);
       gb_u8(mrb, out, gcs.flags);
       gb_u32(mrb, out, gcs.interval_ratio);
       gb_u32(mrb, out, gcs.step_ratio);

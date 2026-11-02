@@ -11,7 +11,9 @@
 #             one point is the writer's pointer width only
 # 2. stack    test/inspect/stack.rb: the stacks derived from the images are
 #             the backtraces mruby prints at those points (the running
-#             context, and the contexts that waited)
+#             context, and the contexts that waited); test/inspect/unstarted.rb:
+#             frames that have not started show where they will start, and
+#             each context says what it is doing
 # 3. diff     test/inspect/diff.rb, diff_task.rb: two saves of one program
 #             differ in what the program changed between them, and only that
 # 4. broken   images cut at every byte or with a byte changed: the reader
@@ -195,6 +197,34 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
   end
 end
 
+# frames that have not started (pc 0) and what each context is doing
+Dir.mktmpdir('checkpoint-inspect') do |dir|
+  FileUtils.cp(File.join(ROOT, 'test/inspect/unstarted.rb'), dir)
+  %w(64 32).product([false, true]).each do |arch, as_task|
+    shape = "unstarted.rb #{arch}#{as_task ? ' as a Task' : ''}"
+    _, err, st = run(VIRTUAL[arch], 'run', *(as_task ? ['--as-task'] : []), 'unstarted.rb', dir: dir)
+    check("#{shape}: runs", st == 0 && err.empty?, err)
+    doc = CheckpointImage.read_file(File.join(dir, 'unstarted.ckpt'))
+    task = ->(n) { doc['contexts'][doc['scheduler']['tasks'].find { |t| t['name_text'] == n }['context'] - 1] }
+    fib = doc['contexts'].find { |c| c['role'] == 'fiber' }
+    root = doc['contexts'][0]
+    fo = fib && fib['frames']
+    check("#{shape}: the unstarted Fiber's frame shows where it starts", fo && fo.size == 2 && fo[0]['not_started'] &&
+          fo[0]['location'] == 'unstarted.rb:13' && fo[0]['line'] == 13, fo&.map { |f| f['location'] }.inspect)
+    check("#{shape}: its second frame is the stand-in for Fiber#resume", fo && fo[1]['placeholder'] && !fo[0]['placeholder'])
+    main = doc['objects'].find { |o| o['name'] == 'T' }
+    check("#{shape}: its self is main (R0 still holds the Fiber object)", fo && fo[0]['self'] == { 'ref' => main['id'] } &&
+          doc['objects'][fo[0]['self_register']['ref'] - 1]['kind'] == 'fiber')
+    late = task.('late')
+    check("#{shape}: the unstarted Task's frame shows where it starts", late['frames'].size == 1 && late['frames'][0]['not_started'] &&
+          late['frames'][0]['location'] == 'unstarted.rb:23', late['frames'].map { |f| f['location'] }.inspect)
+    acts = [root['activity'], task.('cons')['activity'], late['activity'], fib['activity']]
+    want = [as_task ? 'no_frames' : 'scheduler', 'current', 'task', 'not_started']
+    check("#{shape}: what each context is doing #{want.inspect}", acts == want, acts.inspect)
+    check("#{shape}: no frame has a lost line (unknown:0)", doc['contexts'].all? { |c| c['frames'].none? { |f| f['location'] == '(unknown):0' } })
+  end
+end
+
 part_done
 
 # ---- 3. the diff of two saves ----
@@ -215,7 +245,11 @@ def summary(d)
       end
     end
   end
-  d['tasks'].each { |t| (t['fields'] || [["#{t['change']}"]]).each { |f| s << (f.is_a?(Hash) ? "task #{t['key']} #{f['field']}: #{f['a']} -> #{f['b']}" : "task #{t['key']} #{f[0]}") } }
+  d['tasks'].each do |t|
+    (t['fields'] || [[t['change']]]).each do |f|
+      s << (f.is_a?(Hash) ? "task #{t['key']} #{f['field']}: #{CheckpointDiff.wait_text(f['a'])} -> #{CheckpointDiff.wait_text(f['b'])}" : "task #{t['key']} #{f[0]}")
+    end
+  end
   d['scheduler'].each { |f| s << "scheduler #{f['field']}: #{f['a']} -> #{f['b']}" }
   ob = d['objects']
   ob['changed'].reject { |c| c['temporary'] }.each { |c| c['fields'].each { |f| s << "changed #{c['path']} #{f['field']}: #{f['a'] || '-'} -> #{f['b'] || '-'}" } }
@@ -330,10 +364,22 @@ end
 puts "  #{cut} cut images refused, #{flipped} changed images (#{read_ok} of them still well formed)"
 name, bytes = small[small.size / 2]
 body = bytes.byteslice(0, bytes.bytesize - 4)
-doc = CheckpointImage.read(body + 'ZZZ9' + "\x01\x02\x03".b + 'END0')
+unknown = 'ZZZ9' + [3].pack('N') + "\x01\x02\x03".b
+doc = CheckpointImage.read(body + unknown + 'END0')
 sec = doc['sections'].find { |s| s['unknown'] }
-check('an unknown section is kept as hex up to END0', sec && sec['tag'] == 'ZZZ9' && sec['bytes'] == 3 && sec['head_hex'] == '010203' &&
-      doc['warnings'].any? { |w| w.include?('ZZZ9') })
+check('an unknown section is skipped by its length and kept as hex', sec && sec['tag'] == 'ZZZ9' && sec['length'] == 3 &&
+      sec['head_hex'] == '010203' && doc['warnings'].any? { |w| w.include?('ZZZ9') })
+# a known section after an unknown one is still read
+first = CheckpointImage.read(bytes)['sections'].map { |s| s['tag'] }
+at = bytes.index('DBG0') || bytes.index('GCS0') || (bytes.bytesize - 4)
+doc = CheckpointImage.read(bytes.byteslice(0, at) + unknown + bytes.byteslice(at..))
+check('the sections after an unknown one are read', doc['sections'].map { |s| s['tag'] } == ['ZZZ9'] + first)
+begin
+  CheckpointImage.read(body + 'ZZZ9' + [9].pack('N') + "\x01\x02\x03".b + 'END0')
+  check('a section longer than the image is refused', false)
+rescue CheckpointImage::FormatError => e
+  check('a section longer than the image is refused', e.where.include?('ZZZ9'), e.message)
+end
 begin
   CheckpointImage.read(bytes + 'x')
   check('a byte after END0 is refused', false)
@@ -348,6 +394,32 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
   out, _, st = run('ruby', CLI, f, '--json', dir: dir)
   j = JSON.parse(out) rescue nil
   check('--json of a cut image prints the part read and the error (status 1)', st == 1 && j && j['error'] && j['error']['offset'].is_a?(Integer), out[0, 200])
+end
+
+# the C readers skip a section they do not know (by its length) and resume
+# as they do without it; a section whose contents overrun its length is refused
+Dir.mktmpdir('checkpoint-inspect') do |dir|
+  FileUtils.cp(File.join(ROOT, 'test/samples/counter.rb'), dir)
+  img = File.join(dir, 'first.ckpt')
+  run(NORMAL['64'], 'run', '--out', img, 'counter.rb', dir: dir)
+  nxt = File.join(dir, 'next.ckpt')   # the program suspends again: not over the inputs
+  bytes = File.binread(img)
+  unknown = 'ZZZ9' + [5].pack('N') + 'hello'
+  at = bytes.index('DBG0') || (bytes.bytesize - 4)
+  File.binwrite(File.join(dir, 'u.ckpt'), bytes.byteslice(0, at) + unknown + bytes.byteslice(at..))
+  bad = bytes.dup
+  dbg = bad.index('DBG0')
+  bad[dbg + 4, 4] = [bad.byteslice(dbg + 4, 4).unpack1('N') + 1].pack('N') if dbg
+  File.binwrite(File.join(dir, 'bad.ckpt'), bad)
+  %w(64 32).each do |arch|
+    want, = run(NORMAL[arch], 'resume', '--out', nxt, img, dir: dir)
+    got, err, st = run(NORMAL[arch], 'resume', '--out', nxt, File.join(dir, 'u.ckpt'), dir: dir)
+    check("#{arch}: C mruby skips an unknown section and resumes the same", st == 0 && got == want && !want.empty?, err)
+    if dbg
+      out, err, st = run(NORMAL[arch], 'resume', '--out', nxt, File.join(dir, 'bad.ckpt'), dir: dir)
+      check("#{arch}: C mruby refuses a section whose length does not match", st != 0 && out.empty? && err.include?('DBG0'), err)
+    end
+  end
 end
 
 part_done

@@ -33,9 +33,9 @@ HTML (`--html`) には、命令列を除いた JSON (`--no-code` と同じ) が
 | 場所 | 導いた欄 |
 |---|---|
 | `ireps[]` | `hash_ok`、`file`、`line` |
-| `objects[]` | `label`、`class_name`、`refs`、`path`、`temporary` |
-| `contexts[]` | `role`、`task`、`fiber_objects`、`current`、`key`、`backtrace` |
-| `contexts[].frames[]` | `irep`、`file`、`line`、`location`、`key`、`self`、`locals`、`captured` |
+| `objects[]` | `label`、`class_name`、`refs`、`path`、`path_root`、`temporary` |
+| `contexts[]` | `role`、`task`、`fiber_objects`、`current`、`key`、`backtrace`、`activity` |
+| `contexts[].frames[]` | `irep`、`file`、`line`、`location`、`key`、`not_started`、`placeholder`、`self`、`self_register`、`locals`、`captured` |
 | `scheduler.tasks[]` | `main`、`name_text`、`running`、`host`、`queue_index`、`key` |
 | 全体 | `roots`、`warnings` |
 
@@ -111,6 +111,7 @@ HTML (`--html`) には、命令列を除いた JSON (`--no-code` と同じ) が
 | `class_name` | (導いた。クラス・モジュール・特異クラス・取り込みクラス・origin と permanent のクラスだけ) クラスの名前 |
 | `refs` | (導いた) このオブジェクトが指すオブジェクト `[[辺の名前, 番号], ...]`。図の辺。名前は ivar・定数 (`@a`、`::Foo`)、要素 `[0]`、Hash の値 `{:key}` と鍵 `(key 0)`、Set の要素 `<0>`、メソッド `#name`、`superclass`、`upper`、`env`、`target_class`、`begin`・`end`・`message`・`backtrace`・`value`、Task の `name`・`value`・`waits on`、最後にクラス `class` |
 | `path` | (導いた) 根からの道筋 (§8)。permanent は `=名前` |
+| `path_root` | (導いた) 道筋の始まりの根 (`roots` の添字。0 から)。permanent と根から届かないものは null。人に見せる置き場所 (「q、Task "x" の本体の局所変数」) は、この根と `path` の残り (根の `key` の後ろ) から作る |
 | `temporary` | (導いた) 変数でない一時レジスタからしか届かないなら true |
 
 permanent (`permanent`、`permanent_proc`) 以外は、続けて `class` (クラスのオブジェクトの番号) と
@@ -162,7 +163,7 @@ permanent なものへの変更 (形式 §9)。各要素は `kind` (`define_meth
 
 | 欄 | 中身 |
 |---|---|
-| `id`、`state` | 番号と状態 (`created`・`running`・`resumed`・`suspended`・`transferred`・`terminated`。`state_code` は像の値) |
+| `id`、`state` | 番号と、像のままの状態 (mruby の `mrb_fiber_state`: `created`・`running`・`resumed`・`suspended`・`transferred`・`terminated`。`state_code` は像の値)。意味を持つのは Fiber の文脈だけ (下の `activity`) |
 | `vmexec` | C から resume された印 |
 | `prev` | この文脈を resume した文脈 (戻る先) |
 | `fiber` | この文脈の Fiber のオブジェクト |
@@ -173,7 +174,14 @@ permanent なものへの変更 (形式 §9)。各要素は `kind` (`define_meth
 | `fiber_objects` | (導いた) この文脈を指す Fiber のオブジェクト |
 | `current` | (導いた) 書き出したとき動いていた文脈か |
 | `key` | (導いた) 像をまたいで同じ文脈を指す名前: `root`、`task "名前"` (名前の無い Task は `task @ファイル:行`)、`fiber @ファイル:行` (Fiber の本体のブロックの場所)。重なれば `#2` を付ける |
-| `backtrace` | (導いた) この文脈で例外を上げたら mruby が出すバックトレース (**上から**)。`"x.rb:13:in deep"` の形 |
+| `backtrace` | (導いた) この文脈で例外を上げたら mruby が出すバックトレース (**上から**)。`"x.rb:13:in deep"` の形。まだ始まっていない枠は始まる行、`placeholder` の枠は入れない |
+| `activity` | (導いた) この文脈がしていること。`current` (書き出したとき動いていた)・`not_started` (Fiber がまだ resume されていない)・`yielded` (`Fiber.yield` で止まっている)・`resuming` (resume した Fiber を待っている)・`transferring` (transfer して離れた)・`finished` (終わった)・`task` (Task の文脈: 中身は Task の `state` を見る)・`scheduler` (本体が C の関数 `Task.run`・`Task.pass` でスケジューラを回している)・`no_frames` (本体に枠が無い: 埋め込む側がスケジューラを回す)・`other` |
+
+**`state` を人に見せない理由**: 文脈の状態は mruby-fiber しか更新しない。mruby-task は Task の文脈を
+作るときに `created`、Task が止まるときに `terminated` (`MRB_TASK_STOPPED` は `MRB_FIBER_TERMINATED`
+の別名) にするだけで、動いている Task も `created` のまま。本体の文脈は VM を開いたときの `created`
+から、Fiber が戻ってきたときに `running` になるだけ。だから本体と Task では `resumed`・`transferred`
+(Fiber を待っている) と Task の `terminated` しか意味を持たない。`activity` はそれを踏まえて決める。
 
 ### 7.2 枠 (`frames[]`)
 
@@ -187,10 +195,13 @@ permanent なものへの変更 (形式 §9)。各要素は `kind` (`define_meth
 | `pc` | 命令列の中の位置 (null は無し) |
 | `argc`、`kwargc`、`cci`、`visibility`、`block`、`env` | 形式 §10 のまま (`env` は `{kind: "env"/"class", ref}`) |
 | `irep` | (導いた) 動いている irep |
-| `file`、`line` | (導いた) いま動いている (または呼び出しから戻るのを待っている) 行。pc の 1 つ前の命令の行 |
-| `location` | (導いた) バックトレースの 1 行 (`file:line:in method`)。mruby がバックトレースに出さない枠は null |
+| `file`、`line` | (導いた) いま動いている (または呼び出しから戻るのを待っている) 行。pc の 1 つ前の命令の行。pc が 0 の枠は、始まる行 (pc 0 の命令の行。ブロックなら `do` の行) |
+| `location` | (導いた) バックトレースの 1 行 (`file:line:in method`)。mruby がバックトレースに出さない枠は null。pc が 0 の枠は始まる行 (mruby 自身は pc の 1 つ前を引くので `(unknown):0` と出す) |
 | `key` | (導いた) 文脈の `key` + `/番号:メソッド` (`root/1:work`) |
-| `self` | (導いた) R0 の値 |
+| `not_started` | (導いた) pc が 0 (まだ 1 命令も動いていない) |
+| `placeholder` | (導いた) まだ resume されていない Fiber の枠 1。枠 0 の写しで、`Fiber#resume` の呼び出しの枠の代わりに積まれている。最初の resume で、resume から戻るときに VM が外す (mruby-fiber の `init_fiber` と `vm.c` の C の関数の戻り)。中身は枠 0 と同じ |
+| `self` | (導いた) R0 の値。ただし、まだ resume されていない Fiber の枠では、始まるときの self (ブロックの環境の self、無ければ main。mruby-fiber が最初の resume で R0 に入れるもの) |
+| `self_register` | (導いた。上の場合だけ) そのときの R0 の値。`Fiber.new` の受け手 (Fiber のオブジェクト) が写されている |
 | `locals` | (導いた) 局所変数 `[{name, reg, value}]` (無名は name が null) |
 | `captured` | (導いた) ブロックが外から見ている変数。外側へ 1 段ずつ `[{env, method, on_stack, context, frame, variables: [{name, value}]}]`。`on_stack` なら、その変数は文脈 `context` の枠 `frame` のレジスタそのもの |
 
@@ -221,14 +232,13 @@ Task (`tasks[]`):
 
 ### 7.4 任意の節 (`sections[]`)
 
-各要素は `tag` と `offset` (像の中のバイト位置) を持つ。
+各要素は `tag`、`offset` (像の中のバイト位置)、`length` (中身の長さ。形式 §13) を持つ。
 
 - `DBG0`: `ireps: [{irep, files: [{file, start, end, lines: [[pc, 行], ...]}]}]` (行が変わる位置)。
 - `GCS0`: `disabled`・`generational`・`step_per_allocation`・`scheduler_steps`・`interval_ratio`・
   `step_ratio`・`step_limit`・`malloc_threshold`・`debt_limit` (64 bit の値は 10 進の文字列)。
-- 知らない節: `unknown: true`、`bytes`、`head_hex` (先頭 64 バイト)、`tail_hex`。形式は節に長さを
-  持たせていないので、その印から最後の `END0` の手前までを中身とみなす (後ろの節も含まれうる)。
-  `warnings` にも出る。
+- 知らない節: `unknown: true`、`head_hex` (先頭 64 バイト)、`tail_hex` (64 バイトを超えるとき最後の
+  16 バイト)。長さぶん読み飛ばし、後ろの節は続けて読む。`warnings` にも出る。
 
 ## 8. 根と道筋
 
@@ -274,9 +284,9 @@ task "c1"/3:pop.self.@items
 | `a`、`b` | 2 つの像の `source` |
 | `same` | 差がまったく無ければ true |
 | `header` | 違うヘッダの欄 `[{field, a, b}]` (64 bit と 32 bit の書き手の像は `pointer_bits` だけが違う) |
-| `variables` | 変更表 (大域変数・定数・足したメソッド) の違い `[{key, a, b}]`。値は表示の文 |
-| `contexts` | 文脈ごと (`key` で対応) `[{key, change, a, b, fields, frames}]`。`change` は `same`・`changed`・`added`・`removed`。`fields` は状態などの違い。`frames` は下からの枠の比べ (下) |
-| `tasks` | Task ごと (`key` で対応) の違い `[{key, change, a, b, fields}]` (状態・列と順・優先度・割り当ての残り・待ち・値・動いていたか) |
+| `variables` | 変更表 (大域変数・定数・足したメソッド) の違い `[{key, a, b, a_ref, b_ref}]`。`a`・`b` は表示の文、`a_ref`・`b_ref` は値がオブジェクトならその番号 (それぞれの像の中の) |
+| `contexts` | 文脈ごと (`key` で対応) `[{key, change, a, b, fields, frames}]`。`change` は `same`・`changed`・`added`・`removed`。`fields` は `activity`・`vmexec`・`current`・`resumed by` の違い。`frames` は下からの枠の比べ (下)。局所変数の違いは `{name, a, b, a_ref, b_ref, contents_changed}` |
+| `tasks` | Task ごと (`key` で対応) の違い `[{key, change, a, b, fields}]` (状態・列と順・優先度・割り当ての残り・待ち・値・動いていたか)。待ち (`wait`) の値は番号を含まない形 `{reason: "sleep", ticks_left}`・`{reason: "join", task: Task の key}`・`{reason: "queue", queue: 道筋, ticks_left}` |
 | `scheduler` | 時計・次に起きる時刻・動いていた Task・今の文脈などの違い `[{field, a, b}]` |
 | `objects` | `{changed, added, removed, moved}` (下) |
 
@@ -325,10 +335,14 @@ task "c1"/3:pop.self.@items
 
 | 見せるもの | 使う欄 |
 |---|---|
-| 呼び出しの枠 | `contexts[]` を `current` を先に。各文脈の `frames` を逆順 (上から)。行は `location` (null なら `file:line`)、変数は `locals`・`self`・`captured`、C の関数で待っている枠は `kind == "cfunc"` と `cfunc` |
+| 呼び出しの枠 | `contexts[]` を `current` を先に。文脈がしていることは `activity` (Task なら Task の `state`)。まだ始まっていない枠は `not_started`、`placeholder` の枠は畳む。各文脈の `frames` を逆順 (上から)。行は `location` (null なら `file:line`)、変数は `locals`・`self`・`captured`、C の関数で待っている枠は `kind == "cfunc"` と `cfunc` |
 | オブジェクトのつながり | 起点は `roots[]` (`refs` と `temps`) かオブジェクト。辺は `objects[].refs`、箱の文字は `label`、permanent (`kind` が `permanent`・`permanent_proc`) は名前だけの印。中身の欄は §6.2 |
 | 2 つの像の差 | §9 の JSON。オブジェクトへは `a`・`b` の番号で飛ぶ |
 | Task と Fiber | `scheduler.tasks[]` を `queue` ごとに `queue_index` の順に並べる。待ちは `wait`、動いていたものは `running`。文脈の鎖は `contexts[].prev` |
+
+人に見せる文には、道筋 (`path`) や `key` をそのまま出さない (内部の鍵)。オブジェクトの置き場所は
+`path_root` の根 (枠ならその文脈と枠の名前) と `path` の残りから「q、Task "x" の本体の局所変数」の
+ように組み立て、道筋は詳しい欄やポインタを重ねたときに出す。HTML の `app.js` (`whereText`) が例。
 
 形が合っているかは `tools/lib/checkpoint_schema.rb` (Ruby の標準ライブラリだけ) で確かめられる:
 `CheckpointSchema.check(doc)` は食い違いの一覧を返す。

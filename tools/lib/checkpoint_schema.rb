@@ -23,7 +23,7 @@ module CheckpointSchema
   FLOAT = { 'float' => [:either, Float, Integer, String] }
 
   COMMON = { 'id' => Integer, 'kind' => String, 'kind_code' => Integer, 'bytes' => Integer,
-             'label' => String, 'refs' => REFS, 'path' => String, 'temporary' => :bool, 'class_name?' => String }
+             'label' => String, 'refs' => REFS, 'path' => String, 'path_root' => [:opt, Integer], 'temporary' => :bool, 'class_name?' => String }
   HEAD = { 'class' => REF, 'frozen' => :bool }
   OBJECT = {
     'permanent' => { 'name' => String },
@@ -77,13 +77,14 @@ module CheckpointSchema
             'cfunc' => [:opt, String], 'reg_base' => Integer, 'pc' => [:opt, Integer], 'argc' => Integer, 'kwargc' => Integer,
             'cci' => Integer, 'visibility' => VIS, 'block' => REF, 'env' => [:opt, { 'kind' => [:enum, 'env', 'class'], 'ref' => REF }],
             'irep' => REF, 'file' => [:opt, String], 'line' => [:opt, Integer], 'location' => [:opt, String], 'key' => String,
-            'self' => :value, 'locals' => ARR.({ 'name' => [:opt, String], 'reg' => Integer, 'value' => :value }),
+            'not_started' => :bool, 'placeholder' => :bool, 'self' => :value, 'self_register?' => :value, 'locals' => ARR.({ 'name' => [:opt, String], 'reg' => Integer, 'value' => :value }),
             'captured' => ARR.({ 'env' => Integer, 'method' => [:opt, String], 'on_stack' => :bool, 'context?' => Integer,
                                  'frame?' => [:opt, Integer], 'variables' => ARR.(VAR) }) }
   CONTEXT = { 'id' => Integer, 'state' => [:enum, 'created', 'running', 'resumed', 'suspended', 'transferred', 'terminated'],
               'state_code' => Integer, 'vmexec' => :bool, 'prev' => REF, 'fiber' => REF, 'stack' => ARR.(:value),
               'frames' => ARR.(FRAME), 'role' => [:enum, 'root', 'task', 'fiber', 'unknown'], 'task' => REF,
-              'fiber_objects' => ARR.(Integer), 'current' => :bool, 'key' => String, 'backtrace' => ARR.(String) }
+              'fiber_objects' => ARR.(Integer), 'current' => :bool, 'key' => String, 'backtrace' => ARR.(String),
+              'activity' => [:enum, 'current', 'not_started', 'yielded', 'resuming', 'transferring', 'finished', 'task', 'scheduler', 'no_frames', 'other'] }
   TASK = { 'id' => Integer, 'object' => REF, 'context' => REF,
            'state' => [:enum, 'DORMANT', 'READY', 'RUNNING', 'WAITING', 'SUSPENDED'], 'state_code' => Integer,
            'queue' => [:enum, 'dormant', 'ready', 'waiting', 'suspended', nil], 'priority' => Integer, 'timeslice' => Integer,
@@ -92,7 +93,7 @@ module CheckpointSchema
            'main' => :bool, 'name_text' => [:opt, String], 'running' => :bool, 'host' => :bool, 'queue_index' => [:opt, Integer], 'key' => String }
   SCHED = { 'switching' => :bool, 'loop' => :bool, 'tick_ms' => Integer, 'tick' => Integer, 'next_wakeup' => [:opt, Integer],
             'tasks' => ARR.(TASK), 'running_task' => REF, 'host_task' => REF }
-  SECTION = { 'tag' => String, 'offset' => Integer,
+  SECTION = { 'tag' => String, 'offset' => Integer, 'length' => Integer,
               # DBG0
               'ireps?' => ARR.({ 'irep' => Integer, 'files' => ARR.({ 'file' => String, 'start' => Integer, 'end' => Integer,
                                                                         'lines' => ARR.([:tuple, Integer, Integer]) }) }),
@@ -101,7 +102,7 @@ module CheckpointSchema
               'interval_ratio?' => Integer, 'step_ratio?' => Integer, 'step_limit?' => String, 'malloc_threshold?' => String,
               'debt_limit?' => String,
               # a section this reader does not know
-              'unknown?' => :bool, 'bytes?' => Integer, 'head_hex?' => String, 'tail_hex?' => [:opt, String] }
+              'unknown?' => :bool, 'head_hex?' => String, 'tail_hex?' => [:opt, String] }
   ROOT = { 'key' => String, 'kind' => [:enum, 'global', 'variable', 'method', 'superclass', 'contents', 'frame', 'task', 'fiber'],
            'refs' => REFS, 'temps?' => REFS, 'context?' => Integer, 'frame?' => Integer, 'task?' => Integer }
   DOC = {
@@ -117,13 +118,14 @@ module CheckpointSchema
   FIELD = { 'field' => String, 'a' => :any, 'b' => :any }
   DIFF = {
     'inspect_diff' => [:enum, 1], 'a' => Hash, 'b' => Hash, 'same' => :bool,
-    'header' => ARR.(FIELD), 'variables' => ARR.({ 'key' => String, 'a' => [:opt, String], 'b' => [:opt, String] }),
+    'header' => ARR.(FIELD), 'variables' => ARR.({ 'key' => String, 'a' => [:opt, String], 'b' => [:opt, String], 'a_ref' => REF, 'b_ref' => REF }),
     'contexts' => ARR.({ 'key' => String, 'change' => [:enum, 'same', 'changed', 'added', 'removed'], 'a?' => Integer, 'b?' => Integer,
                          'fields?' => ARR.(FIELD),
                          'frames' => ARR.({ 'index' => Integer, 'change' => [:enum, 'same', 'changed', 'called', 'returned'],
                                             'method?' => [:opt, String], 'a?' => String, 'b?' => String, 'pc?' => ARR.([:opt, Integer]),
                                             'self?' => ARR.(String),
-                                            'locals?' => ARR.({ 'name' => String, 'a' => [:opt, String], 'b' => [:opt, String], 'contents_changed?' => :bool }) }) }),
+                                            'locals?' => ARR.({ 'name' => String, 'a' => [:opt, String], 'b' => [:opt, String], 'contents_changed?' => :bool,
+                                                                 'a_ref' => REF, 'b_ref' => REF }) }) }),
     'tasks' => ARR.({ 'key' => String, 'change' => [:enum, 'changed', 'added', 'removed'], 'a?' => Integer, 'b?' => Integer, 'fields?' => ARR.(FIELD) }),
     'scheduler' => ARR.(FIELD),
     'objects' => {

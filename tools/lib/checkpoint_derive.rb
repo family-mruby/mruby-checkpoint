@@ -314,18 +314,76 @@ module CheckpointImage
           end
         c['frames'].each { |f| frame(c, f) }
         c['backtrace'] = backtrace(c)
+        c['activity'] = activity(c, t)
       end
       uniq(fiber_keys.map { |c| c['key'] }).each_with_index { |k, i| fiber_keys[i]['key'] = k }
     end
 
+    # What a context is doing, from the fields that mean something for it.
+    # The context's own status (mrb_fiber_state) is kept up to date by
+    # mruby-fiber only: mruby-task sets a Task's context to "created" when it
+    # makes it and to "terminated" when the Task stops, and the root context
+    # starts "created" and becomes "running" once a Fiber hands control back
+    # to it. So for the root and for Tasks only resumed / transferred (they
+    # wait for a Fiber) and a Task's terminated tell something; the Task's own
+    # state says the rest.
+    def activity(c, t)
+      st = c['state']
+      return 'current' if c['current']
+      return 'resuming' if st == 'resumed'
+      return 'transferring' if st == 'transferred'
+      case c['role']
+      when 'fiber', 'unknown'
+        { 'created' => 'not_started', 'suspended' => 'yielded', 'terminated' => 'finished' }[st] || 'other'
+      when 'task'
+        st == 'terminated' ? 'finished' : 'task'
+      else
+        top = c['frames'].last
+        if top.nil? then 'no_frames'
+        elsif top['kind'] == 'cfunc' then 'scheduler'
+        else 'other'
+        end
+      end
+    end
+
     def stack_value(c, i) = i < c['stack'].size ? c['stack'][i] : nil
+
+    def main_object = (@main_object ||= [@objs.find { |o| o['kind'] == 'permanent' && o['name'] == 'T' }]).first
+
+    # the self a block gets when its Fiber starts (mruby-fiber puts it in R0
+    # at the first resume: the self of the block's environment, or main)
+    def self_at_start(pid)
+      p = pid && obj(pid)
+      if p && p['kind'] == 'proc' && p['env'] && p['env']['kind'] == 'env'
+        e = obj(p['env']['ref'])
+        if e['kind'] == 'env'
+          return e['on_stack'] ? stack_value(@ctxs[e['context'] - 1], e['position']) : (e['values'] || [])[0]
+        end
+      end
+      (m = main_object) ? { 'ref' => m['id'] } : nil
+    end
 
     def frame(c, f)
       ir = f['kind'] == 'ruby' ? proc_irep(f['proc']) : nil
       f['irep'] = ir
-      fl = ir && f['pc'] && line_at(ir, f['pc'] - 1)
+      # pc 0: nothing has run yet; the line is where it will start (pc - 1
+      # would be before the code)
+      f['not_started'] = f['kind'] == 'ruby' && f['pc'] == 0
+      first = c['frames'][0]
+      # an unstarted Fiber has a copy of its block's frame on top: it stands
+      # in for the frame of the C call Fiber#resume, which the VM pops when
+      # that call returns into this context; the block then runs from frame 0
+      f['placeholder'] = c['role'] == 'fiber' && c['state'] == 'created' && f['index'] == 1 &&
+                         f['proc'] == first['proc'] && f['pc'] == first['pc'] && f['reg_base'] == first['reg_base']
+      fl = ir && f['pc'] && line_at(ir, f['not_started'] ? 0 : f['pc'] - 1)
       f['file'], f['line'] = fl
       f['self'] = stack_value(c, f['reg_base'])
+      if f['not_started'] && c['role'] == 'fiber' && c['state'] == 'created'
+        # R0 holds the Fiber object until the first resume (init_fiber copies
+        # the receiver of Fiber.new there)
+        f['self_register'] = f['self']
+        f['self'] = self_at_start(f['proc'])
+      end
       names = ir ? @ireps[ir - 1]['locals'] || [] : []
       f['locals'] = names.each_with_index.map do |n, i|
         { 'name' => n, 'reg' => i + 1, 'value' => stack_value(c, f['reg_base'] + i + 1) }
@@ -371,7 +429,9 @@ module CheckpointImage
         if f['kind'] == 'ruby'
           f['location'] = nil
           next unless f['irep'] && @lines[f['irep']] && f['pc']
-          loc = location(f['irep'], f['pc'], f['method'])
+          loc = f['not_started'] ? start_location(f) : location(f['irep'], f['pc'], f['method'])
+          f['location'] = loc
+          next if f['placeholder']
         else
           f['location'] = nil
           next unless f['method']
@@ -384,6 +444,14 @@ module CheckpointImage
         out << loc
       end
       out
+    end
+
+    # where a frame at pc 0 will start (mruby itself would print
+    # "(unknown):0": it looks up the instruction before pc)
+    def start_location(f)
+      fl = line_at(f['irep'], 0)
+      return '(unknown):0' unless fl
+      "#{fl[0]}:#{fl[1]}#{f['method'] ? ":in #{f['method']}" : ''}"
     end
 
     def location(irep, pc, mid)
@@ -545,11 +613,12 @@ module CheckpointImage
       # registers reach (those objects are marked "temporary")
       [['refs', false], ['temps', true]].each do |field, temp|
         q = []
-        rs.each do |r|
+        rs.each_with_index do |r, ri|
           (r[field] || []).each do |label, id|
             o = obj(id)
             next if o['path']
             o['path'] = join(r['key'], label)
+            o['path_root'] = ri
             o['temporary'] = temp
             q << o
           end
@@ -562,6 +631,7 @@ module CheckpointImage
             c = obj(id)
             next if c['path']
             c['path'] = join(o['path'], label)
+            c['path_root'] = o['path_root']
             c['temporary'] = temp
             q << c
           end
@@ -570,6 +640,7 @@ module CheckpointImage
       @objs.each do |o|
         o['path'] ||= "?##{o['id']}"
         o['temporary'] = false unless o.key?('temporary')
+        o['path_root'] = nil unless o.key?('path_root')
       end
       unreached = @objs.count { |o| o['path'].start_with?('?#') }
       @doc['warnings'] << "#{unreached} objects are not reached from the roots" if unreached.positive?
