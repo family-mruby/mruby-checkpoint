@@ -1,4 +1,4 @@
-# Print a checkpoint image (format v0, with the P2 additions) in readable form.
+# Print a checkpoint image (format v0, with the P2 and P3 additions) in readable form.
 #
 #   ruby tools/checkpoint_inspect.rb IMAGE [--iseq]
 #
@@ -8,6 +8,7 @@ class Reader
   def initialize(bytes) = (@b = bytes; @p = 0)
   def eof? = @p >= @b.bytesize
   def rest = @b.bytesize - @p
+  def peek(n) = @b.byteslice(@p, n)
   def u8 = take(1).unpack1('C')
   def u16 = take(2).unpack1('n')
   def u32 = take(4).unpack1('N')
@@ -93,7 +94,8 @@ end
 
 kinds = { 2 => 'Object', 3 => 'String', 4 => 'Array', 5 => 'Hash', 6 => 'Range', 7 => 'Exception',
           8 => 'Class', 9 => 'Module', 10 => 'SClass', 11 => 'IClass', 12 => 'Proc', 13 => 'Env',
-          14 => 'Data' }
+          14 => 'Data', 16 => 'Bigint', 17 => 'Struct', 18 => 'Set', 19 => 'Rational',
+          20 => 'Complex', 21 => 'Break', 23 => 'Random', 24 => 'Origin', 25 => 'String' }
 nobj = r.u32
 puts "objects: #{nobj}"
 nobj.times do |i|
@@ -129,7 +131,12 @@ nobj.times do |i|
     when 12
       fl = r.u8
       bodyk = r.u8
-      b = bodyk == 0 ? "irep @#{r.u32}" : (f = r.str; a = r.u32; "C #{f} aspec=#{a.to_s(16)}")
+      b = case bodyk
+          when 0 then "irep @#{r.u32}"
+          when 1 then f = r.str; a = r.u32; "C #{f} aspec=#{a.to_s(16)}"
+          when 2 then "alias of #{sym.(r.u32)}"
+          else raise "bad proc body #{bodyk}"
+          end
       up = r.u32
       ek = r.u8
       e = r.u32
@@ -141,7 +148,20 @@ nobj.times do |i|
       else
         "mid=#{mid} len=#{len} bidx=#{bidx} vis=#{v} [#{Array.new(len) { value.() }.join(', ')}]"
       end
-    when 14 then n = r.str; blob = r.str; "#{n} #{blob.unpack1('H*')} #{ivars.()}"
+    when 14 then n = r.str; blob = r.str; "#{n.empty? ? '(not initialized)' : n} #{blob.unpack1('H*')} #{ivars.()}"
+    when 16 then neg = r.u8 == 1 ? '-' : ''; "#{neg}0x#{r.str}"
+    when 17 then "[#{Array.new(r.u32) { value.() }.join(', ')}] #{ivars.()}"
+    when 18
+      n = r.u32
+      n == 0xffffffff ? "(not initialized) #{ivars.()}" : "{#{Array.new(n) { value.() }.join(', ')}} #{ivars.()}"
+    when 19 then "#{r.str}/#{r.str}"
+    when 20 then "(#{[r.u64].pack('Q').unpack1('D')}+#{[r.u64].pack('Q').unpack1('D')}i)"
+    when 21 then "tag=#{r.u8} frame=#{r.u32} value=#{value.()}"
+    when 23 then "state=#{r.u64.to_s(16)} seed=#{r.u32} #{ivars.()}"
+    when 24
+      sup = r.u32; mt = r.u8
+      "super=##{sup} table=#{mt} methods: #{Array.new(r.u32) { meth.() }.join(' ')}"
+    when 25 then "#{r.str.inspect} (binary)"
     else raise "bad kind #{k}"
     end
   puts "#{head} #{body}"
@@ -158,6 +178,17 @@ npatch.times do
   when 5 then puts "  super of ##{r.u32} = ##{r.u32}"
   when 6 then puts "  global #{sym.(r.u32)} = #{value.()}"
   when 7 then puts "  remove global #{sym.(r.u32)}"
+  when 8 then puts "  Random ##{r.u32} state=#{r.u64.to_s(16)} seed=#{r.u32}"
+  when 9 then puts "  class flags ##{r.u32} prepended=#{r.u8}"
+  when 10
+    o = r.u32; fr = r.u8; t = r.u8
+    c = case t
+        when 3 then r.str.inspect
+        when 4 then "[#{Array.new(r.u32) { value.() }.join(', ')}]"
+        when 5 then "{#{Array.new(r.u32) { "#{value.()}=>#{value.()}" }.join(', ')}}"
+        else raise "bad contents type #{t}"
+        end
+    puts "  contents ##{o} frozen=#{fr} #{c}"
   else raise "bad change #{k}"
   end
 end
@@ -175,4 +206,25 @@ nf.times do |k|
   puts "  #{k}: #{mid} proc=##{proc_} R0=stack[#{off}] pc=#{pc} n=#{n} nk=#{nk} cci=#{cci} vis=#{v} " \
        "blk=##{blk} #{%w(none env class)[uk]}=##{u}"
 end
+if r.peek(4) == 'DBG0'
+  r.take(4)
+  nd = r.u32
+  puts "line numbers: #{nd} ireps"
+  nd.times do
+    id = r.u32
+    files = Array.new(r.u16) do
+      fn = r.str; st = r.u32; en = r.u32
+      ents = Array.new(r.u32) { "#{r.u32}:#{r.u32}" }
+      "#{fn}[#{st}...#{en}] #{ents.size} changes"
+    end
+    puts "  @#{id} #{files.join(', ')}"
+  end
+end
+if r.peek(4) == 'GCS0'
+  r.take(4)
+  puts "GC settings: flags=#{r.u8} interval_ratio=#{r.u32} step_ratio=#{r.u32} step_limit=#{r.u64} " \
+       "malloc_threshold=#{r.u64} debt_limit=#{r.i64}"
+end
+abort 'no end mark (END0): truncated' unless r.peek(4) == 'END0'
+r.take(4)
 puts r.eof? ? 'end' : "#{r.rest} bytes left!"

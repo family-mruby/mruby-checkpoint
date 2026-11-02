@@ -1,13 +1,15 @@
 # checkpoint-test: refuse
-# The state holds objects format v0 cannot carry: the suspend is refused with
-# the reason (Checkpoint::Error), nothing is written and the program goes on.
-t = Time.at(0)
+# The state holds what format v0 cannot carry: an open file (a resource of
+# this process) and a running Fiber. The suspend is refused with the reason
+# (Checkpoint::Error), nothing is written and the program goes on.
+t = File.open(__FILE__)
 begin
   Checkpoint.suspend("x.ckpt")
   puts "not reached"
 rescue Checkpoint::Error => e
   puts "refused: #{e.message}"
 end
+t.close
 t = nil
 
 f = Fiber.new do
@@ -19,13 +21,4 @@ f = Fiber.new do
   :fiber_done
 end
 puts f.resume
-
-s = "permanent?"
-ARGV << "extra"
-begin
-  Checkpoint.suspend("x.ckpt")
-rescue Checkpoint::Error => e
-  puts "refused: #{e.message}"
-end
-ARGV.pop
-puts "still running #{s}"
+puts "still running"

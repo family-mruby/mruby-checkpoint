@@ -9,6 +9,11 @@
 #   rake sabiruby -- build the `sabiruby` command with its feature checkpoint in
 #                   SABIRUBY_DIR (a SabiRuby checkout); rake test then also resumes
 #                   every image on it (skipped, with a notice, without one)
+#   rake build:fuzz -- the test builds (build/fuzz): the external trigger
+#                   checkpoint-fuzz, never in the normal builds
+#   rake fuzz[seed,runs,points] -- mruby's test suite stopped from outside at random
+#                   safe points, compared with the run without (tools/fuzz.rb)
+#   rake fuzz:sabiruby[seed,points] -- a part of it resumed on SabiRuby
 #
 # vendor/mruby (the submodule) is never modified. Its tree is copied into
 # build/src/<variant> and patches/*.patch are applied to the copy.
@@ -83,9 +88,41 @@ task :build do
   end
 end
 
-desc 'run the samples with and without checkpoints'
-task :test => :build do
+FUZZ_BUILD = File.join(BUILD, 'fuzz')
+
+desc 'build the test builds with the external trigger (build/fuzz, 64-bit and 32-bit)'
+task 'build:fuzz' do
+  FileUtils.mkdir_p(BUILD)
+  src = prepare_source('patched', PATCHES)
+  mruby_build(src, FUZZ_BUILD, 'CHECKPOINT_FUZZ' => '1')
+  %w(host host32).each do |t|
+    bin = File.join(FUZZ_BUILD, t, 'bin', 'checkpoint-fuzz')
+    abort "missing #{bin}" unless File.exist?(bin)
+  end
+end
+
+desc 'run the samples with and without checkpoints, and the short fuzz of the test suite'
+task :test => [:build, 'build:fuzz'] do
   ruby File.join(ROOT, 'tools/run_tests.rb')
+  # the short version: one fixed seed, about 30 points per test file
+  ruby File.join(ROOT, 'tools/fuzz.rb'), '--seeds', '1', '--points', '30', '--quiet'
+end
+
+desc 'fuzz the test suite: rake fuzz[seed,runs,points] (defaults 1, 10, 200)'
+task :fuzz, [:seed, :runs, :points] => 'build:fuzz' do |_, a|
+  args = ['--seed-from', (a[:seed] || 1).to_s, '--runs', (a[:runs] || 10).to_s,
+          '--points', (a[:points] || 200).to_s, '--isolate']
+  args += ['--json', ENV['FUZZ_JSON']] if ENV['FUZZ_JSON']
+  args += ['--table', ENV['FUZZ_TABLE']] if ENV['FUZZ_TABLE']
+  ruby File.join(ROOT, 'tools/fuzz.rb'), *args
+end
+
+namespace :fuzz do
+  desc 'resume a part of the fuzzed test suite on SabiRuby: rake fuzz:sabiruby[seed,points]'
+  task :sabiruby, [:seed, :points] => ['build:fuzz', :sabiruby] do |_, a|
+    ruby File.join(ROOT, 'tools/fuzz_sabiruby.rb'), '--seed', (a[:seed] || 1).to_s,
+         '--points', (a[:points] || 10).to_s
+  end
 end
 
 namespace :test do

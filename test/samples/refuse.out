@@ -1,5 +1,4 @@
-refused: C data of class Time (type 'Time') has no entry in the checkpoint data table (stack slot 1)
+refused: C data of class File (type 'IO') has no entry in the checkpoint data table (stack slot 1)
 refused in fiber: Checkpoint.suspend from a Fiber or Task is not supported in format v0
 fiber_done
-refused: permanent V:Object@ARGV (Array) was modified; format v0 carries only changes to classes, ivars and globals
-still running permanent?
+still running

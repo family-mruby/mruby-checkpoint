@@ -71,6 +71,8 @@ checkpoint_delete(mrb_state *mrb)
       free(g->output);
       for (int k = 0; k < g->ndata; k++) free(g->data[k].name);
       free(g->data);
+      for (int k = 0; k < g->nfuncs; k++) free(g->fnames[k]);
+      free(g->fnames); free(g->funcs);
       free(g);
       states[i] = NULL;
     }
@@ -96,7 +98,8 @@ mrb_checkpoint_baseline(mrb_state *mrb)
   if (!g) return;
   checkpoint_perm_free(mrb, g->perm);
   g->perm = NULL;
-  g->perm = checkpoint_perm_build(mrb);
+  checkpoint_bundled_register(mrb);
+  g->perm = checkpoint_perm_build(mrb, g);
 }
 
 MRB_API void
@@ -143,12 +146,39 @@ mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const ch
 {
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g) return;
+  for (int i = 0; i < g->ndata; i++) if (g->data[i].type == type) return;
   g->data = (checkpoint_data_ent*)realloc(g->data, sizeof(checkpoint_data_ent) * (g->ndata + 1));
   g->data[g->ndata].type = type;
   g->data[g->ndata].name = dupstr(name);
   g->data[g->ndata].dump = dump;
   g->data[g->ndata].restore = restore;
+  g->data[g->ndata].restore_obj = NULL;
   g->ndata++;
+}
+
+MRB_API void
+mrb_checkpoint_register_func(mrb_state *mrb, const char *name, mrb_func_t func)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g || !func) return;
+  g->fnames = (char**)realloc(g->fnames, sizeof(char*) * (g->nfuncs + 1));
+  g->funcs = (mrb_func_t*)realloc(g->funcs, sizeof(mrb_func_t) * (g->nfuncs + 1));
+  size_t n = strlen(name);
+  g->fnames[g->nfuncs] = (char*)malloc(n + 3);
+  memcpy(g->fnames[g->nfuncs], "F:", 2);
+  memcpy(g->fnames[g->nfuncs] + 2, name, n + 1);
+  g->funcs[g->nfuncs] = func;
+  g->nfuncs++;
+}
+
+MRB_API void
+mrb_checkpoint_register_data_obj(mrb_state *mrb, const mrb_data_type *type, const char *name,
+                                 mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore_obj restore)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g) return;
+  mrb_checkpoint_register_data(mrb, type, name, dump, NULL);
+  g->data[g->ndata - 1].restore_obj = restore;
 }
 
 /* ---- save / suspend ---- */
@@ -177,11 +207,74 @@ default_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path
   }
 }
 
+static int
+tasks_exist(mrb_state *mrb)
+{
+  for (int i = 0; i < 4; i++) {
+    if (mrb->task.queues[i]) return 1;
+  }
+  return 0;
+}
+
+/* an external request that cannot be served at this safe point */
+static void
+external_refused(mrb_state *mrb, checkpoint_state *g, const char *reason)
+{
+  g->pending = 0;
+  /* the flag belongs to the task scheduler too: leave it alone when Tasks exist */
+  if (!tasks_exist(mrb)) mrb->task.switching = FALSE;
+  if (g->refusal) g->refusal(mrb, reason, g->refusal_ud);
+}
+
+static void
+external_safepoint(mrb_state *mrb, checkpoint_state *g)
+{
+  if (mrb->c != mrb->root_c) {
+    /* the instruction after the request entered a Fiber; going on with
+       switching set would make the Fiber's VM return to a scheduler */
+    external_refused(mrb, g, "running in a Fiber or Task; format v0 carries only the root context");
+    return;
+  }
+  if (tasks_exist(mrb)) {
+    external_refused(mrb, g, "Tasks exist; format v0 does not carry Tasks");
+    return;
+  }
+  g->pending = 0;
+  mrb->task.switching = FALSE;
+
+  gbuf out;
+  gb_init(&out);
+  char err[512];
+  if (checkpoint_dump(mrb, &out, err, sizeof(err))) {
+    gb_free(mrb, &out);
+    if (g->refusal) g->refusal(mrb, err, g->refusal_ud);
+    return;
+  }
+  struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+  struct mrb_jmpbuf c_jmp;
+  MRB_TRY(&c_jmp) {
+    mrb->jmp = &c_jmp;
+    if (g->handler) g->handler(mrb, out.p, out.len, g->output, MRB_CHECKPOINT_EXTERNAL, g->handler_ud);
+    mrb->jmp = prev_jmp;
+  }
+  MRB_CATCH(&c_jmp) {
+    mrb->jmp = prev_jmp;
+    gb_free(mrb, &out);
+    MRB_THROW(prev_jmp);
+  }
+  MRB_END_EXC(&c_jmp);
+  gb_free(mrb, &out);
+}
+
 static void
 checkpoint_safepoint(mrb_state *mrb)
 {
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g || !g->pending) return;
+  if (g->pending_kind == MRB_CHECKPOINT_EXTERNAL) {
+    external_safepoint(mrb, g);
+    return;
+  }
   if (mrb->c != mrb->root_c) return;  /* not reached: requests are refused off the root context */
 
   g->pending = 0;
@@ -295,6 +388,47 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
   g->pending = 1;
   mrb->task.switching = TRUE;   /* the VM tests this at every instruction boundary */
   return mrb_symbol_value(MRB_SYM(saved));
+}
+
+MRB_API enum mrb_checkpoint_req
+mrb_checkpoint_request(mrb_state *mrb)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  char cfn[256];
+  if (!g || !g->perm) return MRB_CHECKPOINT_REQ_NOT_READY;
+  if (g->pending) return MRB_CHECKPOINT_REQ_PENDING;
+  if (mrb->c != mrb->root_c) return MRB_CHECKPOINT_REQ_FIBER;
+  /* an exception (or a break through an ensure clause) in flight is not
+     refused: the VM calls the hook only once it is caught */
+  if (c_boundary(mrb, cfn, sizeof(cfn))) return MRB_CHECKPOINT_REQ_C_BOUNDARY;
+  if (tasks_exist(mrb)) return MRB_CHECKPOINT_REQ_TASKS;
+  g->pending = 1;
+  g->pending_kind = MRB_CHECKPOINT_EXTERNAL;
+  mrb->task.switching = TRUE;   /* the VM tests this at every instruction boundary */
+  return MRB_CHECKPOINT_REQ_OK;
+}
+
+MRB_API void
+mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handler fn, void *ud)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g) return;
+  g->refusal = fn;
+  g->refusal_ud = ud;
+}
+
+MRB_API void
+mrb_checkpoint_keep_dead_registers(mrb_state *mrb, mrb_bool keep)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (g) g->keep_dead = keep ? 1 : 0;
+}
+
+MRB_API uint32_t
+mrb_checkpoint_last_dead(mrb_state *mrb)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  return g ? g->last_dead : 0;
 }
 
 static mrb_value

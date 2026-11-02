@@ -16,7 +16,14 @@ rake test     # test/samples を checkpoint あり・なしで比べる
 rake test:asan, rake test:stress   # 64bit を AddressSanitizer (stress は GC の負荷も) で
 rake bench    # patch なし / patch のみ / patch + gem のベンチマーク
 rake sabiruby # SABIRUBY_DIR の SabiRuby を feature checkpoint 付きで作る
+rake build:fuzz               # 試験のビルド (build/fuzz): 外から止める checkpoint-fuzz
+rake fuzz[seed,runs,points]   # mruby の試験一式をランダムな安全点で止めて往復させ、往復なしと比べる
+rake fuzz:sabiruby[seed,points]   # その一部を SabiRuby で続ける
 ```
+
+- `rake test` には、試験一式の短い版 (種 1、1 ファイル約 30 点、数秒) も入る。
+- 試験一式の比べ方・除外の表は `tools/fuzz.rb` と `test/fuzz_exclude.txt`、結果は
+  `doc/report/p3.md`。
 
 - `SABIRUBY_DIR` (SabiRuby の checkout) か `SABIRUBY_BIN` (feature `checkpoint` 付きの
   `sabiruby`) があると、`rake test` は像を SabiRuby でも `resume` する (無ければ飛ばして、
@@ -35,4 +42,6 @@ rake sabiruby # SABIRUBY_DIR の SabiRuby を feature checkpoint 付きで作る
     状態なら真)。`--inproc` は同じプロセスの新しい `mrb_state` で続ける。
   - C の関数が呼んだブロックの中 (`sort { }` など) では、頼んだ時点で
     `Checkpoint::Error` になる。
-- 形式は `doc/format_v0.md`、報告は `doc/report/` (`p1.md`・`p1b.md`・`p2.md`)。
+- 形式は `doc/format_v0.md`、報告は `doc/report/` (`p1.md`・`p1b.md`・`p2.md`・`p3.md`)。
+- 埋め込む側は `mrb_checkpoint_request()` で、プログラムの協力なしに外から書き出しを頼める
+  (次の安全点で書く。`include/mruby/checkpoint.h`)。

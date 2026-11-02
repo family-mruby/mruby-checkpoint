@@ -26,6 +26,7 @@ enum mrb_checkpoint_mode {
 enum mrb_checkpoint_kind {
   MRB_CHECKPOINT_SAVE = 0,     /* Checkpoint.save: the program goes on */
   MRB_CHECKPOINT_SUSPEND = 1,  /* Checkpoint.suspend: the process ends */
+  MRB_CHECKPOINT_EXTERNAL = 2, /* mrb_checkpoint_request: asked from outside the program */
 };
 
 /* Called at the safe point after a successful dump. buf/len is the whole
@@ -51,14 +52,55 @@ MRB_API void mrb_checkpoint_baseline(mrb_state *mrb);
 typedef void (*mrb_checkpoint_name_fn)(const char *name, int is_func, void *ud);
 MRB_API void mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn, void *ud);
 
+/* Name a C function the program's C code makes Procs or methods of at run
+   time (mrb_proc_new_cfunc_with_env and the like): an image can then refer
+   to it by "F:<name>". Call before mrb_checkpoint_baseline, the same on
+   both sides. */
+MRB_API void mrb_checkpoint_register_func(mrb_state *mrb, const char *name, mrb_func_t func);
+
 MRB_API void mrb_checkpoint_set_mode(mrb_state *mrb, enum mrb_checkpoint_mode mode);
 MRB_API void mrb_checkpoint_set_output(mrb_state *mrb, const char *path); /* overrides the path given to save / suspend */
 MRB_API void mrb_checkpoint_set_handler(mrb_state *mrb, mrb_checkpoint_handler fn, void *ud);
+
+/* Ask for a checkpoint from outside the program (no Checkpoint.save call):
+   from a hook, a timer or another thread's flag. Like save, it only marks
+   the state and sets mrb->task.switching; the image is written at the next
+   instruction boundary that is a safe point, and handed to the handler with
+   kind MRB_CHECKPOINT_EXTERNAL (path is the output set by
+   mrb_checkpoint_set_output, may be NULL). Nothing in the program sees it:
+   no register is changed. Returns MRB_CHECKPOINT_REQ_OK, or why the request
+   cannot be taken where the VM stands now (the program goes on untouched).
+   A request taken here can still be refused at the safe point (a value of a
+   type that cannot be carried, a Fiber entered before the boundary...): the
+   refusal handler gets the reason; nothing is raised. */
+enum mrb_checkpoint_req {
+  MRB_CHECKPOINT_REQ_OK = 0,
+  MRB_CHECKPOINT_REQ_NOT_READY,   /* no baseline, or not initialized */
+  MRB_CHECKPOINT_REQ_FIBER,       /* running in a Fiber or Task */
+  MRB_CHECKPOINT_REQ_C_BOUNDARY,  /* inside a block called from C */
+  MRB_CHECKPOINT_REQ_TASKS,       /* Tasks exist */
+  MRB_CHECKPOINT_REQ_PENDING,     /* a checkpoint is already pending */
+  MRB_CHECKPOINT_REQ_EXCEPTION,   /* (not returned since P3: the request waits until it is caught) */
+};
+MRB_API enum mrb_checkpoint_req mrb_checkpoint_request(mrb_state *mrb);
+typedef void (*mrb_checkpoint_refusal_handler)(mrb_state *mrb, const char *reason, void *ud);
+MRB_API void mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handler fn, void *ud);
+
+/* Dead registers (a temporary the code never reads again) are written as nil
+   (the liveness pass, checkpoint_live.c). keep = TRUE writes them as they are. */
+MRB_API void mrb_checkpoint_keep_dead_registers(mrb_state *mrb, mrb_bool keep);
+/* How many non-nil registers the last image wrote as nil. */
+MRB_API uint32_t mrb_checkpoint_last_dead(mrb_state *mrb);
 
 /* Restore an image into mrb (which must have had mrb_checkpoint_baseline and must
    not be running anything) and continue it to the end. Returns the value of
    the top-level program; on a restore error raises Checkpoint::Error. */
 MRB_API mrb_value mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len);
+/* The two halves of mrb_checkpoint_resume: build the state (raises
+   Checkpoint::Error on a restore error; no Ruby code of the program runs
+   except #hash / #eql? of restored Hash keys), then run it to the end. */
+MRB_API void mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len);
+MRB_API mrb_value mrb_checkpoint_continue(mrb_state *mrb);
 
 /* Side table for C data (RData). There is no field in mrb_data_type for this:
    the table maps a data type pointer to a pair of callbacks and a name the
@@ -72,6 +114,15 @@ typedef void *(*mrb_checkpoint_data_restore)(mrb_state *mrb, const uint8_t *byte
 MRB_API void mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const char *name,
                                      mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore restore);
 MRB_API void mrb_checkpoint_buf_bytes(mrb_state *mrb, mrb_checkpoint_buf *b, const void *p, size_t len);
+/* For C data whose struct holds Ruby values that the object also keeps in
+   its ivars (as mruby-regexp's MatchData does, for the GC): restore_obj is
+   called once every object of the image is built and filled, with the
+   object (ivars set, data pointer NULL); it returns the data pointer, or
+   NULL with a reason in why. */
+typedef void *(*mrb_checkpoint_data_restore_obj)(mrb_state *mrb, mrb_value obj, const uint8_t *bytes,
+                                                 size_t len, char *why, size_t whylen);
+MRB_API void mrb_checkpoint_register_data_obj(mrb_state *mrb, const mrb_data_type *type, const char *name,
+                                              mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore_obj restore);
 
 MRB_END_DECL
 

@@ -31,6 +31,9 @@
 #include <mruby/irep.h>
 #include <mruby/gc.h>
 #include <mruby/data.h>
+#include <mruby/error.h>
+#include <mruby/class.h>
+#include <mruby/internal.h>
 #include "checkpoint_internal.h"
 
 mrb_value mrb_attr_reader(mrb_state *mrb, mrb_value obj);
@@ -179,6 +182,9 @@ checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj)
     h = fnv_u64(h, mrb_hash_size(mrb, v));
     mrb_hash_foreach(mrb, mrb_hash_ptr(v), hash_digest_cb, &h);
     break;
+  case MRB_TT_ISTRUCT:
+    h = fnv_bytes(h, mrb_istruct_ptr(v), ISTRUCT_DATA_SIZE);
+    break;
   default:
     break;
   }
@@ -221,7 +227,8 @@ checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep)
   }
   h = fnv_u64(h, irep->slen);
   for (int i = 0; i < irep->slen; i++) {
-    if (irep->syms[i] == 0) { h = fnv_u64(h, UINT64_MAX); continue; }
+    /* (a ROM irep may have slen > 0 and no table: BasicObject#!= in class.c) */
+    if (!irep->syms || irep->syms[i] == 0) { h = fnv_u64(h, UINT64_MAX); continue; }
     mrb_int len;
     const char *s = mrb_sym_name_len(mrb, irep->syms[i], &len);
     h = fnv_u64(h, (uint64_t)len); h = fnv_bytes(h, s, len);
@@ -289,6 +296,7 @@ add_irep(mrb_state *mrb, checkpoint_perm *P, const mrb_irep *irep)
 }
 
 static void snap_object(mrb_state *mrb, checkpoint_perm *P, struct RBasic *o);
+static void visit_class(mrb_state *mrb, checkpoint_perm *P, struct RClass *c, const char *path);
 
 static void
 name_value(mrb_state *mrb, checkpoint_perm *P, mrb_value v, const char *name)
@@ -298,6 +306,13 @@ name_value(mrb_state *mrb, checkpoint_perm *P, mrb_value v, const char *name)
   if (named_obj(P, o)) return;
   add_name(mrb, P, name, o, 0);
   snap_object(mrb, P, o);
+  /* an object's own singleton class (ENV's methods live there) */
+  if (o->tt != MRB_TT_CLASS && o->tt != MRB_TT_MODULE && o->tt != MRB_TT_SCLASS &&
+      o->c && o->c->tt == MRB_TT_SCLASS) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "S:%s", name);
+    visit_class(mrb, P, o->c, buf);
+  }
 }
 
 static void
@@ -317,6 +332,10 @@ snap_object(mrb_state *mrb, checkpoint_perm *P, struct RBasic *o)
     s = new_snap(mrb, P, o);
     s->digest = checkpoint_content_digest(mrb, o);
     checkpoint_collect_iv(mrb, mrb_obj_value(o), &s->iv, &s->niv);
+    break;
+  case MRB_TT_ISTRUCT:
+    s = new_snap(mrb, P, o);
+    s->digest = checkpoint_content_digest(mrb, o);
     break;
   default:
     break;
@@ -339,7 +358,9 @@ visit_class(mrb_state *mrb, checkpoint_perm *P, struct RClass *c, const char *pa
   add_name(mrb, P, path, c, 0);
 
   gsnap *s = new_snap(mrb, P, (struct RBasic*)c);
+  uint32_t sidx = P->nsnaps - 1;   /* s moves when the table grows below */
   s->super = c->super;
+  s->cflags = c->flags & MRB_FL_CLASS_IS_PREPENDED;
   checkpoint_collect_mt(mrb, c, &s->mt, &s->nmt);
   checkpoint_collect_iv(mrb, mrb_obj_value(c), &s->iv, &s->niv);
 
@@ -397,15 +418,31 @@ visit_class(mrb_state *mrb, checkpoint_perm *P, struct RClass *c, const char *pa
     visit_class(mrb, P, c->c, buf);
   }
 
+  /* the superclass, when no constant leads to it (BasicObject: its constant
+     is in BasicObject itself, not in Object) */
+  {
+    struct RClass *sup = c->super;
+    while (sup && sup->tt == MRB_TT_ICLASS) sup = sup->super;
+    if (sup && sup->tt == MRB_TT_CLASS && !named_obj(P, sup)) {
+      mrb_value cp = mrb_class_path(mrb, sup);
+      if (mrb_string_p(cp)) {
+        snprintf(buf, sizeof(buf), "%.*s", (int)RSTRING_LEN(cp), RSTRING_PTR(cp));
+        visit_class(mrb, P, sup, buf);
+      }
+    }
+  }
+
   /* ivars and constants, in name order */
-  if (s->niv > 0) {
-    giv_entry *iv = (giv_entry*)mrb_malloc(mrb, sizeof(giv_entry) * s->niv);
-    memcpy(iv, s->iv, sizeof(giv_entry) * s->niv);
+  s = &P->snaps[sidx];
+  int niv = s->niv;
+  if (niv > 0) {
+    giv_entry *iv = (giv_entry*)mrb_malloc(mrb, sizeof(giv_entry) * niv);
+    memcpy(iv, s->iv, sizeof(giv_entry) * niv);
     sort_mrb = mrb;
-    qsort(iv, s->niv, sizeof(giv_entry), cmp_iv);
+    qsort(iv, niv, sizeof(giv_entry), cmp_iv);
     /* plain values first, so a class reached by two constants is named
        by the first one in a stable order */
-    for (int i = 0; i < s->niv; i++) {
+    for (int i = 0; i < niv; i++) {
       mrb_value v = iv[i].val;
       if (mrb_immediate_p(v)) continue;
       enum mrb_vtype t = mrb_type(v);
@@ -441,16 +478,115 @@ heap_cb(mrb_state *mrb, struct RBasic *obj, void *data)
   return MRB_EACH_OBJ_OK;
 }
 
-checkpoint_perm*
-checkpoint_perm_build(mrb_state *mrb)
+void
+checkpoint_gc_settings(mrb_state *mrb, gc_settings *g)
 {
+  memset(g, 0, sizeof(*g));
+  g->flags = (uint8_t)((mrb->gc.disabled ? 1 : 0) | (mrb->gc.generational ? 2 : 0) |
+                       (mrb->gc.auto_step ? 4 : 0) | (mrb->gc.sched_driven ? 8 : 0));
+  g->interval_ratio = (uint32_t)mrb->gc.interval_ratio;
+  g->step_ratio = (uint32_t)mrb->gc.step_ratio;
+  g->step_limit = (uint64_t)mrb->gc.step_limit;
+  g->malloc_threshold = (uint64_t)mrb->gc.malloc_threshold;
+  g->debt_limit = (int64_t)mrb->gc.debt_limit;
+}
+
+/* C functions the bundled gems put into classes they make at run time
+   (Struct.new, Data.define): static there, so a class is made for the
+   purpose before the baseline and the C functions of its methods and of
+   its singleton class's methods are named after the maker. */
+#define MAX_MADE_FUNCS 64
+static struct { char name[96]; mrb_func_t f; } made_funcs[MAX_MADE_FUNCS];
+static int nmade_funcs = -1;
+
+static int
+made_cb(mrb_state *mrb, mrb_sym sym, mrb_method_t m, void *ud)
+{
+  const char *prefix = (const char*)ud;
+  mrb_func_t f = NULL;
+  if (MRB_METHOD_FUNC_P(m)) f = MRB_METHOD_FUNC(m);
+  else if (MRB_METHOD_PROC(m) && MRB_PROC_CFUNC_P(MRB_METHOD_PROC(m))) f = MRB_METHOD_PROC(m)->body.func;
+  if (!f || nmade_funcs >= MAX_MADE_FUNCS) return 0;
+  for (int i = 0; i < nmade_funcs; i++) if (made_funcs[i].f == f) return 0;
+  snprintf(made_funcs[nmade_funcs].name, sizeof(made_funcs[0].name), "F:%s#%s", prefix, mrb_sym_name(mrb, sym));
+  made_funcs[nmade_funcs].f = f;
+  nmade_funcs++;
+  return 0;
+}
+
+static void
+made_class(mrb_state *mrb, const char *maker, const char *meth, const char *label)
+{
+  if (!mrb_class_defined(mrb, maker)) return;
+  /* enough members to see every kind of accessor (mruby-data has direct
+     functions for the first four, a closure after that) */
+  mrb_value a[6];
+  for (int i = 0; i < 6; i++) {
+    char n[2] = { (char)('a' + i), 0 };
+    a[i] = mrb_symbol_value(mrb_intern_cstr(mrb, n));
+  }
+  mrb_value k = mrb_funcall_argv(mrb, mrb_obj_value(mrb_class_get(mrb, maker)), mrb_intern_cstr(mrb, meth), 6, a);
+  if (!mrb_class_p(k)) return;
+  char buf[64];
+  mrb_mt_foreach(mrb, mrb_class_ptr(k), made_cb, (void*)label);
+  snprintf(buf, sizeof(buf), "S:%s", label);
+  struct RClass *sc = mrb_class_ptr(k)->c;
+  if (sc && sc->tt == MRB_TT_SCLASS) mrb_mt_foreach(mrb, sc, made_cb, buf);
+}
+
+static mrb_value
+find_closures(mrb_state *mrb, void *ud)
+{
+  (void)ud;
+  made_class(mrb, "Struct", "new", "Struct.new");
+  made_class(mrb, "Data", "define", "Data.define");
+  return mrb_nil_value();
+}
+
+checkpoint_perm*
+checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g)
+{
+  if (nmade_funcs < 0) {
+    /* once per process: the same build makes the same functions. The made
+       classes are garbage before the heap is taken below */
+    mrb_bool err;
+    nmade_funcs = 0;
+    int ai = mrb_gc_arena_save(mrb);
+    mrb_protect_error(mrb, find_closures, NULL, &err);
+    mrb_gc_arena_restore(mrb, ai);
+    mrb->exc = NULL;
+    mrb_full_gc(mrb);
+  }
   char buf[512];
   checkpoint_perm *P = (checkpoint_perm*)mrb_calloc(mrb, 1, sizeof(checkpoint_perm));
   pm_init(&P->obj2name); pm_init(&P->func2name); pm_init(&P->heap); pm_init(&P->irep2idx);
 
+  /* every heap object alive now is permanent, named or not. The table
+     holds their addresses, so none of them may be freed later (the program
+     can drop the last reference, e.g. remove_const, and a new object would
+     then take the slot and the name): a hidden Array keeps them all alive,
+     in an ivar of Checkpoint whose name Ruby code cannot spell. */
+  heap_acc h = { &P->heap, mrb };
+  mrb_objspace_each_objects(mrb, heap_cb, &h);
+  {
+    int ai = mrb_gc_arena_save(mrb);
+    mrb_value keep = mrb_ary_new_capa(mrb, (mrb_int)P->heap.n);
+    for (size_t i = 0; i < P->heap.cap; i++) {
+      if (P->heap.keys[i]) mrb_ary_push(mrb, keep, mrb_obj_value((void*)P->heap.keys[i]));
+    }
+    mrb_obj_ptr(keep)->c = NULL;   /* hidden from ObjectSpace, like the GC roots */
+    pm_put(mrb, &P->heap, mrb_obj_ptr(keep), 1);
+    struct RClass *ck = mrb_module_get(mrb, "Checkpoint");
+    mrb_obj_iv_set(mrb, (struct RObject*)ck, mrb_intern_lit(mrb, "__checkpoint_keep__"), keep);
+    mrb_gc_arena_restore(mrb, ai);
+  }
+
   /* C functions the core puts in closures */
   add_name(mrb, P, "F:attr_reader", (const void*)mrb_attr_reader, 1);
   add_name(mrb, P, "F:attr_writer", (const void*)mrb_attr_writer, 1);
+  /* ... and the bundled gems: the accessors Struct.new and Data.define make
+     (static functions there; found through a class made for the purpose) */
+  /* (the functions of the classes gems make at run time come last) */
 
   add_name(mrb, P, "T", mrb->top_self, 0);
   snap_object(mrb, P, (struct RBasic*)mrb->top_self);
@@ -484,9 +620,20 @@ checkpoint_perm_build(mrb_state *mrb)
     mrb_free(mrb, gv);
   }
 
-  /* every heap object alive now is permanent, named or not */
-  heap_acc h = { &P->heap, mrb };
-  mrb_objspace_each_objects(mrb, heap_cb, &h);
+  for (int i = 0; i < nmade_funcs; i++) {
+    if (!pm_get(&P->func2name, (const void*)made_funcs[i].f, NULL)) {
+      add_name(mrb, P, made_funcs[i].name, (const void*)made_funcs[i].f, 1);
+    }
+  }
+  /* the embedder's (mrb_checkpoint_register_func) */
+  for (int i = 0; g && i < g->nfuncs; i++) {
+    if (!pm_get(&P->func2name, (const void*)g->funcs[i], NULL)) {
+      add_name(mrb, P, g->fnames[i], (const void*)g->funcs[i], 1);
+    }
+  }
+
+  checkpoint_gc_settings(mrb, &P->gc);
+
   return P;
 }
 

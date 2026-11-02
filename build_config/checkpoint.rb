@@ -11,6 +11,9 @@
 # CHECKPOINT_TARGETS  comma separated subset of "host,host32" (default: both)
 # CHECKPOINT_DEBUG=asan  -g -O0 with AddressSanitizer (for debugging only)
 #             asan-stress  the same plus MRB_GC_STRESS (a full GC at every allocation)
+# CHECKPOINT_FUZZ=1   the test builds (build/fuzz): adds mrbgems/mruby-checkpoint-fuzz,
+#                     the external trigger (checkpoint-fuzz) that stops the test
+#                     suite at random safe points. Never in the normal builds.
 
 CHECKPOINT_ROOT = File.expand_path("..", __dir__)
 
@@ -19,6 +22,10 @@ def checkpoint_common(conf)
   conf.gembox 'default'
   conf.gem core: 'mruby-task'
   conf.gem "#{CHECKPOINT_ROOT}/mrbgems/mruby-checkpoint" unless ENV['CHECKPOINT_GEM'] == 'no'
+  if ENV['CHECKPOINT_FUZZ'] == '1'
+    conf.gem "#{CHECKPOINT_ROOT}/mrbgems/mruby-checkpoint-fuzz"
+    conf.defines << 'MRB_USE_DEBUG_HOOK'   # the per-instruction hook the trigger counts with
+  end
   conf.defines += %w(MRB_NO_BOXING MRB_INT64 MRB_UTF8_STRING)
   conf.cc.flags << '-O2'
   if ENV['CHECKPOINT_DEBUG'].to_s.start_with?('asan')

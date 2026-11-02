@@ -29,6 +29,10 @@ enum {
   GK_RANGE = 6, GK_EXCEPTION = 7, GK_CLASS = 8, GK_MODULE = 9,
   GK_SCLASS = 10, GK_ICLASS = 11, GK_PROC = 12, GK_ENV = 13, GK_DATA = 14,
   GK_PERM_BODY = 15,  /* a permanent Proc a frame runs: its name and its irep (carried) */
+  /* P3 */
+  GK_BIGINT = 16, GK_STRUCT = 17, GK_SET = 18, GK_RATIONAL = 19, GK_COMPLEX = 20,
+  GK_BREAK = 21, GK_RANDOM = 23, GK_ORIGIN = 24,
+  GK_BSTRING = 25,   /* a String marked binary (String#b): like 3 */
 };
 
 /* irep record kinds */
@@ -37,7 +41,10 @@ enum { GR_CARRIED = 0, GR_PERM = 1, GR_PERM_CARRIED = 2 };
 /* instance types of a class (what Class#allocate makes) */
 enum {
   GI_NONE = 0, GI_OBJECT = 1, GI_EXCEPTION = 2, GI_STRING = 3, GI_ARRAY = 4,
-  GI_HASH = 5, GI_RANGE = 6, GI_PROC = 7, GI_DATA = 8, GI_OTHER = 255,
+  GI_HASH = 5, GI_RANGE = 6, GI_PROC = 7, GI_DATA = 8,
+  GI_STRUCT = 9, GI_SET = 10, GI_COMPLEX = 11, GI_RATIONAL = 12, GI_BIGINT = 13,
+  GI_RANDOM = 14,   /* an inline C struct: Random's */
+  GI_OTHER = 255,
 };
 
 /* method entry kinds */
@@ -47,7 +54,40 @@ enum { GM_PROC = 0, GM_FUNC = 1, GM_UNDEF = 2 };
 enum {
   GP_METHOD_SET = 1, GP_METHOD_REMOVE = 2, GP_IV_SET = 3, GP_IV_REMOVE = 4,
   GP_SUPER_SET = 5, GP_GV_SET = 6, GP_GV_REMOVE = 7,
+  GP_RANDOM_SET = 8,   /* the state of a permanent Random (the default one) */
+  GP_CLASS_FLAGS = 9,  /* a permanent class got prepended modules */
+  GP_CONTENT_SET = 10, /* the contents of a permanent String / Array / Hash (ARGV << x) */
 };
+
+/* mruby-random's state, kept inline in the object (MRB_TT_ISTRUCT):
+   struct rand_state in mruby-random/src/random.c, 64-bit PCG state + the
+   last seed; on 32-bit the state is two 32-bit halves, low first */
+#include <mruby/istruct.h>
+static inline void
+checkpoint_random_get(mrb_value v, uint64_t *state, uint32_t *seed)
+{
+  const uint8_t *p = (const uint8_t*)mrb_istruct_ptr(v);
+#ifdef MRB_32BIT
+  uint32_t lo, hi;
+  memcpy(&lo, p, 4); memcpy(&hi, p + 4, 4);
+  *state = ((uint64_t)hi << 32) | lo;
+#else
+  memcpy(state, p, 8);
+#endif
+  memcpy(seed, p + 8, 4);
+}
+static inline void
+checkpoint_random_set(mrb_value v, uint64_t state, uint32_t seed)
+{
+  uint8_t *p = (uint8_t*)mrb_istruct_ptr(v);
+#ifdef MRB_32BIT
+  uint32_t lo = (uint32_t)state, hi = (uint32_t)(state >> 32);
+  memcpy(p, &lo, 4); memcpy(p + 4, &hi, 4);
+#else
+  memcpy(p, &state, 8);
+#endif
+  memcpy(p + 8, &seed, 4);
+}
 
 /* ---- byte buffer ---- */
 
@@ -100,6 +140,7 @@ typedef struct {
 typedef struct {
   struct RBasic *obj;     /* class, module, sclass, iclass or plain object */
   struct RClass *super;   /* classes only */
+  uint32_t cflags;        /* classes only: MRB_FL_CLASS_IS_PREPENDED */
   gmt_entry *mt; int nmt;
   giv_entry *iv; int niv;
   uint64_t digest;        /* string/array/hash contents */
@@ -109,6 +150,16 @@ typedef struct {
   const mrb_irep *irep;
   uint64_t hash;
 } girep_perm;
+
+/* the settings of the GC a program can change (GC.disable, GC.interval_ratio=, ...) */
+typedef struct {
+  uint8_t flags;              /* bit0 disabled, bit1 generational, bit2 auto_step, bit3 sched_driven */
+  uint32_t interval_ratio, step_ratio;
+  uint64_t step_limit, malloc_threshold;
+  int64_t debt_limit;
+} gc_settings;
+
+void checkpoint_gc_settings(mrb_state *mrb, gc_settings *out);
 
 typedef struct checkpoint_perm {
   /* named permanent things (objects and C functions) */
@@ -126,6 +177,7 @@ typedef struct checkpoint_perm {
 
   gsnap *snaps; uint32_t nsnaps, capsnaps;
   giv_entry *gv; int ngv;
+  gc_settings gc;    /* at the baseline */
 } checkpoint_perm;
 
 typedef struct checkpoint_data_ent {
@@ -133,7 +185,11 @@ typedef struct checkpoint_data_ent {
   char *name;
   mrb_checkpoint_data_dump dump;
   mrb_checkpoint_data_restore restore;
+  mrb_checkpoint_data_restore_obj restore_obj;
 } checkpoint_data_ent;
+
+/* the entries for the C data of mruby's bundled gems (checkpoint_bundled.c) */
+void checkpoint_bundled_register(mrb_state *mrb);
 
 typedef struct checkpoint_state {
   mrb_state *mrb;
@@ -149,11 +205,16 @@ typedef struct checkpoint_state {
   mrb_checkpoint_handler handler;
   void *handler_ud;
   checkpoint_data_ent *data; int ndata;
+  mrb_checkpoint_refusal_handler refusal;   /* where external requests report a refusal */
+  void *refusal_ud;
+  int keep_dead;              /* write dead registers too (no liveness pass) */
+  char **fnames; mrb_func_t *funcs; int nfuncs;   /* mrb_checkpoint_register_func */
+  uint32_t last_dead;         /* non-nil registers the last image wrote as nil */
 } checkpoint_state;
 
 checkpoint_state *checkpoint_get(mrb_state *mrb);
 
-checkpoint_perm *checkpoint_perm_build(mrb_state *mrb);
+checkpoint_perm *checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g);
 void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);
 const char *checkpoint_perm_name_of(checkpoint_perm *P, const void *obj);
 const char *checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f);
@@ -170,6 +231,9 @@ uint64_t checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj);
 void checkpoint_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n);
 void checkpoint_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n);
 void checkpoint_collect_gv(mrb_state *mrb, giv_entry **out, int *n);
+
+/* liveness: keep[s] = 1 for the stack slots whose values are still read */
+void checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint8_t *keep);
 
 /* dump: returns 0 on success; on failure fills err */
 int checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen);

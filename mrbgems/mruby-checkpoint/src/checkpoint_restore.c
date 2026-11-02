@@ -4,8 +4,10 @@
 ** Order:
 **   symbols -> ireps -> objects (pass 1: make every object, pass 2: fill
 **   the fields) -> changes to permanent objects -> included-module classes
-**   -> Hash entries (they may call #hash / #eql? of restored objects) ->
-**   frozen bits -> the VM (stack and frames) -> full GC -> continue.
+**   -> frozen bits (not of Hashes) -> the VM (stack and frames) -> line
+**   numbers, GC settings -> Hash entries (they may call #hash / #eql? of
+**   restored objects, which may run closures over the restored stack) ->
+**   frozen bits of Hashes -> full GC -> GC settings -> continue.
 ** The GC is off until the whole graph hangs from the roots.
 */
 
@@ -22,10 +24,15 @@
 #include <mruby/irep.h>
 #include <mruby/data.h>
 #include <mruby/internal.h>
+#include <mruby/debug.h>
+#include <mruby/presym.h>
+#include <mruby/throw.h>
+#include <mruby/numeric.h>
 #include "checkpoint_internal.h"
 
-typedef struct { struct RBasic *h; mrb_value k, v; } hent;
+typedef struct { struct RBasic *h; mrb_value k, v; uint8_t set; } hent;
 typedef struct { struct REnv *e; uint32_t off; } senv;
+typedef struct { struct RBasic *o; checkpoint_data_ent *de; const uint8_t *blob; size_t len; } dfix;
 
 typedef struct {
   mrb_state *mrb;
@@ -35,6 +42,7 @@ typedef struct {
   int failed;
   char err[512];
   int fill;                 /* object pass: 0 = make, 1 = fill */
+  int roots_done;           /* the root ireps' first reference is dropped */
 
   mrb_sym *syms; uint32_t nsym;
   mrb_irep **ireps; uint8_t *irep_perm; uint32_t *irep_parents; uint32_t nirep;
@@ -43,6 +51,9 @@ typedef struct {
   hent *hents; size_t nhent, caphent;
   senv *senvs; size_t nsenv, capsenv;
   struct RClass **icl; size_t nicl, capicl;
+  dfix *dfix; size_t ndfix, capdfix;   /* C data built from the filled object */
+  struct RClass **pre; size_t npre, cappre;   /* classes with prepended modules */
+  struct RBasic **fl; size_t nfl, capfl;      /* permanent Hashes frozen after their entries */
 } reader;
 
 static void
@@ -372,7 +383,12 @@ define_method(reader *r, struct RClass *c, mrb_sym sym, uint8_t vis, uint8_t kin
     MRB_METHOD_FROM_PROC(m, (const struct RProc*)ptr);
   }
   MRB_SET_VISIBILITY_FLAGS(m.flags, vflags);
+  /* mrb_define_method_raw makes the class the Proc's target class; the
+     image has the Proc's own (which differs for methods an origin holds) */
+  struct RProc *p = (kind == GM_PROC) ? (struct RProc*)ptr : NULL;
+  struct RClass *tc = (p && !MRB_PROC_ENV_P(p)) ? p->e.target_class : NULL;
   mrb_define_method_raw(r->mrb, c, sym, m);
+  if (tc && p->gc_color != MRB_GC_RED && !MRB_PROC_ENV_P(p)) p->e.target_class = tc;
 }
 
 static void
@@ -414,6 +430,12 @@ vtype_of_inst(uint8_t it)
   case GI_RANGE: return MRB_TT_RANGE;
   case GI_PROC: return MRB_TT_PROC;
   case GI_DATA: return MRB_TT_CDATA;
+  case GI_STRUCT: return MRB_TT_STRUCT;
+  case GI_SET: return MRB_TT_SET;
+  case GI_COMPLEX: return MRB_TT_COMPLEX;
+  case GI_RATIONAL: return MRB_TT_RATIONAL;
+  case GI_BIGINT: return MRB_TT_BIGINT;
+  case GI_RANDOM: return MRB_TT_ISTRUCT;
   default: return MRB_TT_FALSE;
   }
 }
@@ -422,6 +444,40 @@ static struct RBasic*
 alloc_obj(reader *r, enum mrb_vtype tt)
 {
   return (struct RBasic*)mrb_obj_alloc(r->mrb, tt, NULL);
+}
+
+/* give c a method table of its own, as mruby does at class creation
+   (mt_new in class.c; the struct is public in mruby/class.h) */
+static void
+ensure_mt(reader *r, struct RClass *c)
+{
+  if (c->mt) return;
+  mrb_mt_tbl *t = (mrb_mt_tbl*)mrb_malloc(r->mrb, sizeof(mrb_mt_tbl));
+  t->size = 0;
+  t->alloc = 0;
+  t->ptr = NULL;
+  t->next = NULL;
+  c->mt = t;
+}
+
+static void
+add_frozen_later(reader *r, struct RBasic *o)
+{
+  if (r->nfl == r->capfl) {
+    r->capfl = r->capfl ? r->capfl * 2 : 8;
+    r->fl = (struct RBasic**)mrb_realloc(r->mrb, r->fl, sizeof(void*) * r->capfl);
+  }
+  r->fl[r->nfl++] = o;
+}
+
+static void
+add_prepended(reader *r, struct RClass *c)
+{
+  if (r->npre == r->cappre) {
+    r->cappre = r->cappre ? r->cappre * 2 : 8;
+    r->pre = (struct RClass**)mrb_realloc(r->mrb, r->pre, sizeof(void*) * r->cappre);
+  }
+  r->pre[r->npre++] = c;
 }
 
 static void
@@ -458,10 +514,12 @@ r_object(reader *r, uint32_t id)
     r_ivars(r, o);
     break;
 
-  case GK_STRING: {
+  case GK_STRING:
+  case GK_BSTRING: {
     uint32_t len; const uint8_t *s = r_str(r, &len);
     if (!r->fill) {
       mrb_value str = mrb_str_new(mrb, (const char*)s, len);
+      if (kind == GK_BSTRING) mrb_str_ptr(str)->flags |= MRB_STR_BINARY;
       r->objs[id - 1] = mrb_basic_ptr(str);
     }
     break;
@@ -490,6 +548,7 @@ r_object(reader *r, uint32_t id)
           r->hents = (hent*)mrb_realloc(mrb, r->hents, sizeof(hent) * r->caphent);
         }
         r->hents[r->nhent].h = o; r->hents[r->nhent].k = k; r->hents[r->nhent].v = v;
+        r->hents[r->nhent].set = 0;
         r->nhent++;
       }
     }
@@ -506,13 +565,15 @@ r_object(reader *r, uint32_t id)
     mrb_value e = r_value(r);
     uint8_t excl = r_u8(r);
     if (!r->fill) {
-      r->objs[id - 1] = mrb_basic_ptr(mrb_range_new(mrb, mrb_nil_value(), mrb_nil_value(), excl));
+      /* bit 1: not initialized yet (Range.allocate) */
+      r->objs[id - 1] = (excl & 2) ? alloc_obj(r, MRB_TT_RANGE) :
+        mrb_basic_ptr(mrb_range_new(mrb, mrb_nil_value(), mrb_nil_value(), excl & 1));
     }
-    else {
+    else if (!(excl & 2)) {
       struct RRange *rg = (struct RRange*)o;
       RANGE_BEG(rg) = b;
       RANGE_END(rg) = e;
-      RANGE_EXCL(rg) = excl;
+      RANGE_EXCL(rg) = excl & 1;
     }
     break;
   }
@@ -544,10 +605,29 @@ r_object(reader *r, uint32_t id)
       MRB_SET_INSTANCE_TT(c, vtype_of_inst(it));
       if (cfl & 1) c->flags |= MRB_FL_UNDEF_ALLOCATE;
       if (cfl & 2) c->flags |= MRB_FL_CLASS_IS_INHERITED;
+      if (cfl & 4) add_prepended(r, c);   /* the flag once the origin is built */
     }
     r_ivars(r, o);
     uint32_t n = r_u32(r);
     for (uint32_t i = 0; i < n && !r->failed; i++) r_method(r, c);
+    /* a class's (empty) method table: modules are told apart by it
+       (Module#prepend's cycle check compares tables) */
+    if (r->fill && (cfl & 8)) ensure_mt(r, c);
+    break;
+  }
+
+  case GK_ORIGIN: {
+    if (!r->fill) r->objs[id - 1] = alloc_obj(r, MRB_TT_ICLASS);
+    struct RClass *c = (struct RClass*)o;
+    struct RBasic *super = r_obj(r);
+    if (r->fill) {
+      c->super = (struct RClass*)super;
+      o->flags |= MRB_FL_CLASS_IS_ORIGIN | MRB_FL_CLASS_IS_INHERITED;
+    }
+    uint8_t has_mt = r_u8(r);
+    uint32_t n = r_u32(r);
+    for (uint32_t i = 0; i < n && !r->failed; i++) r_method(r, c);
+    if (r->fill && has_mt) ensure_mt(r, c);
     break;
   }
 
@@ -579,9 +659,25 @@ r_object(reader *r, uint32_t id)
         if (!f || !is_func) { rfail(r, "C function '%.*s' not found in this build", (int)len, name); break; }
         p->body.func = (mrb_func_t)f;
         p->flags |= MRB_PROC_CFUNC_FL;
-        if (aspec & 0x80000000u) mrb_proc_set_cfunc_aspec(p, aspec & 0x7fffffffu);
+        /* high bit: the compressed aspec follows; 0 there means the
+           arguments are not checked (attr_writer's Proc), unlike NOARG */
+        if (aspec & 0x80000000u) {
+          p->flags &= ~(MRB_PROC_NOARG | MRB_PROC_CASPEC_MASK);
+          if (aspec & 0x7fffffffu) p->flags |= mrb_proc_compress_aspec(aspec & 0x7fffffffu);
+        }
         else p->flags |= MRB_PROC_NOARG;
       }
+    }
+    else if (body == 2) {
+      mrb_sym mid = r_sym(r);
+      if (r->fill) {
+        p->body.mid = mid;
+        p->flags |= MRB_PROC_ALIAS;
+      }
+    }
+    else if (body != 0) {
+      rfail(r, "bad proc body kind %u", body);
+      break;
     }
     else {
       uint32_t ir = r_u32(r);
@@ -646,16 +742,143 @@ r_object(reader *r, uint32_t id)
     break;
   }
 
+  case GK_BIGINT: {
+    uint8_t neg = r_u8(r);
+    uint32_t len; const uint8_t *digits = r_str(r, &len);
+    if (!r->fill && !r->failed) {
+#ifdef MRB_USE_BIGINT
+      mrb_value v = mrb_bint_new_str(mrb, (const char*)digits, len, neg ? -16 : 16);
+      /* the writer had a bigint object even for a value that fits (mruby does
+         not always normalize); keep it one */
+      if (!mrb_bigint_p(v)) v = mrb_as_bint(mrb, v);
+      if (!mrb_bigint_p(v)) { rfail(r, "bigint #%u could not be made", id); break; }
+      r->objs[id - 1] = mrb_basic_ptr(v);
+#else
+      (void)neg; (void)digits;
+      rfail(r, "this build has no bigint");
+#endif
+    }
+    break;
+  }
+
+  case GK_RANDOM: {
+    uint64_t st = r_u64(r);
+    uint32_t sd = r_u32(r);
+    if (!r->fill) r->objs[id - 1] = alloc_obj(r, MRB_TT_ISTRUCT);
+    else checkpoint_random_set(mrb_obj_value(o), st, sd);
+    r_ivars(r, o);
+    break;
+  }
+
+  case GK_STRUCT: {
+    uint32_t n = r_u32(r);
+    if (!r->fill) r->objs[id - 1] = alloc_obj(r, MRB_TT_STRUCT);
+    for (uint32_t i = 0; i < n && !r->failed; i++) {
+      mrb_value v = r_value(r);
+      if (r->fill) mrb_ary_push(mrb, mrb_obj_value(o), v);
+    }
+    r_ivars(r, o);
+    break;
+  }
+
+  case GK_SET: {
+    uint32_t n = r_u32(r);
+    if (n == UINT32_MAX) {   /* not initialized (Set.allocate) */
+      if (!r->fill) r->objs[id - 1] = alloc_obj(r, MRB_TT_SET);
+      r_ivars(r, o);
+      break;
+    }
+    if (!r->fill) {
+      /* an initialized, empty Set; its class is set in the fill pass */
+      r->objs[id - 1] = mrb_basic_ptr(mrb_funcall_argv(mrb, mrb_obj_value(mrb_class_get(mrb, "Set")),
+                                                     mrb_intern_lit(mrb, "new"), 0, NULL));
+    }
+    for (uint32_t i = 0; i < n && !r->failed; i++) {
+      mrb_value v = r_value(r);
+      if (r->fill) {
+        if (r->nhent == r->caphent) {
+          r->caphent = r->caphent ? r->caphent * 2 : 64;
+          r->hents = (hent*)mrb_realloc(mrb, r->hents, sizeof(hent) * r->caphent);
+        }
+        r->hents[r->nhent].h = o; r->hents[r->nhent].k = v; r->hents[r->nhent].v = mrb_nil_value();
+        r->hents[r->nhent].set = 1;
+        r->nhent++;
+      }
+    }
+    r_ivars(r, o);
+    break;
+  }
+
+  case GK_RATIONAL: {
+    uint32_t ln, ld;
+    const uint8_t *ns = r_str(r, &ln);
+    const uint8_t *ds = r_str(r, &ld);
+    if (!r->fill && !r->failed) {
+      mrb_value a[2];
+      a[0] = mrb_str_to_integer(mrb, mrb_str_new(mrb, (const char*)ns, ln), 10, TRUE);
+      a[1] = mrb_str_to_integer(mrb, mrb_str_new(mrb, (const char*)ds, ld), 10, TRUE);
+      mrb_value v = mrb_funcall_argv(mrb, mrb_top_self(mrb), mrb_intern_lit(mrb, "Rational"), 2, a);
+      r->objs[id - 1] = mrb_basic_ptr(v);
+    }
+    break;
+  }
+
+  case GK_COMPLEX: {
+    uint64_t ur = r_u64(r), ui = r_u64(r);
+    if (!r->fill && !r->failed) {
+      double fr, fi;
+      memcpy(&fr, &ur, 8); memcpy(&fi, &ui, 8);
+#ifdef MRB_USE_COMPLEX
+      r->objs[id - 1] = mrb_basic_ptr(mrb_complex_new(mrb, (mrb_float)fr, (mrb_float)fi));
+#else
+      (void)fr; (void)fi;
+      rfail(r, "this build has no Complex");
+#endif
+    }
+    break;
+  }
+
+  case GK_BREAK: {
+    uint8_t tag = r_u8(r);
+    uint32_t ci = r_u32(r);
+    mrb_value v = r_value(r);
+    if (!r->fill) r->objs[id - 1] = alloc_obj(r, MRB_TT_BREAK);
+    else {
+      struct RBreak *brk = (struct RBreak*)o;
+      o->c = NULL;
+      brk->ci_break_index = ci;
+      mrb_break_value_set(brk, v);
+      o->flags = (o->flags & ~(7u << 8)) | ((uint32_t)(tag & 7) << 8);
+    }
+    break;
+  }
+
   case GK_DATA: {
     uint32_t nlen; const uint8_t *name = r_str(r, &nlen);
     uint32_t blen; const uint8_t *blob = r_str(r, &blen);
+    if (nlen == 0) {   /* not initialized: no type, no pointer */
+      if (!r->fill) r->objs[id - 1] = (struct RBasic*)mrb_data_object_alloc(mrb, NULL, NULL, NULL);
+      r_ivars(r, o);
+      break;
+    }
+    checkpoint_data_ent *de = data_ent_by_name(r->G, name, nlen);
+    if (!de) { rfail(r, "C data type '%.*s' is not in this build's checkpoint data table", (int)nlen, name); break; }
     if (!r->fill) {
-      checkpoint_data_ent *de = data_ent_by_name(r->G, name, nlen);
-      if (!de) { rfail(r, "C data type '%.*s' is not in this build's checkpoint data table", (int)nlen, name); break; }
-      void *ptr = de->restore(mrb, blob, blen);
+      /* an entry that builds from the object (its ivars) runs once every
+         object is filled */
+      void *ptr = de->restore ? de->restore(mrb, blob, blen) : NULL;
       r->objs[id - 1] = (struct RBasic*)mrb_data_object_alloc(mrb, NULL, ptr, de->type);
     }
     r_ivars(r, o);
+    if (r->fill && de->restore_obj) {
+      if (r->ndfix == r->capdfix) {
+        r->capdfix = r->capdfix ? r->capdfix * 2 : 16;
+        r->dfix = (dfix*)mrb_realloc(mrb, r->dfix, sizeof(dfix) * r->capdfix);
+      }
+      r->dfix[r->ndfix].o = o; r->dfix[r->ndfix].de = de;
+      r->dfix[r->ndfix].blob = blob; r->dfix[r->ndfix].len = blen;
+      r->ndfix++;
+    }
     break;
   }
 
@@ -723,6 +946,65 @@ r_patches(reader *r)
       mrb_sym s = r_sym(r);
       mrb_value v = r_value(r);
       if (!r->failed) mrb_gv_set(mrb, s, v);
+      break;
+    }
+    case GP_CONTENT_SET: {
+      struct RBasic *o = r_obj(r);
+      uint8_t frozen = r_u8(r);
+      uint8_t kind = r_u8(r);   /* 3 String, 4 Array, 5 Hash: the object's own type */
+      if (r->failed) break;
+      if ((kind == GK_STRING && o->tt != MRB_TT_STRING) || (kind == GK_ARRAY && o->tt != MRB_TT_ARRAY) ||
+          (kind == GK_HASH && o->tt != MRB_TT_HASH)) { rfail(r, "contents of the wrong type for a permanent object"); break; }
+      mrb_value v = mrb_obj_value(o);
+      o->frozen = 0;
+      if (o->tt == MRB_TT_STRING) {
+        uint32_t len; const uint8_t *b = r_str(r, &len);
+        if (!r->failed) { mrb_str_resize(mrb, v, 0); mrb_str_cat(mrb, v, (const char*)b, len); }
+        o->frozen = frozen;
+      }
+      else if (o->tt == MRB_TT_ARRAY) {
+        uint32_t n = r_u32(r);
+        mrb_ary_clear(mrb, v);
+        for (uint32_t i = 0; i < n && !r->failed; i++) mrb_ary_push(mrb, v, r_value(r));
+        o->frozen = frozen;
+      }
+      else if (o->tt == MRB_TT_HASH) {
+        /* emptied now, filled with the other Hashes (keys may be user objects) */
+        uint32_t n = r_u32(r);
+        mrb_hash_clear(mrb, v);
+        for (uint32_t i = 0; i < n && !r->failed; i++) {
+          mrb_value k = r_value(r);
+          mrb_value val = r_value(r);
+          if (r->nhent == r->caphent) {
+            r->caphent = r->caphent ? r->caphent * 2 : 64;
+            r->hents = (hent*)mrb_realloc(mrb, r->hents, sizeof(hent) * r->caphent);
+          }
+          r->hents[r->nhent].h = o; r->hents[r->nhent].k = k; r->hents[r->nhent].v = val;
+          r->hents[r->nhent].set = 0;
+          r->nhent++;
+        }
+        if (frozen) add_frozen_later(r, o);
+      }
+      else rfail(r, "contents for a permanent object that is not a String, Array or Hash");
+      break;
+    }
+    case GP_CLASS_FLAGS: {
+      struct RClass *c = (struct RClass*)r_obj(r);
+      uint8_t f = r_u8(r);
+      if (!r->failed) {
+        if (f & 1) c->flags |= MRB_FL_CLASS_IS_PREPENDED;
+        else c->flags &= ~MRB_FL_CLASS_IS_PREPENDED;
+      }
+      break;
+    }
+    case GP_RANDOM_SET: {
+      struct RBasic *o = r_obj(r);
+      uint64_t st = r_u64(r);
+      uint32_t sd = r_u32(r);
+      if (!r->failed) {
+        if (!o || o->tt != MRB_TT_ISTRUCT) { rfail(r, "Random state for an object that is not one"); break; }
+        checkpoint_random_set(mrb_obj_value(o), st, sd);
+      }
       break;
     }
     case GP_GV_REMOVE: {
@@ -797,6 +1079,47 @@ r_vm(reader *r)
   }
 }
 
+/* line numbers of carried ireps (section 13) */
+static void
+r_debug(reader *r)
+{
+  mrb_state *mrb = r->mrb;
+  uint32_t n = r_u32(r);
+  for (uint32_t i = 0; i < n && !r->failed; i++) {
+    uint32_t id = r_u32(r);
+    uint16_t nf = r_u16(r);
+    if (id == 0 || id > r->nirep) { rfail(r, "debug info for irep #%u out of range", id); return; }
+    mrb_irep *irep = r->ireps[id - 1];
+    int use = !r->irep_perm[id - 1] && !irep->debug_info;
+    uint16_t *lines = NULL;
+    mrb_irep_debug_info *di = NULL;
+    if (use) {
+      lines = (uint16_t*)mrb_calloc(mrb, irep->ilen + 1, sizeof(uint16_t));
+      di = mrb_debug_info_alloc(mrb, irep);
+    }
+    for (uint16_t k = 0; k < nf && !r->failed; k++) {
+      uint32_t flen; const uint8_t *fn = r_str(r, &flen);
+      uint32_t start = r_u32(r), end = r_u32(r), ne = r_u32(r);
+      char name[512];
+      snprintf(name, sizeof(name), "%.*s", (int)flen, (const char*)fn);
+      uint32_t pos = start, line = 0;
+      for (uint32_t j = 0; j < ne && !r->failed; j++) {
+        uint32_t p = r_u32(r), l = r_u32(r);
+        if (use) {
+          for (; pos < p && pos < end && pos <= irep->ilen; pos++) lines[pos] = (uint16_t)line;
+        }
+        line = l;
+      }
+      if (use && !r->failed) {
+        for (; pos < end && pos <= irep->ilen; pos++) lines[pos] = (uint16_t)line;
+        if (end > irep->ilen + 1) end = irep->ilen + 1;
+        if (start < end) mrb_debug_info_append_file(mrb, di, name, lines, start, end);
+      }
+    }
+    mrb_free(mrb, lines);
+  }
+}
+
 static void
 reader_free(reader *r)
 {
@@ -805,10 +1128,13 @@ reader_free(reader *r)
   mrb_free(mrb, r->ireps); mrb_free(mrb, r->irep_perm); mrb_free(mrb, r->irep_parents);
   mrb_free(mrb, r->objs); mrb_free(mrb, r->okind); mrb_free(mrb, r->ofrozen);
   mrb_free(mrb, r->hents); mrb_free(mrb, r->senvs); mrb_free(mrb, r->icl);
+  mrb_free(mrb, r->dfix);
+  mrb_free(mrb, r->pre);
+  mrb_free(mrb, r->fl);
 }
 
-MRB_API mrb_value
-mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
+MRB_API void
+mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
 {
   reader r;
   memset(&r, 0, sizeof(r));
@@ -848,14 +1174,22 @@ mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
   if (!r.failed) r_objects(&r);
   if (!r.failed) {
     /* a new irep starts with one reference, owned by its first parent; for
-       a root irep (no parent here) the Procs now hold it, so drop that one */
+       a root irep (no parent here) the Procs now hold it, so drop that one
+       (a root no Proc holds is not used: it goes) */
     for (uint32_t i = 0; i < r.nirep; i++) {
-      if (!r.irep_perm[i] && r.irep_parents[i] == 0 && r.ireps[i]->refcnt > 1) {
-        mrb_irep_decref(mrb, r.ireps[i]);
-      }
+      if (!r.irep_perm[i] && r.irep_parents[i] == 0) mrb_irep_decref(mrb, r.ireps[i]);
     }
+    r.roots_done = 1;
   }
   r.fill = 1;
+  for (size_t i = 0; i < r.npre; i++) r.pre[i]->flags |= MRB_FL_CLASS_IS_PREPENDED;
+  for (size_t i = 0; i < r.ndfix && !r.failed; i++) {
+    struct RData *rd = (struct RData*)r.dfix[i].o;
+    char why[200] = "";
+    void *ptr = r.dfix[i].de->restore_obj(mrb, mrb_obj_value(rd), r.dfix[i].blob, r.dfix[i].len, why, sizeof(why));
+    if (!ptr) { rfail(&r, "C data %s could not be rebuilt: %s", r.dfix[i].de->name, why); break; }
+    rd->data = ptr;
+  }
   if (!r.failed) r_patches(&r);
   if (!r.failed) {
     /* included-module classes share the module's method table */
@@ -865,15 +1199,41 @@ mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
       MRB_CLASS_ORIGIN(m);
       ic->mt = m->mt;
     }
-    /* Hash entries last: #hash and #eql? may be user methods */
-    for (size_t i = 0; i < r.nhent; i++) {
-      mrb_hash_set(mrb, mrb_obj_value(r.hents[i].h), r.hents[i].k, r.hents[i].v);
-    }
+    /* frozen bits, except a Hash's (its entries are not in yet) */
     for (uint32_t i = 0; i < r.nobj; i++) {
-      if (r.okind[i] != GK_PERM && r.okind[i] != GK_PERM_BODY && r.ofrozen[i]) r.objs[i]->frozen = 1;
+      if (r.okind[i] != GK_PERM && r.okind[i] != GK_PERM_BODY && r.okind[i] != GK_HASH &&
+          r.okind[i] != GK_SET && r.ofrozen[i]) r.objs[i]->frozen = 1;
     }
   }
+  /* the VM before the Hash entries: a key's #hash may run a closure whose
+     variables live on the restored stack */
   if (!r.failed) r_vm(&r);
+  /* optional sections, each with its tag */
+  int has_gcs = 0, has_end = 0;
+  gc_settings gcs;
+  while (!r.failed && r.end - r.p >= 4) {
+    if (memcmp(r.p, "END0", 4) == 0) {
+      r.p += 4;
+      has_end = 1;
+      break;
+    }
+    else if (memcmp(r.p, "DBG0", 4) == 0) {
+      r.p += 4;
+      r_debug(&r);
+    }
+    else if (memcmp(r.p, "GCS0", 4) == 0) {
+      r.p += 4;
+      has_gcs = 1;
+      gcs.flags = r_u8(&r);
+      gcs.interval_ratio = r_u32(&r);
+      gcs.step_ratio = r_u32(&r);
+      gcs.step_limit = r_u64(&r);
+      gcs.malloc_threshold = r_u64(&r);
+      gcs.debt_limit = (int64_t)r_u64(&r);
+    }
+    else break;
+  }
+  if (!r.failed && !has_end) rfail(&r, "truncated image (no end mark)");
   if (!r.failed && r.p != r.end) rfail(&r, "%d bytes left after the image", (int)(r.end - r.p));
 
 #ifndef MRB_NO_METHOD_CACHE
@@ -883,10 +1243,73 @@ mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
   memset(mrb->const_cache, 0, sizeof(mrb->const_cache));
 #endif
 
+  if (!r.failed) {
+    /* Hash entries last: #hash and #eql? may be user methods. They run
+       here (as in Marshal.load); one that raises, or that changes a Hash
+       while the Hashes are rebuilt, makes the restore fail */
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      /* containers last-written first: an object reached from another has a
+         later number, so a Hash or Set used as a key or element is filled
+         before the one that hashes it */
+      mrb_sym add = mrb_intern_lit(mrb, "add");
+      struct RClass *setc = NULL;
+      size_t end = r.nhent;
+      while (end > 0) {
+        size_t start = end;
+        while (start > 0 && r.hents[start - 1].h == r.hents[end - 1].h) start--;
+        for (size_t i = start; i < end; i++) {
+          hent *e = &r.hents[i];
+          if (!e->set) {
+            mrb_hash_set(mrb, mrb_obj_value(e->h), e->k, e->v);
+          }
+          else {
+            /* Set#add of the built-in class, whatever a subclass did */
+            if (!setc) setc = mrb_class_get(mrb, "Set");
+            struct RClass *keep = e->h->c;
+            e->h->c = setc;
+            mrb_funcall_argv(mrb, mrb_obj_value(e->h), add, 1, &e->k);
+            e->h->c = keep;
+          }
+        }
+        end = start;
+      }
+      mrb->jmp = prev_jmp;
+    }
+    MRB_CATCH(&c_jmp) {
+      mrb->jmp = prev_jmp;
+      mrb_value e = mrb->exc ? mrb_obj_value(mrb->exc) : mrb_nil_value();
+      mrb->exc = NULL;
+      mrb_value m = mrb_nil_p(e) ? mrb_nil_value() : mrb_funcall_id(mrb, e, MRB_SYM(inspect), 0);
+      rfail(&r, "a Hash key's #hash or #eql? raised while the Hash was rebuilt: %s",
+            mrb_string_p(m) ? RSTRING_PTR(m) : "?");
+    }
+    MRB_END_EXC(&c_jmp);
+    for (size_t i = 0, j; i < r.nhent && !r.failed; i = j) {
+      for (j = i; j < r.nhent && r.hents[j].h == r.hents[i].h; j++) {}
+      if (!r.hents[i].set && (size_t)mrb_hash_size(mrb, mrb_obj_value(r.hents[i].h)) != j - i) {
+        rfail(&r, "a Hash came out with %d entries instead of %d: its keys' #hash or #eql? "
+              "changed it while it was rebuilt",
+              (int)mrb_hash_size(mrb, mrb_obj_value(r.hents[i].h)), (int)(j - i));
+      }
+    }
+    for (uint32_t i = 0; i < r.nobj && !r.failed; i++) {
+      if ((r.okind[i] == GK_HASH || r.okind[i] == GK_SET) && r.ofrozen[i]) r.objs[i]->frozen = 1;
+    }
+    for (size_t i = 0; i < r.nfl && !r.failed; i++) r.fl[i]->frozen = 1;
+  }
+
   mrb_gc_arena_restore(mrb, ai);
   mrb->gc.disabled = gc_was;
 
   if (r.failed) {
+    /* the root ireps' own reference (their Procs, now garbage, hold the rest) */
+    for (uint32_t i = 0; !r.roots_done && r.ireps && i < r.nirep; i++) {
+      if (!r.ireps[i] || r.irep_perm[i] || r.irep_parents[i] != 0) continue;
+      mrb_irep_decref(mrb, r.ireps[i]);
+    }
     /* leave the root context idle again */
     mrb->root_c->ci = mrb->root_c->cibase;
     char msg[600];
@@ -899,6 +1322,41 @@ mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
   mrb_full_gc(mrb);
   r.G->resumed = 1;
 
+  if (has_gcs) {
+    /* the program's GC settings; generational mode goes through GC.generational_mode=
+       (it changes the collector's state), while the GC is on and not scheduler-driven */
+    mrb_bool gen = (gcs.flags & 2) != 0;
+    if (mrb->gc.generational != gen) {
+      mrb->gc.disabled = FALSE;
+      mrb->gc.sched_driven = FALSE;
+      mrb_funcall_id(mrb, mrb_obj_value(mrb_module_get(mrb, "GC")),
+                     mrb_intern_lit(mrb, "generational_mode="), 1, mrb_bool_value(gen));
+    }
+    mrb->gc.interval_ratio = (int)gcs.interval_ratio;
+    mrb->gc.step_ratio = (int)gcs.step_ratio;
+    mrb->gc.step_limit = (size_t)gcs.step_limit;
+    mrb->gc.malloc_threshold = (size_t)gcs.malloc_threshold;
+    mrb->gc.debt_limit = (mrb_int)gcs.debt_limit;
+    mrb->gc.auto_step = (gcs.flags & 4) != 0;
+    mrb->gc.sched_driven = (gcs.flags & 8) != 0;
+    mrb->gc.disabled = (gcs.flags & 1) != 0;
+  }
+}
+
+MRB_API mrb_value
+mrb_checkpoint_continue(mrb_state *mrb)
+{
   mrb_callinfo *top = mrb->root_c->ci;
+  if (top == mrb->root_c->cibase && !top->proc) {
+    mrb_raise(mrb, mrb_class_get_under(mrb, mrb_module_get(mrb, "Checkpoint"), "Error"),
+              "nothing restored");
+  }
   return mrb_vm_exec(mrb, top->proc, top->pc);
+}
+
+MRB_API mrb_value
+mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
+{
+  mrb_checkpoint_restore(mrb, buf, len);
+  return mrb_checkpoint_continue(mrb);
 }

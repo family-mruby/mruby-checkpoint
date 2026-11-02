@@ -23,6 +23,8 @@
 #include <mruby/data.h>
 #include <mruby/internal.h>
 #include <mruby/version.h>
+#include <mruby/debug.h>
+#include <mruby/numeric.h>
 #include "checkpoint_internal.h"
 
 typedef struct {
@@ -228,6 +230,12 @@ inst_type(enum mrb_vtype tt)
   case MRB_TT_RANGE: return GI_RANGE;
   case MRB_TT_PROC: return GI_PROC;
   case MRB_TT_CDATA: return GI_DATA;
+  case MRB_TT_STRUCT: return GI_STRUCT;
+  case MRB_TT_SET: return GI_SET;
+  case MRB_TT_COMPLEX: return GI_COMPLEX;
+  case MRB_TT_RATIONAL: return GI_RATIONAL;
+  case MRB_TT_BIGINT: return GI_BIGINT;
+  case MRB_TT_ISTRUCT: return GI_RANDOM;
   default: return GI_OTHER;
   }
 }
@@ -265,6 +273,20 @@ hash_w_cb(mrb_state *mrb, mrb_value k, mrb_value v, void *p)
   return 0;
 }
 
+/* a Random (mruby-random), or an instance of a subclass */
+static int
+is_random(mrb_state *mrb, struct RBasic *o)
+{
+  if (o->tt != MRB_TT_ISTRUCT || !mrb_class_defined(mrb, "Random")) return 0;
+  return mrb_obj_is_kind_of(mrb, mrb_obj_value(o), mrb_class_get(mrb, "Random"));
+}
+
+static mrb_value
+set_to_a(mrb_state *mrb, void *o)
+{
+  return mrb_funcall_argv(mrb, mrb_obj_value(o), mrb_intern_lit(mrb, "to_a"), 0, NULL);
+}
+
 static void
 w_object(dumper *d, uint32_t id)
 {
@@ -289,8 +311,14 @@ w_object(dumper *d, uint32_t id)
     return;
   }
   if (pm_get(&d->P->heap, o, NULL)) {
-    fail(d, "object made by mrb_open has no name: %s of class %s (%s)",
-         type_name(o->tt), class_name(mrb, o->c), reach);
+    if (o->tt == MRB_TT_CLASS || o->tt == MRB_TT_MODULE) {
+      fail(d, "object made by mrb_open has no name: %s %s (%s)",
+           type_name(o->tt), class_name(mrb, (struct RClass*)o), reach);
+    }
+    else {
+      fail(d, "object made by mrb_open has no name: %s of class %s (%s)",
+           type_name(o->tt), class_name(mrb, o->c), reach);
+    }
     gb_u8(mrb, b, GK_PERM);
     gb_str(mrb, b, "", 0);
     return;
@@ -311,7 +339,7 @@ w_object(dumper *d, uint32_t id)
 
   case MRB_TT_STRING: {
     mrb_value s = mrb_obj_value(o);
-    HEADER(GK_STRING);
+    HEADER(RSTR_BINARY_P((struct RString*)o) ? GK_BSTRING : GK_STRING);
     gb_str(mrb, b, RSTRING_PTR(s), (size_t)RSTRING_LEN(s));
     break;
   }
@@ -345,6 +373,12 @@ w_object(dumper *d, uint32_t id)
   case MRB_TT_RANGE: {
     struct RRange *r = (struct RRange*)o;
     HEADER(GK_RANGE);
+    if (!(o->flags & 1)) {  /* RANGE_INITIALIZED_FLAG (range.c): Range.allocate, no edges yet */
+      gb_u8(mrb, b, GV_NIL);
+      gb_u8(mrb, b, GV_NIL);
+      gb_u8(mrb, b, 2);
+      break;
+    }
     snprintf(label, sizeof(label), "begin of #%u", id);
     w_value(d, b, RANGE_BEG(r), label);
     snprintf(label, sizeof(label), "end of #%u", id);
@@ -370,9 +404,6 @@ w_object(dumper *d, uint32_t id)
   case MRB_TT_MODULE:
   case MRB_TT_SCLASS: {
     struct RClass *c = (struct RClass*)o;
-    if (c->flags & (MRB_FL_CLASS_IS_PREPENDED | MRB_FL_CLASS_IS_ORIGIN)) {
-      fail(d, "class %s uses prepend, which format v0 does not carry (%s)", class_name(mrb, c), reach);
-    }
     HEADER(o->tt == MRB_TT_CLASS ? GK_CLASS : o->tt == MRB_TT_MODULE ? GK_MODULE : GK_SCLASS);
     snprintf(label, sizeof(label), "superclass of #%u", id);
     gb_u32(mrb, b, obj_ref(d, c->super, label));
@@ -383,7 +414,9 @@ w_object(dumper *d, uint32_t id)
     }
     gb_u8(mrb, b, it);
     gb_u8(mrb, b, (uint8_t)((MRB_UNDEF_ALLOCATOR_P(c) ? 1 : 0) |
-                            ((c->flags & MRB_FL_CLASS_IS_INHERITED) ? 2 : 0)));
+                            ((c->flags & MRB_FL_CLASS_IS_INHERITED) ? 2 : 0) |
+                            ((c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 4 : 0) |
+                            (c->mt ? 8 : 0)));
     w_ivars(d, b, o, id);
     gmt_entry *mt; int n;
     checkpoint_collect_mt(mrb, c, &mt, &n);
@@ -396,6 +429,21 @@ w_object(dumper *d, uint32_t id)
 
   case MRB_TT_ICLASS: {
     struct RClass *c = (struct RClass*)o;
+    if (c->flags & MRB_FL_CLASS_IS_ORIGIN) {
+      /* the origin of a class with prepended modules: holds the class's
+         own methods (the class field is the class) */
+      HEADER(GK_ORIGIN);
+      snprintf(label, sizeof(label), "superclass of #%u", id);
+      gb_u32(mrb, b, obj_ref(d, c->super, label));
+      gb_u8(mrb, b, c->mt ? 1 : 0);
+      gmt_entry *mt; int n;
+      checkpoint_collect_mt(mrb, c, &mt, &n);
+      gb_u32(mrb, b, (uint32_t)n);
+      snprintf(label, sizeof(label), "#%u", id);
+      for (int i = 0; i < n; i++) w_method(d, b, c, mt[i].sym, mt[i].flags, mt[i].ptr, label);
+      mrb_free(mrb, mt);
+      break;
+    }
     HEADER(GK_ICLASS);  /* the class field is the included module */
     snprintf(label, sizeof(label), "superclass of #%u", id);
     gb_u32(mrb, b, obj_ref(d, c->super, label));
@@ -408,12 +456,15 @@ w_object(dumper *d, uint32_t id)
     if (MRB_PROC_STRICT_P(p)) fl |= 1;
     if (MRB_PROC_ORPHAN_P(p)) fl |= 2;
     if (MRB_PROC_SCOPE_P(p)) fl |= 4;
-    if (MRB_PROC_ALIAS_P(p)) {
-      fail(d, "alias proc is not in format v0 (%s)", reach);
-    }
     HEADER(GK_PROC);
     gb_u8(mrb, b, fl);
-    if (MRB_PROC_CFUNC_P(p)) {
+    if (MRB_PROC_ALIAS_P(p)) {
+      /* alias_method of a Ruby method: the original's name, and the
+         original Proc as upper */
+      gb_u8(mrb, b, 2);
+      gb_u32(mrb, b, sym_ref(d, p->body.mid));
+    }
+    else if (MRB_PROC_CFUNC_P(p)) {
       const char *fname = checkpoint_perm_func_name(d->P, p->body.func);
       if (!fname) {
         fail(d, "Proc made from a C function that has no name in the baseline (%s)", reach);
@@ -474,8 +525,116 @@ w_object(dumper *d, uint32_t id)
     break;
   }
 
+  case MRB_TT_BIGINT: {
+    /* sign + hex digits of the absolute value */
+    mrb_value str = mrb_integer_to_str(mrb, mrb_obj_value(o), 16);
+    const char *p = RSTRING_PTR(str); mrb_int n = RSTRING_LEN(str);
+    HEADER(GK_BIGINT);
+    uint8_t neg = (n > 0 && p[0] == '-');
+    gb_u8(mrb, b, neg);
+    gb_str(mrb, b, p + neg, (size_t)(n - neg));
+    break;
+  }
+
+  case MRB_TT_ISTRUCT: {
+    if (!is_random(mrb, o)) {
+      fail(d, "type istruct (class %s) is not in format v0 (%s)", class_name(mrb, o->c), reach);
+      gb_u8(mrb, b, GK_PERM); gb_str(mrb, b, "", 0);
+      break;
+    }
+    uint64_t st; uint32_t sd;
+    checkpoint_random_get(mrb_obj_value(o), &st, &sd);
+    HEADER(GK_RANDOM);
+    gb_u64(mrb, b, st);
+    gb_u32(mrb, b, sd);
+    w_ivars(d, b, o, id);
+    break;
+  }
+
+  case MRB_TT_STRUCT: {
+    /* a Struct's values are an Array's body (mruby-struct); the member
+       names are the class's */
+    mrb_value a = mrb_obj_value(o);
+    mrb_int n = RARRAY_LEN(a);
+    HEADER(GK_STRUCT);
+    gb_u32(mrb, b, (uint32_t)n);
+    for (mrb_int i = 0; i < n; i++) {
+      snprintf(label, sizeof(label), "member %d of #%u", (int)i, id);
+      w_value(d, b, RARRAY_PTR(a)[i], label);
+    }
+    w_ivars(d, b, o, id);
+    break;
+  }
+
+  case MRB_TT_SET: {
+    /* the elements in order (Set#to_a, a C method); the reader adds them
+       again after everything is built, like a Hash's keys */
+    /* RSet embeds a khash whose first field is its table (mruby-set/src/set.c,
+       mruby/khash.h): NULL until Set#initialize ran (Set.allocate) */
+    struct { MRB_OBJECT_HEADER; void *data; } *rs = (void*)o;
+    HEADER(GK_SET);
+    if (rs->data == NULL) {
+      gb_u32(mrb, b, UINT32_MAX);
+      w_ivars(d, b, o, id);
+      break;
+    }
+    mrb_value ary = set_to_a(mrb, o);
+    if (!mrb_array_p(ary)) { fail(d, "Set#to_a did not give an Array (%s)", reach); break; }
+    gb_u32(mrb, b, (uint32_t)RARRAY_LEN(ary));
+    for (mrb_int i = 0; i < RARRAY_LEN(ary); i++) {
+      snprintf(label, sizeof(label), "element %d of #%u", (int)i, id);
+      w_value(d, b, RARRAY_PTR(ary)[i], label);
+    }
+    w_ivars(d, b, o, id);
+    break;
+  }
+
+  case MRB_TT_RATIONAL: {
+    /* numerator and denominator as decimal text (either may be a bigint) */
+    mrb_value nu = mrb_funcall_argv(mrb, mrb_obj_value(o), mrb_intern_lit(mrb, "numerator"), 0, NULL);
+    mrb_value de = mrb_funcall_argv(mrb, mrb_obj_value(o), mrb_intern_lit(mrb, "denominator"), 0, NULL);
+    HEADER(GK_RATIONAL);
+    mrb_value ns = mrb_integer_to_str(mrb, nu, 10), ds = mrb_integer_to_str(mrb, de, 10);
+    gb_str(mrb, b, RSTRING_PTR(ns), (size_t)RSTRING_LEN(ns));
+    gb_str(mrb, b, RSTRING_PTR(ds), (size_t)RSTRING_LEN(ds));
+    break;
+  }
+
+  case MRB_TT_COMPLEX: {
+    mrb_value re = mrb_funcall_argv(mrb, mrb_obj_value(o), mrb_intern_lit(mrb, "real"), 0, NULL);
+    mrb_value im = mrb_funcall_argv(mrb, mrb_obj_value(o), mrb_intern_lit(mrb, "imaginary"), 0, NULL);
+    HEADER(GK_COMPLEX);
+    double fr = mrb_float_p(re) ? mrb_float(re) : (double)mrb_as_int(mrb, re);
+    double fi = mrb_float_p(im) ? mrb_float(im) : (double)mrb_as_int(mrb, im);
+    uint64_t u;
+    memcpy(&u, &fr, 8); gb_u64(mrb, b, u);
+    memcpy(&u, &fi, 8); gb_u64(mrb, b, u);
+    break;
+  }
+
+  case MRB_TT_BREAK: {
+    /* a break / jump / stop going through an ensure clause: its kind (the
+       VM's tag: 0 break, 1 jump, 2 stop), the frame it ends at, its value */
+    struct RBreak *brk = (struct RBreak*)o;
+    HEADER(GK_BREAK);
+    gb_u8(mrb, b, (uint8_t)((o->flags >> 8) & 7));
+    gb_u32(mrb, b, (uint32_t)brk->ci_break_index);
+    snprintf(label, sizeof(label), "value of break #%u", id);
+    w_value(d, b, mrb_break_value_get(brk), label);
+    break;
+  }
+
   case MRB_TT_CDATA: {
     struct RData *rd = (struct RData*)o;
+    if (!rd->type && !rd->data) {
+      /* allocated, not initialized yet (Regexp.allocate ...): no type, no
+         pointer; carried as such (type name "") */
+      HEADER(GK_DATA);
+      gb_str(mrb, b, "", 0);
+      gb_str(mrb, b, "", 0);
+      w_ivars(d, b, o, id);
+      break;
+    }
     checkpoint_data_ent *de = rd->type ? data_ent(d->G, rd->type) : NULL;
     if (!de) {
       fail(d, "C data of class %s (type '%s') has no entry in the checkpoint data table (%s)",
@@ -551,7 +710,7 @@ w_irep(dumper *d, uint32_t id)
     }
   }
   gb_u16(mrb, b, irep->slen);
-  for (int i = 0; i < irep->slen; i++) gb_u32(mrb, b, sym_ref(d, irep->syms[i]));
+  for (int i = 0; i < irep->slen; i++) gb_u32(mrb, b, irep->syms ? sym_ref(d, irep->syms[i]) : 0);
   gb_u16(mrb, b, irep->rlen);
   for (int i = 0; i < irep->rlen; i++) gb_u32(mrb, b, irep->reps ? irep_ref(d, irep->reps[i]) : 0);
   if (irep->lv) {
@@ -658,6 +817,12 @@ w_patches(dumper *d)
         gb_u32(mrb, &d->patches, obj_ref(d, c->super, label));
         d->npatch++;
       }
+      if (o->tt != MRB_TT_ICLASS && (c->flags & MRB_FL_CLASS_IS_PREPENDED) != s->cflags) {
+        gb_u8(mrb, &d->patches, GP_CLASS_FLAGS);
+        gb_u32(mrb, &d->patches, obj_ref(d, o, label));
+        gb_u8(mrb, &d->patches, (c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0);
+        d->npatch++;
+      }
       if (o->tt == MRB_TT_ICLASS) break;
     }
       /* fall through */
@@ -668,10 +833,53 @@ w_patches(dumper *d)
       mrb_free(mrb, iv);
       break;
     }
+    case MRB_TT_ISTRUCT:
+      if (checkpoint_content_digest(mrb, o) != s->digest) {
+        if (!is_random(mrb, o)) {
+          fail(d, "permanent %s (inline C struct of class %s) was modified", name, class_name(mrb, o->c));
+          break;
+        }
+        uint64_t st; uint32_t sd;
+        checkpoint_random_get(mrb_obj_value(o), &st, &sd);
+        gb_u8(mrb, &d->patches, GP_RANDOM_SET);
+        gb_u32(mrb, &d->patches, obj_ref(d, o, label));
+        gb_u64(mrb, &d->patches, st);
+        gb_u32(mrb, &d->patches, sd);
+        d->npatch++;
+      }
+      break;
     case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_HASH:
       if (checkpoint_content_digest(mrb, o) != s->digest) {
-        fail(d, "permanent %s (%s) was modified; format v0 carries only changes to "
-             "classes, ivars and globals", name, type_name(o->tt));
+        /* the whole contents again, as in the object record (and frozen) */
+        mrb_value v = mrb_obj_value(o);
+        gb_u8(mrb, &d->patches, GP_CONTENT_SET);
+        gb_u32(mrb, &d->patches, obj_ref(d, o, label));
+        gb_u8(mrb, &d->patches, (uint8_t)o->frozen);
+        gb_u8(mrb, &d->patches, o->tt == MRB_TT_STRING ? GK_STRING : o->tt == MRB_TT_ARRAY ? GK_ARRAY : GK_HASH);
+        if (o->tt == MRB_TT_STRING) {
+          gb_str(mrb, &d->patches, RSTRING_PTR(v), (size_t)RSTRING_LEN(v));
+        }
+        else if (o->tt == MRB_TT_ARRAY) {
+          gb_u32(mrb, &d->patches, (uint32_t)RARRAY_LEN(v));
+          for (mrb_int i = 0; i < RARRAY_LEN(v); i++) {
+            snprintf(label, sizeof(label), "element %d of permanent %s", (int)i, name);
+            w_value(d, &d->patches, RARRAY_PTR(v)[i], label);
+          }
+        }
+        else {
+          gb_u32(mrb, &d->patches, (uint32_t)mrb_hash_size(mrb, v));
+          hash_w hw = { d, &d->patches, 0, 0 };
+          mrb_hash_foreach(mrb, mrb_hash_ptr(v), hash_w_cb, &hw);
+        }
+        d->npatch++;
+      }
+      if (o->tt != MRB_TT_HASH) break;
+      {
+        /* a Hash's ivars (its default value) */
+        giv_entry *iv; int n;
+        checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
+        diff_iv(d, o, s->iv, s->niv, iv, n, name);
+        mrb_free(mrb, iv);
       }
       break;
     default:
@@ -716,11 +924,22 @@ w_vm(dumper *d)
   mrb_callinfo *top = c->ci;
   size_t live = (size_t)(top->stack - c->stbase) + (size_t)mrb_ci_nregs(top);
   if (c->stbase + live > c->stend) live = (size_t)(c->stend - c->stbase);
+  /* dead registers (never read again from where the frames stand) go as nil */
+  uint8_t *keep = (uint8_t*)mrb_malloc(mrb, live + 1);
+  if (d->G->keep_dead) memset(keep, 1, live);
+  else checkpoint_live_slots(mrb, c, live, keep);
+  d->G->last_dead = 0;
   gb_u32(mrb, b, (uint32_t)live);
   for (size_t i = 0; i < live; i++) {
+    if (!keep[i]) {
+      if (!mrb_nil_p(c->stbase[i])) d->G->last_dead++;
+      gb_u8(mrb, b, GV_NIL);
+      continue;
+    }
     snprintf(label, sizeof(label), "stack slot %d", (int)i);
     w_value(d, b, c->stbase[i], label);
   }
+  mrb_free(mrb, keep);
 
   uint32_t nframes = (uint32_t)(top - c->cibase) + 1;
   gb_u32(mrb, b, nframes);
@@ -765,6 +984,46 @@ w_vm(dumper *d)
   }
 }
 
+/* ---- debug info (line numbers), the optional last section ---- */
+
+/* the files and (pc, line) changes of a carried irep's debug info */
+static int
+w_debug_irep(dumper *d, gbuf *b, uint32_t id)
+{
+  mrb_state *mrb = d->mrb;
+  const mrb_irep *irep = d->iq[id - 1];
+  const mrb_irep_debug_info *di = irep->debug_info;
+  if (!di || di->flen == 0 || checkpoint_perm_irep(d->P, irep, NULL)) return 0;
+  for (int i = 0; i < di->flen; i++) {
+    if (di->files[i]->line_type != mrb_debug_line_packed_map) return 0;
+  }
+  gb_u32(mrb, b, id);
+  gb_u16(mrb, b, di->flen);
+  for (int i = 0; i < di->flen; i++) {
+    const mrb_irep_debug_info_file *f = di->files[i];
+    uint32_t end = i + 1 < di->flen ? di->files[i + 1]->start_pos : di->pc_count;
+    mrb_int flen;
+    const char *fn = mrb_sym_name_len(mrb, f->filename_sym, &flen);
+    gb_str(mrb, b, fn, (size_t)flen);
+    gb_u32(mrb, b, f->start_pos);
+    gb_u32(mrb, b, end);
+    /* count, then the entries */
+    const uint8_t *p = f->lines.packed_map, *pend = p + f->line_entry_count;
+    uint32_t n = 0;
+    while (p < pend) { mrb_packed_int_decode(p, &p); mrb_packed_int_decode(p, &p); n++; }
+    gb_u32(mrb, b, n);
+    p = f->lines.packed_map;
+    uint32_t pos = 0, line = 0;
+    while (p < pend) {
+      pos += mrb_packed_int_decode(p, &p);
+      line += mrb_packed_int_decode(p, &p);
+      gb_u32(mrb, b, pos);
+      gb_u32(mrb, b, line);
+    }
+  }
+  return 1;
+}
+
 int
 checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
 {
@@ -791,14 +1050,16 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     }
   }
 
+  gc_settings gcs;
+  checkpoint_gc_settings(mrb, &gcs);   /* before the dump turns the GC off */
   mrb_bool gc_was = mrb->gc.disabled;
   mrb->gc.disabled = TRUE;
   int ai = mrb_gc_arena_save(mrb);
 
   w_vm(&d);
   if (!d.failed) w_patches(&d);
-  for (uint32_t i = 1; i <= d.nobj; i++) w_object(&d, i);  /* nobj grows while we go */
-  for (uint32_t i = 1; i <= d.nirep; i++) w_irep(&d, i);
+  for (uint32_t i = 1; i <= d.nobj && !d.failed; i++) w_object(&d, i);  /* nobj grows while we go */
+  for (uint32_t i = 1; i <= d.nirep && !d.failed; i++) w_irep(&d, i);
 
   if (!d.failed) {
     char tmp[64];
@@ -816,6 +1077,29 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     gb_u32(mrb, out, d.nobj);   gb_bytes(mrb, out, d.objs.p, d.objs.len);
     gb_u32(mrb, out, d.npatch); gb_bytes(mrb, out, d.patches.p, d.patches.len);
     gb_bytes(mrb, out, d.vm.p, d.vm.len);
+    /* line numbers of the carried ireps (format v0 section 13, optional:
+       left out when no carried irep has them) */
+    gbuf dbg; gb_init(&dbg);
+    uint32_t ndbg = 0;
+    for (uint32_t i = 1; i <= d.nirep; i++) ndbg += (uint32_t)w_debug_irep(&d, &dbg, i);
+    if (ndbg > 0) {
+      gb_bytes(mrb, out, "DBG0", 4);
+      gb_u32(mrb, out, ndbg);
+      gb_bytes(mrb, out, dbg.p, dbg.len);
+    }
+    gb_free(mrb, &dbg);
+    /* the GC settings, when the program changed them (section 14) */
+    if (memcmp(&gcs, &d.P->gc, sizeof(gcs)) != 0) {
+      gb_bytes(mrb, out, "GCS0", 4);
+      gb_u8(mrb, out, gcs.flags);
+      gb_u32(mrb, out, gcs.interval_ratio);
+      gb_u32(mrb, out, gcs.step_ratio);
+      gb_u64(mrb, out, gcs.step_limit);
+      gb_u64(mrb, out, gcs.malloc_threshold);
+      gb_u64(mrb, out, (uint64_t)gcs.debt_limit);
+    }
+    /* the end: a cut image is refused, also one cut between sections */
+    gb_bytes(mrb, out, "END0", 4);
   }
 
   mrb_gc_arena_restore(mrb, ai);

@@ -1,0 +1,11 @@
+# Tests whose result may legitimately change when a checkpoint falls inside
+# them (tools/fuzz.rb). They are run and counted like every other test; a
+# difference whose first differing line belongs to one of these assertions is
+# reported as expected instead of as a failure.
+#
+# file | assertion (the start of its line in the verbose output) | when | reason
+# "another process": counted as expected only when the same run kept in one
+# process (--xproc 0) gives the reference output.
+core/proc.rb | identity check for proc object | in-process | Proc#hash is computed from the addresses of the irep and the Env (proc.c proc_hash); a restore gives new addresses, so a hash taken before the checkpoint and one taken after differ
+mruby-method/method.rb | to_s | in-process | the expected string is built from the inspect of a singleton class (#<Class:#<Object:0x...>>, an address) before the checkpoint and compared with an inspect made after it
+mruby-io/io.rb | IO | another process | the tests keep a file descriptor as an Integer (IO.sysopen) and make an IO of it later; a descriptor is a resource of the process, which the image does not carry (O_CLOEXEC), so in another process the number is not open (EBADF)
