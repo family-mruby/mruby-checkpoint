@@ -1,44 +1,80 @@
 --- a/src/vm.c
 +++ b/src/vm.c
-@@ -1603,6 +1603,15 @@
- #define CALL_CODE_HOOKS() do { insn = BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); } while (0)
+@@ -1622,6 +1622,35 @@
+   return FALSE;
+ }
  
- #ifdef MRB_USE_TASK_SCHEDULER
 +/* Safe point hook (mruby-ghost). Called from the task-switch check, only
 +   while task.switching is pending and only where a task switch would be
 +   allowed apart from the root-context rule: no exception in flight, no
 +   ObjectSpace walk, no C call boundary on the call-info stack. At that
 +   point every frame's pc and registers are in memory (ci->pc, ci->stack).
 +   The hook may return (nothing to do), raise, or never return. NULL by
-+   default, so normal execution pays nothing beyond the existing check. */
++   default. */
 +void (*mrb_vm_safepoint_hook)(mrb_state *mrb) = NULL;
 +
- /* TRUE when the current context is executing across a C call boundary, i.e.
-    a C function on the stack re-entered the VM (mrb_funcall / mrb_yield /
-    mrb_vm_run). A task cannot be suspended at such a point: the C stack
-@@ -1663,12 +1672,19 @@
++/* The slow half of RETURN_IF_TASK_STOPPED, kept out of line so that the
++   check expanded at every instruction boundary is two loads and a branch.
++   Returns TRUE when mrb_vm_exec should return to the scheduler. */
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((noinline))
++#endif
++static mrb_bool
++task_stop_requested(mrb_state *mrb)
++{
++  if (mrb->task.switching && !mrb->exc && !mrb->gc.iterating &&
++      !task_across_c_boundary(mrb)) {
++    if (mrb_vm_safepoint_hook) {
++      mrb_vm_safepoint_hook(mrb);
++      if (!mrb->task.switching) return mrb->c->status == MRB_TASK_STOPPED;
++    }
++    if (mrb->c != mrb->root_c) return TRUE;
++  }
++  return mrb->c->status == MRB_TASK_STOPPED;
++}
++
+ /* Defer task switches while a C-level ObjectSpace walk holds gc.iterating
+    true. The walk runs callbacks (which may call back into mrb_vm_exec via
+    mrb_yield); returning early from an inner exec while the outer C
+@@ -1662,15 +1691,21 @@
+ 
     This macro must only be expanded where prev_jmp is in scope, i.e.
     inside mrb_vm_exec (via NEXT / END_DISPATCH). */
++#ifdef MRB_USE_VM_SWITCH_DISPATCH
  #define RETURN_IF_TASK_STOPPED(mrb) do { \
 -  if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
 -       !(mrb)->exc && \
 -       !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
 -      (mrb)->c->status == MRB_TASK_STOPPED) { \
--    (mrb)->jmp = prev_jmp; \
--    return mrb_nil_value(); \
-+  if ((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED) { \
-+    if ((mrb)->task.switching && mrb_vm_safepoint_hook && \
-+        !(mrb)->exc && !(mrb)->gc.iterating && \
-+        !task_across_c_boundary(mrb)) { \
-+      mrb_vm_safepoint_hook(mrb); \
-+    } \
-+    if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
-+         !(mrb)->exc && \
-+         !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
-+        (mrb)->c->status == MRB_TASK_STOPPED) { \
-+      (mrb)->jmp = prev_jmp; \
-+      return mrb_nil_value(); \
-+    } \
++  if (mrb_unlikely((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED) && \
++      task_stop_requested(mrb)) { \
+     (mrb)->jmp = prev_jmp; \
+     return mrb_nil_value(); \
    } \
  } while (0)
++#else
++/* one shared slow path (L_TASK_CHECK in mrb_vm_exec) for every boundary */
++#define RETURN_IF_TASK_STOPPED(mrb) do { \
++  if (mrb_unlikely((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED)) \
++    goto L_TASK_CHECK; \
++} while (0)
++#endif
  #define TASK_STOP(mrb) do { \
+   if (mrb->c->status != MRB_TASK_STOPPED) \
+     mrb->c->status = MRB_TASK_STOPPED; \
+@@ -3919,6 +3954,15 @@
+       return regs[irep->nlocals];
+     }
+   }
++#if defined(MRB_USE_TASK_SCHEDULER) && !defined(MRB_USE_VM_SWITCH_DISPATCH)
++L_TASK_CHECK:
++  if (task_stop_requested(mrb)) {
++    mrb->jmp = prev_jmp;
++    return mrb_nil_value();
++  }
++  CALL_CODE_HOOKS();
++  goto *optable[insn];
++#endif
+   END_DISPATCH;
+ #undef regs
+   }

@@ -568,7 +568,7 @@ same_value(mrb_value a, mrb_value b)
 }
 
 static void
-diff_iv(dumper *d, uint32_t ref, giv_entry *old, int nold, giv_entry *cur, int ncur, const char *name)
+diff_iv(dumper *d, struct RBasic *o, giv_entry *old, int nold, giv_entry *cur, int ncur, const char *name)
 {
   mrb_state *mrb = d->mrb;
   char label[200];
@@ -577,7 +577,8 @@ diff_iv(dumper *d, uint32_t ref, giv_entry *old, int nold, giv_entry *cur, int n
     for (j = 0; j < nold; j++) if (old[j].sym == cur[i].sym) break;
     if (j < nold && same_value(old[j].val, cur[i].val)) continue;
     gb_u8(mrb, &d->patches, GP_IV_SET);
-    gb_u32(mrb, &d->patches, ref);
+    snprintf(label, sizeof(label), "permanent %s", name);
+    gb_u32(mrb, &d->patches, obj_ref(d, o, label));
     gb_u32(mrb, &d->patches, sym_ref(d, cur[i].sym));
     snprintf(label, sizeof(label), "%s of %s", mrb_sym_name(mrb, cur[i].sym), name);
     w_value(d, &d->patches, cur[i].val, label);
@@ -588,7 +589,8 @@ diff_iv(dumper *d, uint32_t ref, giv_entry *old, int nold, giv_entry *cur, int n
     for (i = 0; i < ncur; i++) if (old[j].sym == cur[i].sym) break;
     if (i < ncur) continue;
     gb_u8(mrb, &d->patches, GP_IV_REMOVE);
-    gb_u32(mrb, &d->patches, ref);
+    snprintf(label, sizeof(label), "permanent %s", name);
+    gb_u32(mrb, &d->patches, obj_ref(d, o, label));
     gb_u32(mrb, &d->patches, sym_ref(d, old[j].sym));
     d->npatch++;
   }
@@ -647,7 +649,7 @@ w_patches(dumper *d)
     case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: {
       giv_entry *iv; int n;
       ghost_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
-      if (n > 0 || s->niv > 0) diff_iv(d, obj_ref(d, o, label), s->iv, s->niv, iv, n, name);
+      diff_iv(d, o, s->iv, s->niv, iv, n, name);  /* refers to o only if something changed */
       mrb_free(mrb, iv);
       break;
     }
