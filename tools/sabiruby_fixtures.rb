@@ -11,28 +11,39 @@
 #                    (the sample's `sabiruby-refuse K "TEXT"` annotation)
 # For a save sample: NAME.1.ckpt and NAME.1.out (= NAME.resumed.out).
 # NAME.rb is copied too, so that the images can be made again from it.
+# The samples of Tasks and Fibers (task_*, fiber_*), counter and lines are also run as a
+# Task (checkpoint run --as-task, the start of a Family mruby application): NAME-task.K.ckpt
+# and so on. A sample marked `clock virtual` is run with the test builds (build/fuzz), whose
+# mruby-task clock is virtual.
 
 require 'open3'
 require 'tmpdir'
 require 'fileutils'
 
 ROOT = File.expand_path('..', __dir__)
-BIN = { '64' => File.join(ROOT, 'build/mruby/host/bin/checkpoint'), '32' => File.join(ROOT, 'build/mruby/host32/bin/checkpoint') }
+NORMAL = { '64' => File.join(ROOT, 'build/mruby/host/bin/checkpoint'), '32' => File.join(ROOT, 'build/mruby/host32/bin/checkpoint') }
+VIRTUAL = { '64' => File.join(ROOT, 'build/fuzz/host/bin/checkpoint'), '32' => File.join(ROOT, 'build/fuzz/host32/bin/checkpoint') }
+AS_TASK = /\A(task_|fiber_|counter\z|lines\z)/
 out_dir = ARGV.shift or abort 'usage: sabiruby_fixtures.rb OUTDIR [sample ...]'
 out_dir = File.expand_path(out_dir)
 FileUtils.mkdir_p(out_dir)
 samples = ARGV.empty? ? Dir[File.join(ROOT, 'test/samples/*.rb')].sort : ARGV.map { |a| File.expand_path(a) }
 
 def run(arch, *args, dir:)
-  out, _err, _st = Open3.capture3(BIN.fetch(arch), *args, chdir: dir)
+  args = [args[0], '--as-task', *args[1..]] if $as_task && args[0] == 'run'
+  out, _err, _st = Open3.capture3($bins.fetch(arch), *args, chdir: dir)
   out
 end
 
-samples.each do |path|
-  name = File.basename(path, '.rb')
+samples.product([false, true]).each do |path, as_task|
+  base = File.basename(path, '.rb')
   src = File.read(path)
   ann = src.lines.grep(/^# checkpoint-test:/).map { |l| l.sub(/^# checkpoint-test:\s*/, '').strip }
   next if ann.include?('refuse')
+  next if as_task && (base !~ AS_TASK || ann.include?('no-as-task') || ann.any? { |a| a.start_with?('sabiruby-skip-as-task') })
+  $as_task = as_task
+  $bins = ann.include?('clock virtual') ? VIRTUAL : NORMAL
+  name = as_task ? "#{base}-task" : base
   refused = ann.filter_map { |a| (m = a.match(/\Asabiruby-refuse (\d+) "(.*)"\z/)) && [m[1].to_i, m[2]] }.to_h
   Dir.mktmpdir('checkpoint-fixtures') do |dir|
     FileUtils.cp(path, dir)

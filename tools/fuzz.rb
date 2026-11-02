@@ -108,7 +108,8 @@ def excluded_by(list, ref, out)
   i = (0...[la.size, lb.size].max).find { |k| la[k] != lb[k] }
   return nil unless i
   line = la[i] || lb[i]
-  list.find { |e| line.start_with?(e[:assertion]) }
+  # the assertion's own line, or its line in the failure summary ("Class: name => message")
+  list.find { |e| line.start_with?(e[:assertion]) || line =~ /\A\w+(::\w+)*: #{Regexp.escape(e[:assertion])}/ }
 end
 
 # what differs between two runs without any checkpoint: the wall clock in
@@ -278,6 +279,7 @@ def run_file(gem, file, opts, excl)
               written: points['written'] }
       ex = !same && excluded_by(excl[name], ref, out)
       ex = nil if ex && ex[:when] == 'as-task' && !opts[:as_task]
+      ex = nil if ex && ex[:when] == 'sabiruby'   # another VM only (tools/fuzz_sabiruby.rb)
       if ex && ex[:when] == 'another process'
         # listed for other processes only: the same run kept in this process must not differ
         o2, _, s2 = run('64', [*common, '--seed', seed.to_s, '--mean', mean.to_s, '--xproc', '0',

@@ -164,10 +164,18 @@ checkpoint_task_of_context(mrb_state *mrb, struct mrb_context *c)
   return NULL;
 }
 
-/* the Task whose slice is running (the one RUNNING in the ready queue) */
+/* the Task whose slice is running: the one whose context the current
+   context was resumed from (or is), else the one RUNNING in the ready queue
+   (a Fiber it reached by Fiber#transfer has no way back to it). It may have
+   stopped running at this point already (it slept, it terminated itself):
+   its slice ends at the next boundary. */
 mrb_task*
 checkpoint_running_task(mrb_state *mrb)
 {
+  for (struct mrb_context *c = mrb->c; c && c != mrb->root_c; c = c->prev) {
+    mrb_task *t = checkpoint_task_of_context(mrb, c);
+    if (t) return t;
+  }
   for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; t; t = t->next) {
     if (t->status == MRB_TASK_STATUS_RUNNING) return t;
   }

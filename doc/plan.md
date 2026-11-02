@@ -58,7 +58,7 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 | P1b | mruby-checkpoint への改名、`save` / `suspend`、C の境目の中は例外 | 検収済 (2026-11-02) |
 | P2 | mruby → SabiRuby の片道 (スコープ 4) | 検収済 (2026-11-02) |
 | P3 | 試験一式のランダムな安全点での往復 (スコープ 5) | 検収済 (2026-11-03。Fiber・Task は止まる条件で P4 へ) |
-| P4 | Task と Fiber、形式 v1 (行番号つき)、Family mruby と同じ起動の形 | 指示済 |
+| P4 | Task と Fiber、形式 v1 (行番号つき)、Family mruby と同じ起動の形 | 実装済・検収待ち |
 | P5 | 像の可視化: 共通の読み手 (像 → JSON)、CLI (`inspect --stack`・`diff`)、1 ファイルの HTML | 未着手 |
 
 ## 決まったこと (2026-11-02)

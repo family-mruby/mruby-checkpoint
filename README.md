@@ -42,6 +42,16 @@ rake fuzz:sabiruby[seed,points]   # その一部を SabiRuby で続ける
     状態なら真)。`--inproc` は同じプロセスの新しい `mrb_state` で続ける。
   - C の関数が呼んだブロックの中 (`sort { }` など) では、頼んだ時点で
     `Checkpoint::Error` になる。
-- 形式は `doc/format_v0.md`、報告は `doc/report/` (`p1.md`・`p1b.md`・`p2.md`・`p3.md`)。
+  - Fiber・Task の中でも、Task が待っている最中でも書き出せる (P4)。続きは、動いていた
+    文脈 (Fiber、または Task とスケジューラ) から。
+  - `checkpoint run --as-task prog.rb` は、Family mruby のアプリと同じ起動の形 (プログラムの
+    本体を Task にして `mrb_task_run`) で動かす。
+- 形式は `doc/format_v1.md` (v0 は `doc/format_v0.md`、経過として残す)、報告は `doc/report/`
+  (`p1.md`・`p1b.md`・`p2.md`・`p3.md`・`p4.md`)。
+- 試験のビルド (`build/fuzz`) の mruby-task は仮想の時計 (`mrbgems/hal-task-virtual`) で動く:
+  tick はスケジューラが空いたときと root が sleep したときに進む (`checkpoint-fuzz --quantum N`
+  は N 命令ごとにも)。
 - 埋め込む側は `mrb_checkpoint_request()` で、プログラムの協力なしに外から書き出しを頼める
-  (次の安全点で書く。`include/mruby/checkpoint.h`)。
+  (次の安全点で書く。`include/mruby/checkpoint.h`)。命令ごとの hook からは
+  `mrb_checkpoint_request_here()` (その境目で書く)。埋め込む側の Task は
+  `mrb_checkpoint_set_host_task()` で像に記し、復元の後 `mrb_checkpoint_host_task()` で引く。

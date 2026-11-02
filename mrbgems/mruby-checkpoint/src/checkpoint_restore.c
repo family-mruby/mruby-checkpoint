@@ -1229,8 +1229,8 @@ r_sched(reader *r, int *switch_pending, int *loop_running, uint16_t *unit, uint3
   *running = r_u32(r);
   *host = r_u32(r);
   if (!r->failed && (*running > r->ntask || *host > r->ntask)) rfail(r, "Task out of range");
-  if (!r->failed && *running && r->tasks[*running - 1].status != MRB_TASK_STATUS_RUNNING) {
-    rfail(r, "the running Task is not RUNNING");
+  if (!r->failed && *running && r->tasks[*running - 1].queue == 255) {
+    rfail(r, "the main Task cannot be the running one");
   }
 }
 

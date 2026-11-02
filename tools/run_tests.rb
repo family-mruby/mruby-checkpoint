@@ -23,7 +23,7 @@
 # Every image must also read cleanly with tools/checkpoint_inspect.rb.
 #
 # SabiRuby (the Rust mruby VM, built with its feature `checkpoint`) resumes the images too,
-# one way (mruby -> SabiRuby). For each sample and each writer (64 and 32):
+# one way (mruby -> SabiRuby), of both start shapes. For each sample and each writer (64 and 32):
 #   A->sabiruby #k   the k-th image along the chain of suspends (the chain goes on in the
 #                    C mruby of the same width) resumed on SabiRuby: what the C processes
 #                    printed before it + SabiRuby's output must equal the reference.
@@ -32,6 +32,8 @@
 #   A save->sabiruby the image of a save sample resumed on SabiRuby: NAME.resumed.out.
 #   Annotation `sabiruby-refuse K "TEXT"`: SabiRuby must refuse the K-th image (exit
 #   status not 0, nothing on stdout) with a message that contains TEXT.
+#   Annotation `sabiruby-skip-as-task "WHY"`: the shape as a Task is not resumed on SabiRuby,
+#   because SabiRuby itself runs that program differently (WHY is printed).
 # The SabiRuby binary is SABIRUBY_BIN, or SABIRUBY_DIR/target/release/sabiruby (build it
 # with `rake sabiruby`). Without one, or with one built without the feature, these checks
 # are skipped and the run says so.
@@ -248,15 +250,23 @@ if SABIRUBY.nil?
   puts "SKIP SabiRuby resume: #{sabiruby_skip}"
 else
   puts "SabiRuby resume (#{SABIRUBY}):"
-  samples.each do |path|
+  samples.product([false, true]).each do |path, as_task|
     name = File.basename(path, '.rb')
     src = File.read(path)
     ann = src.lines.grep(/^# checkpoint-test:/).map { |l| l.sub(/^# checkpoint-test:\s*/, '').strip }
     next if ann.include?('refuse')
+    next if as_task && ann.include?('no-as-task')
+    skip = ann.map { |a| a[/\Asabiruby-skip-as-task "(.*)"\z/, 1] }.compact.first
+    if as_task && skip
+      puts "#{File.basename(path, '.rb')} (as a Task): SKIP on SabiRuby: #{skip}"
+      next
+    end
+    $as_task = as_task
+    $bins = ann.include?('clock virtual') ? VIRTUAL : CHECKPOINT
     save_after = ann.any? { |a| a.start_with?('save-after') }
     refused = ann.filter_map { |a| (m = a.match(/\Asabiruby-refuse (\d+) "(.*)"\z/)) && [m[1].to_i, m[2]] }.to_h
     golden = File.read(path.sub(/\.rb\z/, '.out'))
-    puts "#{name}:"
+    puts "#{name}#{as_task ? ' (as a Task)' : ''}:"
     Dir.mktmpdir('checkpoint-sabiruby') do |dir|
       FileUtils.cp(path, dir)
       file = File.basename(path)

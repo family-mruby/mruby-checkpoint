@@ -1185,6 +1185,8 @@ w_sched(dumper *d)
   if (need_queues) mrb_objspace_each_objects(mrb, queue_obj_cb, d);
 
   uint32_t running = 0;
+  mrb_task *run = checkpoint_running_task(mrb);
+  if (run && !pm_get(&d->taskid, run, &running)) running = 0;
   gb_u32(mrb, b, d->ntask);
   for (uint32_t i = 0; i < d->ntask && !d->failed; i++) {
     mrb_task *t = d->tq[i];
@@ -1201,9 +1203,8 @@ w_sched(dumper *d)
       case MRB_TASK_STATUS_SUSPENDED: q = MRB_TASK_QUEUE_SUSPENDED; break;
       default: q = MRB_TASK_QUEUE_DORMANT; break;
       }
-      if (t->status == MRB_TASK_STATUS_RUNNING) {
-        if (running) fail(d, "two Tasks are running");
-        running = i + 1;
+      if (t->status == MRB_TASK_STATUS_RUNNING && running != i + 1) {
+        fail(d, "two Tasks are running");
       }
     }
     gb_u8(mrb, b, q);

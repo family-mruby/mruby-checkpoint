@@ -131,7 +131,7 @@ namespace :fuzz do
   desc 'resume a part of the fuzzed test suite on SabiRuby: rake fuzz:sabiruby[seed,points]'
   task :sabiruby, [:seed, :points] => ['build:fuzz', :sabiruby] do |_, a|
     ruby File.join(ROOT, 'tools/fuzz_sabiruby.rb'), '--seed', (a[:seed] || 1).to_s,
-         '--points', (a[:points] || 10).to_s
+         '--points', (a[:points] || 10).to_s, '--gems', 'mruby-fiber,mruby-task,mruby-enumerator'
   end
 end
 

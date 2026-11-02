@@ -1,4 +1,5 @@
 # checkpoint-test: suspend-after "inner 1"
+# checkpoint-test: sabiruby-skip-as-task "SabiRuby raises FiberError for Fiber#transfer inside a Task (its Task contexts run in a loop of their own), without any image"
 # Fibers that resume Fibers: the root resumes outer, outer resumes inner. The
 # program suspends in inner (outer and the root wait in Fiber#resume), in
 # outer between the two, and at the root with both suspended. Fiber#transfer

@@ -28,7 +28,7 @@ def checkpoint_common(conf)
     conf.gem "#{CHECKPOINT_ROOT}/mrbgems/hal-task-virtual"   # mruby-task's HAL: the virtual clock
     conf.gem "#{CHECKPOINT_ROOT}/mrbgems/mruby-checkpoint-fuzz"
     conf.defines << 'MRB_USE_DEBUG_HOOK'   # the per-instruction hook the trigger counts with
-    conf.defines << 'CHECKPOINT_TEST_HELPERS'   # Checkpoint.__pass_and_save
+    conf.defines << 'CHECKPOINT_TEST_HELPERS'   # Checkpoint.__pass_and_save / __pass_and_suspend
   end
   conf.defines += %w(MRB_NO_BOXING MRB_INT64 MRB_UTF8_STRING)
   conf.cc.flags << '-O2'

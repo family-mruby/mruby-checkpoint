@@ -66,6 +66,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <mruby.h>
 #include <mruby/compile.h>
 #include <mruby/error.h>
@@ -585,6 +586,9 @@ main(int argc, char **argv)
   if (opt_log) {
     log_fp = fopen(opt_log, "a");
     if (!log_fp) { fprintf(stderr, "checkpoint-fuzz: cannot open %s\n", opt_log); return 2; }
+    /* the tool's own descriptor stays out of the processes it starts (the
+       program there may name descriptors by number) */
+    fcntl(fileno(log_fp), F_SETFD, FD_CLOEXEC);
   }
 
   if (resume) {

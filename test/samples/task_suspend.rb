@@ -2,8 +2,8 @@
 # checkpoint-test: clock virtual
 # Task#suspend and Task#resume. The boss suspends a worker that takes turns
 # with it, and a sleeper in the middle of its sleep (which keeps its wait).
-# The program suspends while both are suspended, and again after they are
-# resumed (the sleeper's deadline has passed by then).
+# The program suspends while both are suspended, and again after the sleeper
+# is resumed with its deadline passed.
 def run_tasks(*tasks)
   tasks.each(&:join)   # the program is a Task (checkpoint run --as-task)
 rescue RuntimeError
@@ -30,10 +30,13 @@ boss = Task.new(name: "boss", priority: 150) do
   puts "suspended: #{worker.status} #{sleeper.status}"
   Checkpoint.suspend("task_suspend.ckpt")   # worker suspended, sleeper suspended while sleeping
   sleep_ms 40
-  puts "boss resumes them"
+  puts "boss resumes the worker"
   worker.resume
+  worker.join
+  puts "boss resumes the sleeper"
   sleeper.resume
-  Checkpoint.suspend("task_suspend.ckpt")
+  Checkpoint.suspend("task_suspend.ckpt")   # the sleeper waits, its deadline passed
+  sleeper.join
   :boss_done
 end
 run_tasks(boss, worker, sleeper)

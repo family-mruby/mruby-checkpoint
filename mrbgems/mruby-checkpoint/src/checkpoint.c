@@ -569,14 +569,21 @@ checkpoint_suspend(mrb_state *mrb, mrb_value self)
 }
 
 #ifdef CHECKPOINT_TEST_HELPERS
-/* test builds only: Task.pass and Checkpoint.save in one call, so that the
-   image is taken where the scheduler has asked for a switch (the slice ends
-   at that safe point, on both sides) */
+/* test builds only: Task.pass and Checkpoint.save (or suspend) in one call,
+   so that the image is taken where the scheduler has asked for a switch (the
+   slice ends at that safe point, on both sides) */
 static mrb_value
 checkpoint_pass_and_save(mrb_state *mrb, mrb_value self)
 {
   if (mrb->c != mrb->root_c) mrb->task.switching = TRUE;
   return request(mrb, MRB_CHECKPOINT_SAVE);
+}
+
+static mrb_value
+checkpoint_pass_and_suspend(mrb_state *mrb, mrb_value self)
+{
+  if (mrb->c != mrb->root_c) mrb->task.switching = TRUE;
+  return request(mrb, MRB_CHECKPOINT_SUSPEND);
 }
 #endif
 
@@ -664,6 +671,7 @@ mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
   mrb_define_module_function(mrb, m, "resumed?", checkpoint_resumed_p, MRB_ARGS_NONE());
 #ifdef CHECKPOINT_TEST_HELPERS
   mrb_define_module_function(mrb, m, "__pass_and_save", checkpoint_pass_and_save, MRB_ARGS_OPT(1));
+  mrb_define_module_function(mrb, m, "__pass_and_suspend", checkpoint_pass_and_suspend, MRB_ARGS_OPT(1));
 #endif
 
   struct RClass *box = mrb_define_class_under(mrb, m, "Box", mrb->object_class);
