@@ -1,7 +1,7 @@
 # 実装指示書 P2: mruby → SabiRuby の片道
 
 `doc/plan.md`、`doc/format_v0.md`、`doc/report/p1.md`・`p1b.md` を先に読む。この段は
-スコープの 4: **mruby (C) が `Checkpoint.suspend` / `save` で書いた像を、SabiRuby
+スコープの 4: **mruby (C) が `Checkpoint.suspend` / `save` で書いたイメージを、SabiRuby
 (Rust 製の mruby VM) が読んで、次の行から続ける**。逆向き (SabiRuby → mruby) は
 この段ではやらない。
 
@@ -36,24 +36,24 @@
    - 組み込みの名前 (permanent の名前の一覧) を、SabiRuby 側と突き合わせる表を作る
      材料として書き出せるようにする (例: `checkpoint names` で一覧を出す)。
 2. **SabiRuby 側** (worktree):
-   - `checkpoint` feature の下に像の読み込み (復元) を作る: 形式の検査 → 全オブジェクト
+   - `checkpoint` feature の下にイメージの読み込み (復元) を作る: 形式の検査 → 全オブジェクト
      を確保 → 参照をつなぐ → permanent を名前で引き当て → irep の取り込み (プログラムの
      irep はこちらの `.mrb` の読み込みと同じ道で、mrblib は名前か運ばれた中身で) →
      callinfo・レジスタの窓・Env の組み立て → 続きから実行。
    - SabiRuby の CLI (`sabiruby`) に `--resume FILE` か同等の入口を足す (feature
      on のときだけ)。
    - 名前の対応: こちらの permanent の名前 (`S:Object`、`M:Integer#times`、
-     `F:Array#length` など) を SabiRuby の組み込みに引き当てる。足りないものは像を
+     `F:Array#length` など) を SabiRuby の組み込みに引き当てる。足りないものはイメージを
      拒否し、何が無いかを出す。
    - 命令の集合・意味の差 (4.0.0 系と 4.1) が問題になる所があれば、表にして report に。
 3. **試験** (このリポジトリの `rake test` に足す。SabiRuby のビルドが無いときは
    飛ばしてよいが、飛ばしたことを出す):
-   - `test/samples` のうち対応できるものを、mruby 64bit・32bit で書いた像を
+   - `test/samples` のうち対応できるものを、mruby 64bit・32bit で書いたイメージを
      SabiRuby で `resume` し、出力が往復なしと一致すること。最低限: カウンタ、
      ユーザ定義のクラス、クロージャ、`times` の中の suspend (mrblib のフレーム)、
      Hash、`save` の戻り値 `:resumed`。
    - 対応できないものは、どれが・なぜかを表に。
-   - SabiRuby 側の既存の試験 (README の Verification の節) が feature off と on の
+   - SabiRuby 側の既存の試験 (README の Verification のセクション) が feature off と on の
      両方で通ること。no_std の検査 (`tools/check_no_std.sh`) も。
 
 ## 触ってよい範囲
@@ -66,7 +66,7 @@
 ## 止まる条件
 
 - SabiRuby の VM の中心 (命令の実行・GC・Value の表現) に大きな改造が要るとき。
-  feature の下の追加と、復元に要る最小の口 (内部の構造体を組み立てる関数) までは可。
+  feature の下の追加と、復元に要る最小の API (内部の構造体を組み立てる関数) までは可。
 - 形式を意味論の層で書いたつもりが、C の mruby の内部に依存していて SabiRuby で
   組み立てられない所が見つかったとき (直し方を案にして返す)。
 - sudo・パッケージの追加が要るとき。
@@ -80,6 +80,6 @@
 - SabiRuby のコミットの書き方・文書の書き方は、その README の Rules と既存の
   docs に合わせる。
 - `target/` は大きいので、終わったら worktree の `target/` を `cargo clean` で消す。
-- report は `doc/report/p2.md`: 選んだ方式と理由、SabiRuby に足した口、名前の対応の
+- report は `doc/report/p2.md`: 選んだ方式と理由、SabiRuby に足した API、名前の対応の
   表、命令の差、試験の結果、拒否した型・場面、見立てと違った点、撤回した仮説、
   残件 (逆向きの書き出しで要りそうなこと)。

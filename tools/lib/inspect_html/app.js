@@ -64,25 +64,25 @@ window.addEventListener('error', function (e) {
     return JSON.stringify(v);
   }
   // ---- words for a person: the JSON's keys and enum values stay inside ----
-  var TASK_STATE = { DORMANT: '休み', READY: '準備', RUNNING: '動いている', WAITING: '待ち', SUSPENDED: '止められた' };
-  var QUEUE = { ready: '準備の列', waiting: '待ちの列', suspended: '止められた列', dormant: '休みの列' };
-  var ROLE = { root: 'プログラムの本体', task: 'Task', fiber: 'Fiber', unknown: '文脈' };
+  var TASK_STATE = { DORMANT: '休止', READY: '実行可能', RUNNING: '実行中', WAITING: '待機中', SUSPENDED: '中断中' };
+  var QUEUE = { ready: 'レディキュー', waiting: '待ちキュー', suspended: '中断キュー', dormant: '休止キュー' };
+  var ROLE = { root: 'プログラムの本体', task: 'Task', fiber: 'Fiber', unknown: 'コンテキスト' };
   var ACTIVITY = {
-    current: '動いている (ここで書き出した)', not_started: 'まだ始まっていない', yielded: 'Fiber.yield で止まっている',
-    resuming: 'resume した Fiber を待っている', transferring: '別の Fiber へ transfer した', finished: '終わった',
-    scheduler: 'C の関数からスケジューラを回している', no_frames: '枠なし (埋め込む側がスケジューラを回す)', other: 'そのほか'
+    current: '実行中 (ここで書き出した)', not_started: '未開始', yielded: 'Fiber.yield で中断中',
+    resuming: 'resume した Fiber を待っている', transferring: '別の Fiber へ transfer した', finished: '終了',
+    scheduler: 'C の関数からスケジューラを回している', no_frames: 'フレームなし (埋め込む側がスケジューラを回す)', other: 'そのほか'
   };
-  var EDGE = { target_class: '定義先', upper: '外側', env: '環境', 'waits on': '待ち先', 'class': 'クラス', superclass: '上位',
+  var EDGE = { target_class: '定義先', upper: '外側', env: '環境', 'waits on': '待ち先', 'class': 'クラス', superclass: 'スーパークラス',
     proc: 'Proc', '&block': 'ブロック', message: 'メッセージ', backtrace: 'バックトレース', name: '名前', value: '値', begin: '始め', end: '終わり' };
   var FIELD = {
-    activity: '状態', vmexec: 'C から resume された', current: '書き出したとき動いていた', 'resumed by': 'resume した文脈',
-    state: '状態', queue: '列', priority: '優先度', timeslice: '割り当ての残り (tick)', wait: '待ち', value: '値',
-    running: '動いていた', host: '埋め込む側の Task', switching: '切り替えを頼んでいた', loop: 'スケジューラの輪', tick_ms: '1 tick (ms)',
-    tick: '時計 (tick)', next_wakeup: '次に起きるまで (tick)', 'running Task': '動いていた Task', 'host Task': '埋め込む側の Task',
-    'current context': '止まった文脈', magic: '印', format: '形式の版', implementation: '処理系', bytecode: 'バイトコード',
-    integer_bits: 'Integer のビット数', float_bits: 'Float のビット数', utf8: 'String は UTF-8', pointer_bits: '書き手のポインタ幅'
+    activity: '状態', vmexec: 'C から resume された', current: '書き出したとき実行中だった', 'resumed by': 'resume したコンテキスト',
+    state: '状態', queue: 'キュー', priority: '優先度', timeslice: 'タイムスライスの残り (tick)', wait: '待ち', value: '値',
+    running: '実行中だった', host: '埋め込む側の Task', switching: '切り替えを要求していた', loop: 'スケジューラのループ', tick_ms: '1 tick (ms)',
+    tick: '時計 (tick)', next_wakeup: '次に起きるまで (tick)', 'running Task': '実行中だった Task', 'host Task': '埋め込む側の Task',
+    'current context': '止まったコンテキスト', magic: 'マジック', format: '形式の版', implementation: '処理系', bytecode: 'バイトコード',
+    integer_bits: 'Integer のビット数', float_bits: 'Float のビット数', utf8: 'String は UTF-8', pointer_bits: '書き出し側のポインタ幅'
   };
-  var KIND = { permanent: 'permanent (名前だけ)', permanent_proc: 'permanent の Proc (枠が動かす)', object: 'ふつうのオブジェクト', string: 'String',
+  var KIND = { permanent: 'permanent (名前だけ)', permanent_proc: 'permanent の Proc (フレームが動かす)', object: 'ふつうのオブジェクト', string: 'String',
     array: 'Array', hash: 'Hash', range: 'Range', exception: '例外', 'class': 'クラス', module: 'モジュール', singleton_class: '特異クラス',
     iclass: '取り込みクラス', proc: 'Proc', env: 'Env (捕まえた変数の箱)', data: 'C のデータ', bigint: '大きな Integer', struct: 'Struct', set: 'Set',
     rational: 'Rational', complex: 'Complex', 'break': 'break の途中', random: 'Random', origin: 'prepend の origin', task: 'Task', fiber: 'Fiber' };
@@ -93,28 +93,28 @@ window.addEventListener('error', function (e) {
     var l = o.label;
     switch (o.kind) {
       case 'env': return 'Env (' + (o.method ? o.method + ' の' : 'ブロックの') + '変数)';
-      case 'fiber': return o.context ? 'Fiber (文脈 ' + o.context + ')' : 'Fiber (まだ初期化されていない)';
+      case 'fiber': return o.context ? 'Fiber (コンテキスト ' + o.context + ')' : 'Fiber (まだ初期化されていない)';
       case 'permanent': case 'permanent_proc':
         return l.replace(/ \(method\)$/, ' (メソッド)').replace(/^env of (.*)$/, '$1 の変数の箱');
       case 'iclass': return l.replace(/ \(included\)$/, ' (取り込み)');
       case 'origin': return l.replace(/ \(origin\)$/, ' (prepend の origin)');
-      case 'break': return o.tag + ' の途中 (枠 ' + o.frame + ' へ)';
+      case 'break': return o.tag + ' の途中 (フレーム ' + o.frame + ' へ)';
       default: return l.replace(/ \(not initialized\)/, ' (まだ初期化されていない)');
     }
   }
   function edgeName(l) {
     var m = /^\(key (\d+)\)$/.exec(l);
-    return m ? '鍵 ' + m[1] : (EDGE[l] || l);
+    return m ? 'キー ' + m[1] : (EDGE[l] || l);
   }
   function taskState(t) { return (TASK_STATE[t.state] || t.state); }
-  function queueText(t) { return t.queue ? QUEUE[t.queue] + 'の ' + (t.queue_index + 1) + ' 番目' : 'main の Task (列に入らない)'; }
+  function queueText(t) { return t.queue ? QUEUE[t.queue] + 'の ' + (t.queue_index + 1) + ' 番目' : 'main の Task (キューに入らない)'; }
   function yesNo(x) { return x === true || x === 'true' ? 'はい' : (x === false || x === 'false' ? 'いいえ' : x); }
   // the name of a context, for a sentence
   function ctxName(d, c) {
     if (c.role === 'root') return 'プログラムの本体';
     if (c.role === 'task') { var t = d.scheduler.tasks[c.task - 1]; return 'Task ' + (t.name_text !== null ? '"' + t.name_text + '"' : t.key); }
     var f = c.frames[0];
-    return 'Fiber' + (f && f.file ? ' (' + f.file + ':' + f.line + ')' : ' (文脈 ' + c.id + ')');
+    return 'Fiber' + (f && f.file ? ' (' + f.file + ':' + f.line + ')' : ' (コンテキスト ' + c.id + ')');
   }
   // the name of a frame: "Task "c1" の pop" / "本体のトップレベル" / "… のブロック"
   function frameName(d, c, f) {
@@ -124,7 +124,7 @@ window.addEventListener('error', function (e) {
   function rootName(d, r) {
     switch (r.kind) {
       case 'frame': var c = d.contexts[r.context - 1]; return frameName(d, c, c.frames[r.frame]);
-      case 'global': return '大域変数 ' + r.key;
+      case 'global': return 'グローバル変数 ' + r.key;
       case 'variable': return '定数・クラスの変数 ' + r.key.replace(/^Object::/, '');
       case 'method': return 'メソッド ' + r.key.replace(/^Object#/, '');
       case 'task': return r.key.replace(/^task /, 'Task ');
@@ -132,21 +132,21 @@ window.addEventListener('error', function (e) {
       default: return r.key;
     }
   }
-  // where an object is, for a person: "q、Task "x" のトップレベルの局所変数"
+  // where an object is, for a person: "q、Task "x" のトップレベルのローカル変数"
   function whereText(d, o) {
     if (isPerm(o)) return 'permanent (' + o.name + ')';
-    if (o.path_root === null || o.path_root === undefined) return '根から届かない';
+    if (o.path_root === null || o.path_root === undefined) return 'ルートから届かない';
     var r = d.roots[o.path_root];
     var rest = o.path.slice(r.key.length).replace(/^\./, '');
     if (r.kind === 'frame') {
       var c = d.contexts[r.context - 1], f = c.frames[r.frame];
       var first = rest.split(/[.\[{<#]/)[0];
-      var kind = first === 'self' ? '' : (/^r\d+$/.test(first) ? 'の一時レジスタ' : (f.locals.some(function (l) { return l.name === first; }) ? 'の局所変数' : ''));
+      var kind = first === 'self' ? '' : (/^r\d+$/.test(first) ? 'の一時レジスタ' : (f.locals.some(function (l) { return l.name === first; }) ? 'のローカル変数' : ''));
       return rest + '、' + frameName(d, c, f) + kind;
     }
     if (r.kind === 'global' || r.kind === 'variable' || r.kind === 'method') {
       var head = r.kind === 'variable' ? r.key.replace(/^Object::/, '') : (r.kind === 'method' ? r.key.replace(/^Object#/, '') : r.key);
-      return head + (rest ? (/^[\[{<#]/.test(rest) ? '' : '.') + rest : '') + '、' + { global: '大域変数', variable: '定数', method: 'メソッド' }[r.kind];
+      return head + (rest ? (/^[\[{<#]/.test(rest) ? '' : '.') + rest : '') + '、' + { global: 'グローバル変数', variable: '定数', method: 'メソッド' }[r.kind];
     }
     return (rest || 'それ自身') + '、' + rootName(d, r);
   }
@@ -180,7 +180,7 @@ window.addEventListener('error', function (e) {
     return objLink(o, img === undefined ? st.img : img);
   }
   function objLink(o, img) {
-    return h('a', { cls: 'obj mono', title: whereText(DOCS[img], o) + '\n道筋: ' + o.path + '  (#' + o.id + ')',
+    return h('a', { cls: 'obj mono', title: whereText(DOCS[img], o) + '\nパス: ' + o.path + '  (#' + o.id + ')',
       onclick: function () { go({ view: 'objects', img: img, focus: o.id, sel: o.id }); } },
       cut(L(o), 70), h('span', { cls: 'muted', text: ' #' + o.id }));
   }
@@ -224,15 +224,15 @@ window.addEventListener('error', function (e) {
   }
 
   // ---- the frame of the page ----
-  var VIEWS = [['stack', '呼び出しの枠'], ['tasks', 'Task と Fiber'], ['objects', 'オブジェクト']];
-  if (DIFF) VIEWS.push(['diff', '2 つの像の差']);
-  VIEWS.push(['image', '像の中身']);
+  var VIEWS = [['stack', 'コールスタック'], ['tasks', 'Task と Fiber'], ['objects', 'オブジェクト']];
+  if (DIFF) VIEWS.push(['diff', '2 つのイメージの差']);
+  VIEWS.push(['image', 'イメージの中身']);
 
   function summary() {
     var d = doc(), hd = d.header, sc = d.scheduler;
     var cur = d.contexts[d.current_context - 1];
-    var bits = [d.source.file + ' (' + d.source.bytes + ' バイト)', hd.implementation, hd.pointer_bits + ' bit の書き手',
-      'オブジェクト ' + d.objects.length, '文脈 ' + d.contexts.length, 'Task ' + sc.tasks.length,
+    var bits = [d.source.file + ' (' + d.source.bytes + ' バイト)', hd.implementation, hd.pointer_bits + ' bit の書き出し側',
+      'オブジェクト ' + d.objects.length, 'コンテキスト ' + d.contexts.length, 'Task ' + sc.tasks.length,
       '止まった所: ' + ctxName(d, cur) + (cur.frames.length ? ' ' + (cur.frames[cur.frames.length - 1].location || '') : '')];
     var e = document.getElementById('summary');
     e.textContent = '';
@@ -270,9 +270,9 @@ window.addEventListener('error', function (e) {
   function ctxTitle(d, c) {
     var t = c.task ? d.scheduler.tasks[c.task - 1] : null;
     var act = c.activity === 'task' ? null : ACTIVITY[c.activity];
-    var e = h('h3', { id: 'ctx-' + c.id }, ctxName(d, c), h('span', { cls: 'muted', text: '  文脈 ' + c.id + (act && !c.current ? ' ・ ' + act : '') }));
+    var e = h('h3', { id: 'ctx-' + c.id }, ctxName(d, c), h('span', { cls: 'muted', text: '  コンテキスト ' + c.id + (act && !c.current ? ' ・ ' + act : '') }));
     if (c.current) add(e, h('span', { cls: 'badge cur', text: 'ここで止まった' }));
-    if (t && t.running) add(e, h('span', { cls: 'badge run', text: '動いていた Task' }));
+    if (t && t.running) add(e, h('span', { cls: 'badge run', text: '実行中だった Task' }));
     if (t) add(e, h('span', { cls: 'badge', text: taskState(t) + ' ・ ' + queueText(t) }));
     if (c.prev) add(e, h('span', { cls: 'badge', text: ctxName(d, d.contexts[c.prev - 1]) + ' が resume した' }));
     return e;
@@ -280,12 +280,12 @@ window.addEventListener('error', function (e) {
 
   function viewStack(m) {
     var d = doc();
-    add(m, h('p', { cls: 'muted' }, '文脈 (プログラムの本体・Task・Fiber) ごとの呼び出しの枠。上が新しい枠で、バックトレースと同じ並び。' +
-      '「C の関数」は文脈の切り替えを待っている枠。値の青い字はオブジェクトの図へ飛ぶ。'));
+    add(m, h('p', { cls: 'muted' }, 'コンテキスト (プログラムの本体・Task・Fiber) ごとのコールスタック。上が新しいフレームで、バックトレースと同じ並び。' +
+      '「C の関数」はコンテキストの切り替えを待っているフレーム。値の青い字はオブジェクトの図へ飛ぶ。'));
     var order = d.contexts.slice().sort(function (a, b) { return (b.current ? 1 : 0) - (a.current ? 1 : 0) || a.id - b.id; });
     order.forEach(function (c) {
       var card = h('div', { cls: 'card' + (c.current ? ' cur' : '') }, ctxTitle(d, c));
-      if (!c.frames.length) add(card, h('div', { cls: 'empty', text: c.activity === 'finished' ? '終わった (枠なし)' : '枠なし' }));
+      if (!c.frames.length) add(card, h('div', { cls: 'empty', text: c.activity === 'finished' ? '終了 (フレームなし)' : 'フレームなし' }));
       c.frames.slice().reverse().forEach(function (f) { add(card, frameBox(d, c, f)); });
       add(m, card);
     });
@@ -293,14 +293,14 @@ window.addEventListener('error', function (e) {
 
   function frameBox(d, c, f) {
     if (f.placeholder) {
-      return h('div', { cls: 'frame muted' }, '枠 ' + f.index + ': 枠 0 の写し。Fiber#resume の呼び出しの枠の代わりに積まれていて、最初の resume から戻るときに外される (中身は枠 0 と同じ)');
+      return h('div', { cls: 'frame muted' }, 'フレーム ' + f.index + ': フレーム 0 の写し。Fiber#resume のフレームの代わりに積まれていて、最初の resume から戻るときに外される (中身はフレーム 0 と同じ)');
     }
     var loc = f.location || ((f.file ? f.file + ':' + f.line : '(行なし)') + (f.method ? ':in ' + f.method : ''));
     var head = h('summary', null, h('span', { cls: 'loc mono', text: loc }));
     if (f.kind === 'cfunc') add(head, h('span', { cls: 'badge warn', text: 'C の関数 ' + f.cfunc.replace(/^F:(S:)?/, '').replace('#', f.cfunc.indexOf('F:S:') === 0 ? '.' : '#') + ' で待っている' }));
     else if (f.not_started) add(head, h('span', { cls: 'badge', text: '未開始: ここから始まる' }));
     else if (!f.location) add(head, h('span', { cls: 'badge', text: 'バックトレースには出ない' }));
-    add(head, h('span', { cls: 'muted', text: '  枠 ' + f.index + (f.pc !== null ? ' ・ pc ' + f.pc : '') + (f.irep ? ' ・ irep @' + f.irep : '') }));
+    add(head, h('span', { cls: 'muted', text: '  フレーム ' + f.index + (f.pc !== null ? ' ・ pc ' + f.pc : '') + (f.irep ? ' ・ irep @' + f.irep : '') }));
     var t = h('table');
     var selfMain = isRef(f.self) && obj(d, f.self.ref).name === 'T';
     if (f.self_register !== undefined) add(t, row('self', h('span', null, value(d, f.self), h('span', { cls: 'muted' }, ' (最初の resume から。それまで R0 には ', value(d, f.self_register), ' が入っている)'))));
@@ -318,7 +318,7 @@ window.addEventListener('error', function (e) {
         vars.forEach(function (x, i) { add(t, row(i ? '' : '外の変数 (' + where + ')', h('span', null, x.name + ' = ', value(d, x.value)))); });
       }
     });
-    var det = h('details', { cls: 'frame' }, head, t.childNodes.length ? t : h('div', { cls: 'empty', text: '局所変数なし' }));
+    var det = h('details', { cls: 'frame' }, head, t.childNodes.length ? t : h('div', { cls: 'empty', text: 'ローカル変数なし' }));
     det.open = true;
     return det;
   }
@@ -328,7 +328,7 @@ window.addEventListener('error', function (e) {
   function viewTasks(m) {
     var d = doc(), sc = d.scheduler;
     add(m, h('p', null, 'tick ' + sc.tick + ' (1 tick ' + sc.tick_ms + ' ms) ・ 次に起きる: ' + (sc.next_wakeup === null ? 'なし' : sc.next_wakeup + ' tick 後') +
-      ' ・ スケジューラの輪: ' + (sc.loop ? '回っている' : '回っていない') + (sc.switching ? ' ・ 切り替えを頼んでいた' : '')));
+      ' ・ スケジューラのループ: ' + (sc.loop ? '回っている' : '回っていない') + (sc.switching ? ' ・ 切り替えを要求していた' : '')));
     var byLane = {};
     sc.tasks.forEach(function (t) { var k = t.queue || 'main'; (byLane[k] = byLane[k] || []).push(t); });
     // the lanes that hold a Task (ready always, as the place where Tasks run)
@@ -355,13 +355,13 @@ window.addEventListener('error', function (e) {
         var g = s('g', { cls: 'task' + (t.running ? ' run' : ''), transform: 'translate(' + x + ',' + y + ')' });
         g.appendChild(s('rect', { width: W, height: H, rx: 6 }));
         g.appendChild(s('text', { cls: 't1', x: 8, y: 18, text: cut(t.main ? 'main' : (t.name_text !== null ? '"' + t.name_text + '"' : t.key), 24) + (t.running ? '  ▶' : '') }));
-        g.appendChild(s('text', { cls: 't2', x: 8, y: 35, text: taskState(t) + ' ・ 優先度 ' + t.priority + (c && c.frames.length === 1 && c.frames[0].not_started ? ' ・ まだ始まっていない' : '') }));
-        g.appendChild(s('text', { cls: 't2', x: 8, y: 51, text: '時間の割り当ての残り ' + t.timeslice + ' tick' }));
+        g.appendChild(s('text', { cls: 't2', x: 8, y: 35, text: taskState(t) + ' ・ 優先度 ' + t.priority + (c && c.frames.length === 1 && c.frames[0].not_started ? ' ・ 未開始' : '') }));
+        g.appendChild(s('text', { cls: 't2', x: 8, y: 51, text: 'タイムスライスの残り ' + t.timeslice + ' tick' }));
         var w = waitText(d, t);
         if (w) g.appendChild(s('text', { cls: 't2', x: 8, y: 67, text: cut((t.state === 'WAITING' ? '待ち: ' : '最後の待ち: ') + w, 34) }));
         var tags = [t.host ? '埋め込む側の Task' : null, t.value !== null && t.value !== undefined && t.state === 'DORMANT' ? '値 ' + cut(valueText(d, t.value), 20) : null].filter(Boolean);
         if (tags.length) g.appendChild(s('text', { cls: 't2', x: 8, y: 83, text: tags.join(' ・ ') }));
-        var title = s('title'); title.textContent = t.key + ' (Task ' + t.id + ', 文脈 ' + (t.context || '-') + ')'; g.appendChild(title);
+        var title = s('title'); title.textContent = t.key + ' (Task ' + t.id + ', コンテキスト ' + (t.context || '-') + ')'; g.appendChild(title);
         if (c) g.addEventListener('click', function () { go({ view: 'stack' }); var e = document.getElementById('ctx-' + c.id); if (e) e.scrollIntoView(); });
         svg.appendChild(g);
       });
@@ -375,7 +375,7 @@ window.addEventListener('error', function (e) {
       var wp = whereText(d, o).split('、');
       g.appendChild(s('text', { x: 8, y: 16, text: cut(L(o) + ' (' + wp[0] + ')', 30) }));
       g.appendChild(s('text', { cls: 'kind', x: 8, y: 31, text: cut(wp.slice(1).join('、'), 36) }));
-      var qt = s('title'); qt.textContent = whereText(d, o) + '\n道筋: ' + o.path; g.appendChild(qt);
+      var qt = s('title'); qt.textContent = whereText(d, o) + '\nパス: ' + o.path; g.appendChild(qt);
       svg.appendChild(g);
     });
     sc.tasks.forEach(function (t) {
@@ -386,8 +386,8 @@ window.addEventListener('error', function (e) {
       if (w.reason === 'queue') hArrow(svg, a[0] + W, a[1] + H / 2, b[0], b[1] + H / 4);
       else arrow(svg, a[0] + W / 2, a[1] + H, b[0] + W / 2, b[1] + (b[1] > a[1] ? 0 : H), '');
     });
-    add(m, h('h2', { text: 'スケジューラの列' }), h('div', { cls: 'svgbox' }, svg));
-    add(m, h('p', { cls: 'muted', text: '列の中は左から順番 (この順に動く)。緑の枠は書き出したときに動いていた Task。橙の矢印は待っている相手 (join・Task::Queue)。箱を押すとその Task の呼び出しの枠へ。' }));
+    add(m, h('h2', { text: 'スケジューラのキュー' }), h('div', { cls: 'svgbox' }, svg));
+    add(m, h('p', { cls: 'muted', text: 'キューの中は左から順番 (この順に動く)。緑の枠線は書き出したときに実行中だった Task。橙の矢印は待っている相手 (join・Task::Queue)。箱を押すとその Task のコールスタックへ。' }));
 
     // the contexts and who resumed whom
     var cs = d.contexts, CW = 230, CH = 62;
@@ -404,8 +404,8 @@ window.addEventListener('error', function (e) {
       var g = s('g', { cls: 'task' + (c.current ? ' cur' : ''), transform: 'translate(' + x + ',' + y + ')',
         onclick: function () { go({ view: 'stack' }); var e = document.getElementById('ctx-' + c.id); if (e) e.scrollIntoView(); } });
       g.appendChild(s('rect', { width: CW, height: CH, rx: 6 }));
-      g.appendChild(s('text', { cls: 't1', x: 8, y: 18, text: cut('文脈 ' + c.id + ': ' + ctxName(d, c), 30) }));
-      g.appendChild(s('text', { cls: 't2', x: 8, y: 36, text: cut((c.activity === 'task' ? 'Task は' + taskState(t) : ACTIVITY[c.activity]) + ' ・ 枠 ' + c.frames.filter(function (f) { return !f.placeholder; }).length, 34) }));
+      g.appendChild(s('text', { cls: 't1', x: 8, y: 18, text: cut('コンテキスト ' + c.id + ': ' + ctxName(d, c), 30) }));
+      g.appendChild(s('text', { cls: 't2', x: 8, y: 36, text: cut((c.activity === 'task' ? 'Task は' + taskState(t) : ACTIVITY[c.activity]) + ' ・ フレーム ' + c.frames.filter(function (f) { return !f.placeholder; }).length, 34) }));
       var top = c.frames.length ? c.frames[0].not_started && c.frames.length <= 2 ? c.frames[0] : c.frames[c.frames.length - 1] : null;
       if (top) g.appendChild(s('text', { cls: 't2', x: 8, y: 53, text: cut((top.not_started ? '始まる所 ' : '') + (top.location || top.cfunc || ''), 34) }));
       svg2.appendChild(g);
@@ -415,10 +415,10 @@ window.addEventListener('error', function (e) {
       var a = cp[c.prev], b = cp[c.id];
       arrow(svg2, a[0] + CW / 2, a[1] + CH, b[0] + CW / 2, b[1] + (b[1] > a[1] ? 0 : CH), 'prev');
     });
-    add(m, h('h2', { text: '文脈 (resume の鎖)' }), h('div', { cls: 'svgbox' }, svg2));
-    add(m, h('p', { cls: 'muted', text: '青の枠は書き出したとき動いていた文脈 (止まった所)。青の矢印は resume した文脈から、された文脈へ (prev の鎖。終わったら戻る先)。' }));
+    add(m, h('h2', { text: 'コンテキスト (resume のチェーン)' }), h('div', { cls: 'svgbox' }, svg2));
+    add(m, h('p', { cls: 'muted', text: '青の枠線は書き出したとき実行中だったコンテキスト (止まった所)。青の矢印は resume したコンテキストから、されたコンテキストへ (prev のチェーン。終わったら戻る先)。' }));
 
-    var tb = h('table', null, h('tr', null, ['Task', '状態', '列', '優先度', '割り当ての残り (tick)', '待ち', '値', '文脈'].map(function (x) { return h('th', { text: x }); })));
+    var tb = h('table', null, h('tr', null, ['Task', '状態', 'キュー', '優先度', 'タイムスライスの残り (tick)', '待ち', '値', 'コンテキスト'].map(function (x) { return h('th', { text: x }); })));
     sc.tasks.forEach(function (t) {
       add(tb, h('tr', null, h('td', { cls: 'mono', text: t.key + (t.running ? ' ▶' : '') + (t.host ? ' (埋め込む側)' : '') }), h('td', { text: taskState(t) }),
         h('td', { text: queueText(t) }), h('td', { text: t.priority }), h('td', { text: t.timeslice }),
@@ -483,14 +483,14 @@ window.addEventListener('error', function (e) {
       h('label', null, '深さ ', h('input', { type: 'number', min: 1, max: 9, value: st.depth, onchange: function (e) { st.depth = parseInt(e.target.value, 10) || 2; graph = null; render(); } })),
       h('label', null, h('input', { type: 'checkbox', onchange: function (e) { st.classEdges = e.target.checked; graph = null; render(); } }), ' クラスへの辺'));
     if (st.classEdges) tools.querySelector('input[type=checkbox]').checked = true;
-    var search = h('input', { type: 'text', placeholder: '#番号・道筋・表示で探す', value: st.q });
+    var search = h('input', { type: 'text', placeholder: '#番号・パス・表示で探す', value: st.q });
     var list = h('div', { cls: 'list' });
     function fill() {
       list.textContent = '';
       var q = st.q.trim().toLowerCase();
       if (!q) {
         var grp = null;
-        var gname = { global: '大域変数', variable: '定数・クラスの変数', method: '足したメソッド', superclass: '上位の付け替え', contents: '組み込みの中身', frame: '呼び出しの枠', task: 'Task', fiber: 'Fiber' };
+        var gname = { global: 'グローバル変数', variable: '定数・クラスの変数', method: '足したメソッド', superclass: 'スーパークラスの付け替え', contents: '組み込みの中身', frame: 'フレーム', task: 'Task', fiber: 'Fiber' };
         d.roots.forEach(function (r) {
           if (!r.refs.length && !(r.temps || []).length) return;
           if (r.kind !== grp) { grp = r.kind; add(list, h('div', { cls: 'grp', text: gname[r.kind] || r.kind })); }
@@ -515,7 +515,7 @@ window.addEventListener('error', function (e) {
     fill();
     add(side, h('div', { cls: 'tools' }, search), list);
     var wide = h('div', { cls: 'wide' }, tools, h('div', { cls: 'svgbox' }, drawGraph(d)), h('p', { cls: 'muted', text:
-      '箱を押すと先を開く・閉じる (右の欄にそのオブジェクトの中身)。灰色の箱は permanent (VM を開いたときからあるもの。名前で運ばれ、中身は像に無い)。点線はすでに描いた箱への辺。' }));
+      '箱を押すと先を開く・閉じる (右の欄にそのオブジェクトの中身)。灰色の箱は permanent (VM を開いたときからあるもの。名前で運ばれ、中身はイメージに無い)。点線はすでに描いた箱への辺。' }));
     var detail = h('div', { cls: 'side' }, details(d, st.sel));
     add(m, h('div', { cls: 'split' }, side, wide, detail));
   }
@@ -593,7 +593,7 @@ window.addEventListener('error', function (e) {
         g.appendChild(s('text', { cls: 'kind', x: 8, y: 31, text: '#' + o.id + ' ' + (o['class'] && o.kind !== 'env' ? cut(obj(d, o['class']).class_name || L(obj(d, o['class'])), 20) : KIND[o.kind] || o.kind) }));
         if (n) g.appendChild(s('text', { cls: 'more', x: W - 8, y: 31, 'text-anchor': 'end', text: graph.open[id] ? '−' : '+' + n }));
       }
-      var t = s('title'); t.textContent = whereText(d, o) + '\n道筋: ' + o.path; g.appendChild(t);
+      var t = s('title'); t.textContent = whereText(d, o) + '\nパス: ' + o.path; g.appendChild(t);
       svg.appendChild(g);
     });
     return svg;
@@ -604,8 +604,8 @@ window.addEventListener('error', function (e) {
     if (!id || !obj(d, id)) { add(box, h('div', { cls: 'empty', text: '箱を選ぶと中身が出る' })); return box; }
     var o = obj(d, id), t = h('table');
     var cn = o['class'] && o.kind !== 'env' ? (obj(d, o['class']).class_name || L(obj(d, o['class']))) : null;
-    add(box, h('h3', { text: cut(L(o), 60) }), h('div', { cls: 'muted', text: '#' + o.id + (cn ? ' ・ ' + cn + ' のオブジェクト' : '') + (o.frozen ? ' ・ frozen' : '') + ' ・ 像の中で ' + o.bytes + ' バイト' }));
-    add(box, h('div', { text: whereText(d, o) }), h('div', { cls: 'muted mono', text: '道筋: ' + o.path, title: '根からの道筋 (2 つの像の差はこれで対応を取る)' }));
+    add(box, h('h3', { text: cut(L(o), 60) }), h('div', { cls: 'muted', text: '#' + o.id + (cn ? ' ・ ' + cn + ' のオブジェクト' : '') + (o.frozen ? ' ・ frozen' : '') + ' ・ イメージの中で ' + o.bytes + ' バイト' }));
+    add(box, h('div', { text: whereText(d, o) }), h('div', { cls: 'muted mono', text: 'パス: ' + o.path, title: 'ルートからのパス (2 つのイメージの差はこれで対応を取る)' }));
     if (o['class']) add(t, row('クラス', value(d, { ref: o['class'] })));
     var iv = function (list) { (list || []).forEach(function (p) { add(t, row(p[0], value(d, p[1]))); }); };
     switch (o.kind) {
@@ -630,21 +630,21 @@ window.addEventListener('error', function (e) {
       case 'exception': add(t, row('メッセージ', value(d, o.message)), row('バックトレース', value(d, o.backtrace))); iv(o.ivars); break;
       case 'class': case 'module': case 'singleton_class': case 'origin':
         if (o.class_name) add(t, row('名前', h('span', { cls: 'mono', text: o.class_name })));
-        add(t, row('上位', o.superclass ? value(d, { ref: o.superclass }) : '-'));
+        add(t, row('スーパークラス', o.superclass ? value(d, { ref: o.superclass }) : '-'));
         iv(o.ivars);
         o.methods.forEach(function (mm) { add(t, row('#' + mm.name, mm.kind === 'proc' ? value(d, { ref: mm.proc }) : h('span', { cls: 'mono', text: mm.kind === 'cfunc' ? 'C ' + mm.cfunc : 'undef' }))); });
         break;
-      case 'iclass': add(t, row('上位', o.superclass ? value(d, { ref: o.superclass }) : '-')); break;
+      case 'iclass': add(t, row('スーパークラス', o.superclass ? value(d, { ref: o.superclass }) : '-')); break;
       case 'proc':
         var b = o.body;
         add(t, row('本体', h('span', { cls: 'mono', text: b.kind === 'irep' ? 'irep @' + b.irep + (d.ireps[b.irep - 1].file ? ' (' + d.ireps[b.irep - 1].file + ':' + d.ireps[b.irep - 1].line + ')' : '') : (b.kind === 'cfunc' ? 'C ' + b.name : 'alias ' + b.method) })));
-        add(t, row('印', [['lambda', 'lambda'], ['orphan', 'return の戻り先がもう無い'], ['scope', 'メソッドの本体']].filter(function (k) { return o[k[0]]; }).map(function (k) { return k[1]; }).join('、') || '-'));
+        add(t, row('フラグ', [['lambda', 'lambda'], ['orphan', 'return の戻り先がもう無い'], ['scope', 'メソッドの本体']].filter(function (k) { return o[k[0]]; }).map(function (k) { return k[1]; }).join('、') || '-'));
         if (o.upper) add(t, row('外側', value(d, { ref: o.upper })));
         if (o.env) add(t, row(o.env.kind === 'env' ? '環境' : '定義先', value(d, { ref: o.env.ref })));
         break;
       case 'env':
         add(t, row('メソッド', o.method || '-'));
-        if (o.on_stack) add(t, row('置き場所', '文脈 ' + o.context + ' のスタックの ' + o.position + ' (その枠のレジスタそのもの)'));
+        if (o.on_stack) add(t, row('置き場所', 'コンテキスト ' + o.context + ' のスタックの ' + o.position + ' (そのフレームのレジスタそのもの)'));
         else (o.values || []).forEach(function (v, i) { add(t, row('[' + i + ']', value(d, v))); });
         break;
       case 'data':
@@ -656,10 +656,10 @@ window.addEventListener('error', function (e) {
         var tk = o.task ? d.scheduler.tasks[o.task - 1] : null;
         if (tk) add(t, row('Task', tk.key + ' ・ ' + taskState(tk) + ' ・ ' + queueText(tk)), row('待ち', waitText(d, tk) || '-'));
         iv(o.ivars); break;
-      case 'fiber': add(t, row('文脈', o.context ? String(o.context) : '(まだ無い)')); break;
-      case 'break': add(t, row('種類', { 'break': 'break', jump: 'jump (ensure を通る)', stop: '止まる' }[o.tag] || o.tag), row('行き先の枠', String(o.frame)), row('値', value(d, o.value))); break;
+      case 'fiber': add(t, row('コンテキスト', o.context ? String(o.context) : '(まだ無い)')); break;
+      case 'break': add(t, row('種類', { 'break': 'break', jump: 'jump (ensure を通る)', stop: '止まる' }[o.tag] || o.tag), row('行き先のフレーム', String(o.frame)), row('値', value(d, o.value))); break;
       default:
-        [['value', '値'], ['numerator', '分子'], ['denominator', '分母'], ['state', '乱数の状態'], ['seed', '種']].forEach(function (k) { if (o[k[0]] !== undefined) add(t, row(k[1], String(o[k[0]]))); });
+        [['value', '値'], ['numerator', '分子'], ['denominator', '分母'], ['state', '乱数の状態'], ['seed', 'シード']].forEach(function (k) { if (o[k[0]] !== undefined) add(t, row(k[1], String(o[k[0]]))); });
         iv(o.ivars);
     }
     add(box, t);
@@ -684,7 +684,7 @@ window.addEventListener('error', function (e) {
     add(m, wrap);
     if (df.same) { add(wrap, h('p', { text: '差はない。' })); return; }
     var ob = df.objects;
-    add(wrap, h('p', null, 'A → B。オブジェクトは番号でなく、根 (大域変数・定数・枠・Task) からの道筋で対応を取っている。 ',
+    add(wrap, h('p', null, 'A → B。オブジェクトは番号でなく、ルート (グローバル変数・定数・フレーム・Task) からのパスで対応を取っている。 ',
       h('span', { cls: 'chg', text: '変わった ' + ob.changed.length }), ' ・ ', h('span', { cls: 'add', text: '増えた ' + ob.added.length }), ' ・ ',
       h('span', { cls: 'del', text: '消えた ' + ob.removed.length }), ' ・ 移った ' + ob.moved.length));
     // one side of a change: an object of that image as a link, else the words
@@ -704,30 +704,30 @@ window.addEventListener('error', function (e) {
     }
     function objText(img, id, path) {
       var o = id ? obj(DOCS[img], id) : byPath[img][path];
-      return h('a', { cls: 'link', title: '道筋: ' + path, onclick: function () { go({ view: 'objects', img: img, focus: o.id, sel: o.id }); } }, whereText(DOCS[img], o));
+      return h('a', { cls: 'link', title: 'パス: ' + path, onclick: function () { go({ view: 'objects', img: img, focus: o.id, sel: o.id }); } }, whereText(DOCS[img], o));
     }
     function ctxHead(key) {
       var c = B.contexts.filter(function (x) { return x.key === key; })[0] || A.contexts.filter(function (x) { return x.key === key; })[0];
       return c ? ctxName(B.contexts.indexOf(c) >= 0 ? B : A, c) : key;
     }
-    if (df.header.length) add(wrap, h('h2', { text: '頭' }), fieldTable(df.header));
+    if (df.header.length) add(wrap, h('h2', { text: 'ヘッダ' }), fieldTable(df.header));
     if (df.variables.length) {
-      add(wrap, h('h2', { text: '大域変数・定数・メソッド' }), fieldTable(df.variables.map(function (v) {
+      add(wrap, h('h2', { text: 'グローバル変数・定数・メソッド' }), fieldTable(df.variables.map(function (v) {
         return { field: v.key.replace(/^Object::/, '').replace(/^Object#/, '#'), a: v.a, b: v.b, a_ref: v.a_ref, b_ref: v.b_ref };
       })));
     }
     var cs = df.contexts.filter(function (c) { return c.change !== 'same'; });
     if (cs.length) {
-      add(wrap, h('h2', { text: '呼び出しの枠' }));
+      add(wrap, h('h2', { text: 'コールスタック' }));
       cs.forEach(function (c) {
         var card = h('div', { cls: 'card' }, h('h3', { title: c.key }, ctxHead(c.key), c.change !== 'changed' ? h('span', { cls: c.change === 'added' ? 'badge run' : 'badge warn', text: c.change === 'added' ? '増えた' : '消えた' }) : null));
         if (c.fields && c.fields.length) add(card, fieldTable(c.fields));
         (c.frames || []).slice().reverse().forEach(function (f) {
           if (f.change === 'same') return;
-          if (f.change === 'called') add(card, h('div', { cls: 'row add mono', text: '+ 呼ばれた枠 ' + f.index + ': ' + f.b }));
-          else if (f.change === 'returned') add(card, h('div', { cls: 'row del mono', text: '− 戻った枠 ' + f.index + ': ' + f.a }));
+          if (f.change === 'called') add(card, h('div', { cls: 'row add mono', text: '+ 呼ばれたフレーム ' + f.index + ': ' + f.b }));
+          else if (f.change === 'returned') add(card, h('div', { cls: 'row del mono', text: '− 戻ったフレーム ' + f.index + ': ' + f.a }));
           else {
-            add(card, h('div', { cls: 'row chg mono', text: '~ 枠 ' + f.index + ': ' + (f.a === f.b ? f.a : f.a + ' → ' + f.b) + (f.pc ? ' (pc ' + f.pc[0] + ' → ' + f.pc[1] + ')' : '') }));
+            add(card, h('div', { cls: 'row chg mono', text: '~ フレーム ' + f.index + ': ' + (f.a === f.b ? f.a : f.a + ' → ' + f.b) + (f.pc ? ' (pc ' + f.pc[0] + ' → ' + f.pc[1] + ')' : '') }));
             var rows = (f.self ? [{ field: 'self', a: f.self[0], b: f.self[1] }] : []).concat(f.locals.map(function (l) {
               return l.contents_changed ? { field: l.name, a: '(中身が変わった)', b: l.b, b_ref: l.b_ref } : { field: l.name, a: l.a, b: l.b, a_ref: l.a_ref, b_ref: l.b_ref };
             }));
@@ -776,7 +776,7 @@ window.addEventListener('error', function (e) {
     var d = doc(), hd = d.header;
     var t = h('table');
     Object.keys(hd).forEach(function (k) { add(t, row(FIELD[k] || k, String(yesNo(hd[k])))); });
-    add(m, h('h2', { text: '頭' }), t);
+    add(m, h('h2', { text: 'ヘッダ' }), t);
     if (d.warnings.length) {
       add(m, h('h2', { text: '注意' }));
       d.warnings.forEach(function (w) { add(m, h('div', { cls: 'badge warn', text: w })); });
@@ -788,11 +788,11 @@ window.addEventListener('error', function (e) {
     Object.keys(kinds).sort(function (a, b) { return kb[b] - kb[a]; }).forEach(function (k) { add(kt, h('tr', null, h('td', { text: KIND[k] || k }), h('td', { text: kinds[k] }), h('td', { text: kb[k] }))); });
     var ib = 0; d.ireps.forEach(function (ir) { ib += ir.bytes; });
     add(m, h('h2', { text: '表' }), h('p', null, 'シンボル ' + d.symbols.length + ' ・ irep ' + d.ireps.length + ' (' + ib + ' バイト) ・ オブジェクト ' + d.objects.length +
-      ' ・ 変更 ' + d.changes.length + ' ・ 文脈 ' + d.contexts.length + ' ・ Task ' + d.scheduler.tasks.length), kt);
-    add(m, h('h2', { text: '任意の節' }));
+      ' ・ 変更 ' + d.changes.length + ' ・ コンテキスト ' + d.contexts.length + ' ・ Task ' + d.scheduler.tasks.length), kt);
+    add(m, h('h2', { text: '任意のセクション' }));
     if (!d.sections.length) add(m, h('div', { cls: 'empty', text: 'なし' }));
     d.sections.forEach(function (sec) {
-      var text = sec.tag === 'DBG0' ? sec.ireps.length + ' 個の irep の行番号' : (sec.unknown ? '知らない節 (読み飛ばした): ' + sec.length + ' バイト ' + sec.head_hex :
+      var text = sec.tag === 'DBG0' ? sec.ireps.length + ' 個の irep の行番号' : (sec.unknown ? '知らないセクション (読み飛ばした): ' + sec.length + ' バイト ' + sec.head_hex :
         (sec.tag === 'GCS0' ? 'GC の設定: ' + Object.keys(sec).filter(function (k) { return k !== 'tag' && k !== 'offset' && k !== 'length'; }).map(function (k) { return k + '=' + sec[k]; }).join(' ') : JSON.stringify(sec)));
       add(m, h('div', { cls: 'mono', text: sec.tag + ' (' + sec.offset + ' バイト目): ' + text }));
     });

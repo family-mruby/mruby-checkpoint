@@ -1,6 +1,6 @@
-# 実装指示書 P1b: mruby-checkpoint への改名と口の整理
+# 実装指示書 P1b: mruby-checkpoint への改名と API の整理
 
-P1 は検収済み (`doc/report/p1.md`)。この段は名前と口を整えるだけで、形式・方式は
+P1 は検収済み (`doc/report/p1.md`)。この段は名前と API を整えるだけで、形式・方式は
 変えない。
 
 ## 決まったこと (2026-11-02 ユーザ)
@@ -8,7 +8,7 @@ P1 は検収済み (`doc/report/p1.md`)。この段は名前と口を整える�
 - 汎用の機能の名前は **`mruby-checkpoint`** (Linux の CRIU と同じ言葉。保存・移動・
   巻き戻しを全部含む)。Ghost の名前は、この上に作るデモの層 (別のボードへの移動・
   シングルトン) にだけ残す。このリポジトリからは消す。
-- Ruby の口:
+- Ruby の API:
   - `Checkpoint.save(path)`: 状態を書き出して**動き続ける**。復元した側も `save` の
     次の行から続く。(どちらの側かを見分ける手段が要るなら、`save` の戻り値で区別する
     案を考えて report に。例: 書いた側は `:saved`、復元した側は `:resumed`。)
@@ -16,7 +16,7 @@ P1 は検収済み (`doc/report/p1.md`)。この段は名前と口を整える�
     `Ghost.hop` と同じ)。
   - どちらも、ドライバの `resume` で次の行から続く。
 - C の境目の中 (`sort { }` など C の関数が呼ぶブロックの中) で `save` / `suspend` を
-  頼んだら、**頼んだ時点で例外** (`Checkpoint::Error`、理由つき) にする。先送りは
+  要求したら、**要求した時点で例外** (`Checkpoint::Error`、理由つき) にする。先送りは
   やめる。Ruby で書かれた繰り返し (`each`・`times`) の中は今まで通りその場で行う。
 - 誤り: `Ghost::Error` → `Checkpoint::Error`。
 
@@ -28,13 +28,13 @@ P1 は検収済み (`doc/report/p1.md`)。この段は名前と口を整える�
   patch の中のコメント (`mruby-ghost` の語)、README・`doc/plan.md`・
   `doc/format_v0.md` の名前を追従させる。拡張子 `.ghost` も改める (`.ckpt` など、
   .gitignore も)。
-- 形式の先頭の印 (magic) に ghost 由来の文字があれば改め、形式の版の扱い (v0 のまま
+- 形式の先頭のマジック (magic) に ghost 由来の文字があれば改め、形式の版の扱い (v0 のまま
   か) を report に書く。
 - `doc/report/p1.md` は経過の記録なので書き換えない (冒頭に「この段の後で
   mruby-checkpoint に改名した」と 1 行だけ足す)。`doc/instruction_p1.md` も同じ。
-- 試験: 既存のサンプルを新しい口に直し、次を足す。
+- 試験: 既存のサンプルを新しい API に直し、次を足す。
   - `save` (続行) の往復: 書いた側と復元した側の両方の出力を、往復なしと比べる。
-  - C の境目の中の `save` / `suspend` が、頼んだ時点で `Checkpoint::Error` になり、
+  - C の境目の中の `save` / `suspend` が、要求した時点で `Checkpoint::Error` になり、
     rescue して続けられること。
 - `rake test` (ASan と GC_STRESS の両方も) が通ること。
 - ベンチマークの道具 (`tools/bench.rb`) は名前の追従だけ。速さの判定は

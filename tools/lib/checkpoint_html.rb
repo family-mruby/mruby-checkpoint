@@ -25,7 +25,7 @@ module CheckpointHtml
   def escape(s) = s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub('"', '&quot;')
 
   def page(docs, diff)
-    title = diff ? "像の差: #{docs[0]['source']['file']} → #{docs[1]['source']['file']}" : "像: #{docs[0]['source']['file']}"
+    title = diff ? "イメージの差: #{docs[0]['source']['file']} → #{docs[1]['source']['file']}" : "イメージ: #{docs[0]['source']['file']}"
     data = { 'docs' => docs, 'diff' => diff }
     <<~HTML
       <!doctype html>
