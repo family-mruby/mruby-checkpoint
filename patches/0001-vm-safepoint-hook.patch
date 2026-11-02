@@ -1,6 +1,6 @@
 --- a/src/vm.c
 +++ b/src/vm.c
-@@ -1622,6 +1622,35 @@
+@@ -1622,6 +1622,36 @@
    return FALSE;
  }
  
@@ -9,8 +9,9 @@
 +   allowed apart from the root-context rule: no exception in flight, no
 +   ObjectSpace walk, no C call boundary on the call-info stack. At that
 +   point every frame's pc and registers are in memory (ci->pc, ci->stack).
-+   The hook may return (nothing to do), raise, or never return. NULL by
-+   default. */
++   The hook may return (nothing to do), raise, or never return. It may call
++   methods (mrb_funcall), which may move the call-info stack: the VM takes
++   its frame from mrb->c->ci again after the check. NULL by default. */
 +void (*mrb_vm_safepoint_hook)(mrb_state *mrb) = NULL;
 +
 +/* The slow half of RETURN_IF_TASK_STOPPED, kept out of line so that the
@@ -36,7 +37,7 @@
  /* Defer task switches while a C-level ObjectSpace walk holds gc.iterating
     true. The walk runs callbacks (which may call back into mrb_vm_exec via
     mrb_yield); returning early from an inner exec while the outer C
-@@ -1662,15 +1691,21 @@
+@@ -1662,15 +1692,23 @@
  
     This macro must only be expanded where prev_jmp is in scope, i.e.
     inside mrb_vm_exec (via NEXT / END_DISPATCH). */
@@ -46,10 +47,14 @@
 -       !(mrb)->exc && \
 -       !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
 -      (mrb)->c->status == MRB_TASK_STOPPED) { \
-+  if (mrb_unlikely((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED) && \
-+      task_stop_requested(mrb)) { \
-     (mrb)->jmp = prev_jmp; \
-     return mrb_nil_value(); \
+-    (mrb)->jmp = prev_jmp; \
+-    return mrb_nil_value(); \
++  if (mrb_unlikely((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED)) { \
++    if (task_stop_requested(mrb)) { \
++      (mrb)->jmp = prev_jmp; \
++      return mrb_nil_value(); \
++    } \
++    ci = (mrb)->c->ci;   /* the safe point hook may have moved it */ \
    } \
  } while (0)
 +#else
@@ -62,7 +67,7 @@
  #define TASK_STOP(mrb) do { \
    if (mrb->c->status != MRB_TASK_STOPPED) \
      mrb->c->status = MRB_TASK_STOPPED; \
-@@ -3919,6 +3954,15 @@
+@@ -3919,6 +3957,16 @@
        return regs[irep->nlocals];
      }
    }
@@ -72,6 +77,7 @@
 +    mrb->jmp = prev_jmp;
 +    return mrb_nil_value();
 +  }
++  ci = mrb->c->ci;   /* the safe point hook may have moved it (mrb_funcall) */
 +  CALL_CODE_HOOKS();
 +  goto *optable[insn];
 +#endif

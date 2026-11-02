@@ -18,18 +18,16 @@
 ** the image holds :resumed in the same register.
 **
 ** task.switching is the scheduler's flag too (a Task's timeslice is over,
-** it sleeps, a Task it woke goes first), and a plain bool: a request that
-** sets it cannot tell later whether the scheduler set it as well. So the
-** request notes how the scheduler stood (mark_switch), and at the safe point
-** the change says whether the scheduler asked for a switch meanwhile
-** (sched_switch): the running Task no longer runs, its timeslice is over,
-** a waiting Task woke, a Task of higher priority became ready. Then the flag
+** it sleeps or passes, a Task it woke goes first): a request that sets it
+** would hide whether the scheduler set it as well. mruby-task counts its own
+** requests (mrb->task.switch_requests, patches/0002-task-switch-requests.patch;
+** every place that sets the flag for the scheduler moves the count). The
+** request notes the count and whether the flag was set already (mark_switch);
+** at the safe point the scheduler has asked for a switch exactly when the
+** flag was set already or the count has moved (sched_switch). Then the flag
 ** is left set (the VM returns to the scheduler right after the hook) and the
-** image says the slice ends there; otherwise it is cleared. The one switch
-** that leaves no trace is Task.pass called by the very instruction between
-** an external request and its safe point: that pass is lost (the Task runs
-** on until its timeslice is over). The test trigger asks at the boundary
-** where it stands (mrb_checkpoint_request_here), which has no such window.
+** image says the slice ends there; otherwise it is cleared, as it would be
+** without the request.
 */
 
 #include <stdio.h>
@@ -89,7 +87,6 @@ checkpoint_delete(mrb_state *mrb)
       free(g->data);
       for (int k = 0; k < g->nfuncs; k++) free(g->fnames[k]);
       free(g->fnames); free(g->funcs);
-      free(g->snap_wait); free(g->snap_reason); free(g->snap_ready);
       free(g);
       states[i] = NULL;
     }
@@ -227,81 +224,25 @@ default_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path
 
 /* ---- the scheduler's flag ---- */
 
-static void
-snap_free(checkpoint_state *g)
-{
-  free(g->snap_wait); free(g->snap_reason); free(g->snap_ready);
-  g->snap_wait = NULL; g->snap_reason = NULL; g->snap_ready = NULL;
-  g->nsnap_wait = g->nsnap_ready = 0;
-  g->snap_task = NULL;
-}
-
-/* raise the request: the VM tests task.switching at every boundary */
+/* raise the request: the VM tests task.switching at every boundary. The
+   scheduler's record as it stands now is what the safe point compares with. */
 static void
 mark_switch(mrb_state *mrb, checkpoint_state *g)
 {
-  snap_free(g);
-  if (mrb->task.switching) {   /* a switch is asked for already */
-    g->own_switch = 0;
-    return;
-  }
-  g->own_switch = 1;
+  g->sched_asked = mrb->task.switching ? 1 : 0;
+  g->sched_requests = mrb->task.switch_requests;
   mrb->task.switching = TRUE;
-  mrb_task *run = checkpoint_running_task(mrb);
-  if (!run) return;
-  g->snap_task = run;
-  int nw = 0, nr = 0;
-  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_WAITING]; t; t = t->next) nw++;
-  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; t; t = t->next) nr++;
-  g->snap_wait = (void**)malloc(sizeof(void*) * (nw + 1));
-  g->snap_reason = (uint8_t*)malloc(nw + 1);
-  g->snap_ready = (void**)malloc(sizeof(void*) * (nr + 1));
-  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_WAITING]; t; t = t->next) {
-    g->snap_reason[g->nsnap_wait] = t->reason;
-    g->snap_wait[g->nsnap_wait++] = t;
-  }
-  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; t; t = t->next) g->snap_ready[g->nsnap_ready++] = t;
 }
 
-static int
-in_queue(mrb_state *mrb, int q, void *t)
-{
-  for (mrb_task *x = mrb->task.queues[q]; x; x = x->next) if ((void*)x == t) return 1;
-  return 0;
-}
-
-/* at the safe point: did the scheduler ask for a switch (before the request,
-   or since)? */
+/* at the safe point: has the scheduler asked for a switch (before the
+   request, or since)? */
 static int
 sched_switch(mrb_state *mrb, checkpoint_state *g)
 {
   int sw;
   if (!mrb->task.switching) sw = 0;    /* the scheduler cleared it (not at a safe point here) */
-  else if (!g->own_switch) sw = 1;
-  else if (!g->snap_task) sw = 0;      /* no Task was running: nothing to switch from */
-  else {
-    mrb_task *run = (mrb_task*)g->snap_task;
-    sw = run->status != MRB_TASK_STATUS_RUNNING || run->c.status == MRB_TASK_STOPPED ||
-         run->timeslice == 0;
-    /* a waiting Task woke (a tick, a push, a close; a join only for a Task
-       of higher priority, as wake_up_join_waiters does) */
-    for (int i = 0; !sw && i < g->nsnap_wait; i++) {
-      mrb_task *t = (mrb_task*)g->snap_wait[i];
-      if (!in_queue(mrb, MRB_TASK_QUEUE_READY, t)) continue;
-      if (g->snap_reason[i] != MRB_TASK_REASON_JOIN || t->priority < run->priority) sw = 1;
-    }
-    /* a Task of higher priority than the running one became ready (made,
-       resumed) */
-    for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; !sw && t; t = t->next) {
-      if (t == run || t->priority >= run->priority) continue;
-      int was = 0;
-      for (int i = 0; i < g->nsnap_ready; i++) if (g->snap_ready[i] == (void*)t) { was = 1; break; }
-      for (int i = 0; !was && i < g->nsnap_wait; i++) if (g->snap_wait[i] == (void*)t) was = 1;
-      if (!was) sw = 1;
-    }
-  }
-  snap_free(g);
-  g->own_switch = 0;
+  else sw = g->sched_asked || mrb->task.switch_requests != g->sched_requests;
+  g->sched_asked = 0;
   return sw;
 }
 
@@ -509,30 +450,6 @@ mrb_checkpoint_request(mrb_state *mrb)
   return MRB_CHECKPOINT_REQ_OK;
 }
 
-MRB_API enum mrb_checkpoint_req
-mrb_checkpoint_request_here(mrb_state *mrb)
-{
-  checkpoint_state *g = checkpoint_get(mrb);
-  char cfn[256];
-  if (!g || !g->perm) return MRB_CHECKPOINT_REQ_NOT_READY;
-  if (g->pending) {
-    if (!mrb->task.switching) mark_switch(mrb, g);
-    return MRB_CHECKPOINT_REQ_PENDING;
-  }
-  if (c_boundary(mrb, cfn, sizeof(cfn))) return MRB_CHECKPOINT_REQ_C_BOUNDARY;
-  g->pending = 1;
-  g->pending_kind = MRB_CHECKPOINT_EXTERNAL;
-  if (mrb->exc || mrb->gc.iterating) {
-    /* an exception (or a break through an ensure clause) in flight, or a C
-       walk of the heap: the VM calls the hook at the first safe point */
-    mark_switch(mrb, g);
-    return MRB_CHECKPOINT_REQ_OK;
-  }
-  /* a safe point: the image is of this boundary, the flag stays as it is */
-  external_write(mrb, g, mrb->task.switching ? 1 : 0);
-  return MRB_CHECKPOINT_REQ_OK;
-}
-
 MRB_API void
 mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handler fn, void *ud)
 {
@@ -571,18 +488,28 @@ checkpoint_suspend(mrb_state *mrb, mrb_value self)
 #ifdef CHECKPOINT_TEST_HELPERS
 /* test builds only: Task.pass and Checkpoint.save (or suspend) in one call,
    so that the image is taken where the scheduler has asked for a switch (the
-   slice ends at that safe point, on both sides) */
+   slice ends at that safe point, on both sides). The pass is the one of
+   mruby-task (task_request_switch) and is counted as the scheduler's. */
+static void
+pass_like_task(mrb_state *mrb)
+{
+  if (mrb->c != mrb->root_c) {
+    mrb->task.switch_requests++;
+    mrb->task.switching = TRUE;
+  }
+}
+
 static mrb_value
 checkpoint_pass_and_save(mrb_state *mrb, mrb_value self)
 {
-  if (mrb->c != mrb->root_c) mrb->task.switching = TRUE;
+  pass_like_task(mrb);
   return request(mrb, MRB_CHECKPOINT_SAVE);
 }
 
 static mrb_value
 checkpoint_pass_and_suspend(mrb_state *mrb, mrb_value self)
 {
-  if (mrb->c != mrb->root_c) mrb->task.switching = TRUE;
+  pass_like_task(mrb);
   return request(mrb, MRB_CHECKPOINT_SUSPEND);
 }
 #endif

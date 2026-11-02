@@ -83,12 +83,6 @@ enum mrb_checkpoint_req {
   MRB_CHECKPOINT_REQ_EXCEPTION,   /* (not returned since P3: the request waits until it is caught) */
 };
 MRB_API enum mrb_checkpoint_req mrb_checkpoint_request(mrb_state *mrb);
-/* The same, from a place where the VM stands at an instruction boundary with
-   every frame in memory (the per-instruction hook, code_fetch_hook): the
-   image is taken right here when this boundary is a safe point, else at the
-   first safe point after (an exception in flight). Nothing runs between the
-   request and the image, so the scheduler's state at the point is exact. */
-MRB_API enum mrb_checkpoint_req mrb_checkpoint_request_here(mrb_state *mrb);
 typedef void (*mrb_checkpoint_refusal_handler)(mrb_state *mrb, const char *reason, void *ud);
 MRB_API void mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handler fn, void *ud);
 
@@ -118,12 +112,6 @@ MRB_API mrb_value mrb_checkpoint_continue(mrb_state *mrb);
    program, as Family mruby runs an application): the image keeps which one
    it is, so that the restoring side finds it again (its value, its end).
    mrb_checkpoint_host_task returns it after mrb_checkpoint_restore, or nil. */
-/* The Task that was running goes on with a full timeslice (the default), or
-   with what was left of it in the image (keep = TRUE; an experiment: the
-   writer's ticks to the end of the slice, as if the run had not stopped).
-   Set on the restoring side. */
-MRB_API void mrb_checkpoint_keep_timeslice(mrb_state *mrb, mrb_bool keep);
-
 MRB_API void mrb_checkpoint_set_host_task(mrb_state *mrb, mrb_value task);
 MRB_API mrb_value mrb_checkpoint_host_task(mrb_state *mrb);
 

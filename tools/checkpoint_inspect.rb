@@ -100,6 +100,7 @@ kinds = { 2 => 'Object', 3 => 'String', 4 => 'Array', 5 => 'Hash', 6 => 'Range',
           26 => 'Task', 27 => 'Fiber' }
 nobj = r.u32
 puts "objects: #{nobj}"
+proc_irep = {}   # Proc object -> the irep it runs (for the lines of the frames)
 nobj.times do |i|
   k = r.u8
   if k == 1
@@ -107,7 +108,9 @@ nobj.times do |i|
     next
   end
   if k == 15
-    puts "  ##{i + 1} = #{r.str} (runs irep @#{r.u32})"
+    n = r.str; ir = r.u32
+    proc_irep[i + 1] = ir
+    puts "  ##{i + 1} = #{n} (runs irep @#{ir})"
     next
   end
   klass = r.u32
@@ -134,7 +137,7 @@ nobj.times do |i|
       fl = r.u8
       bodyk = r.u8
       b = case bodyk
-          when 0 then "irep @#{r.u32}"
+          when 0 then ir = r.u32; proc_irep[i + 1] = ir; "irep @#{ir}"
           when 1 then f = r.str; a = r.u32; "C #{f} aspec=#{a.to_s(16)}"
           when 2 then "alias of #{sym.(r.u32)}"
           else raise "bad proc body #{bodyk}"
@@ -199,6 +202,7 @@ npatch.times do
 end
 
 fstates = %w(created running resumed suspended transferred terminated)
+frames = []   # [context, frame, method, proc, pc] of the Ruby frames
 nctx = r.u32
 puts "contexts: #{nctx}"
 nctx.times do |c|
@@ -213,6 +217,7 @@ nctx.times do |c|
     mid = sym.(r.u32); proc_ = r.u32
     fname = fk == 1 ? " C #{r.str}" : ''
     off = r.u32; pc = r.u32
+    frames << [c + 1, k, mid, proc_, pc] if fk == 0 && pc != 0xffffffff
     n, nk, cci, v = r.u8, r.u8, r.u8, r.u8
     blk = r.u32; uk = r.u8; u = r.u32
     puts "    #{k}: #{mid}#{fname} proc=##{proc_} R0=stack[#{off}] pc=#{pc == 0xffffffff ? '-' : pc} n=#{n} nk=#{nk} " \
@@ -240,18 +245,35 @@ ntask.times do |i|
        "name=#{name} value=#{res}#{wait}"
 end
 puts "running Task: #{r.u32}, host Task: #{r.u32}"
+lines = {}   # irep -> [[file, start, end, [[pc, line], ...]], ...]
 if r.peek(4) == 'DBG0'
   r.take(4)
   nd = r.u32
   puts "line numbers: #{nd} ireps"
   nd.times do
     id = r.u32
-    files = Array.new(r.u16) do
-      fn = r.str; st = r.u32; en = r.u32
-      ents = Array.new(r.u32) { "#{r.u32}:#{r.u32}" }
-      "#{fn}[#{st}...#{en}] #{ents.size} changes"
+    lines[id] = Array.new(r.u16) do
+      [r.str, r.u32, r.u32, Array.new(r.u32) { [r.u32, r.u32] }]
     end
-    puts "  @#{id} #{files.join(', ')}"
+    puts "  @#{id} #{lines[id].map { |f, st, en, e| "#{f}[#{st}...#{en}] #{e.size} changes" }.join(', ')}"
+  end
+end
+# the line of each Ruby frame (the instruction before its pc: the one that
+# is running, or the call it waits in), as a backtrace shows it
+line_at = lambda do |id, pc|
+  (lines[id] || []).each do |f, st, en, ents|
+    next unless pc >= st && pc < en
+    l = ents.select { |p, _| p <= pc }.last
+    return "#{f}:#{l ? l[1] : '?'}"
+  end
+  nil
+end
+unless frames.empty?
+  puts "frames:"
+  frames.each do |cx, k, mid, pr, pc|
+    id = proc_irep[pr]
+    where = id && line_at.(id, pc > 0 ? pc - 1 : 0)
+    puts "  context #{cx} frame #{k}: #{mid} irep @#{id || '?'} pc=#{pc} #{where || '(no line)'}"
   end
 end
 if r.peek(4) == 'GCS0'

@@ -221,12 +221,10 @@ typedef struct checkpoint_state {
   int dump_switch;            /* the image is taken where the scheduler asked for a switch */
   void *host_task;            /* the embedder's Task (mrb_checkpoint_set_host_task), an mrb_task */
   const mrb_data_type *task_type;   /* mruby-task's (static there; probed) */
-  int keep_timeslice;         /* the running Task goes on with what was left of its timeslice */
-  /* the scheduler as the request found it (see mark_switch in checkpoint.c) */
-  int own_switch;             /* the request set task.switching (it was clear) */
-  void *snap_task;            /* the running Task then */
-  void **snap_wait; uint8_t *snap_reason; int nsnap_wait;   /* the waiting Tasks and why */
-  void **snap_ready; int nsnap_ready;                       /* the ready ones */
+  /* the scheduler's record when the request was raised (see mark_switch in
+     checkpoint.c) */
+  int sched_asked;            /* task.switching was set already */
+  uint32_t sched_requests;    /* mrb->task.switch_requests then */
   /* what mrb_checkpoint_continue starts again (set by the restore) */
   struct checkpoint_resume_plan {
     int set;

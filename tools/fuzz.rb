@@ -4,7 +4,6 @@
 #   ruby tools/fuzz.rb [--seeds 1,2,3 | --seed-from N --runs K] [--points N]
 #                      [--xproc N] [--keep-dead] [--only PATTERN] [--jobs N]
 #                      [--json FILE] [--table FILE] [--quiet] [--as-task] [--quantum N]
-#                      [--keep-timeslice]
 #
 # For every test file (vendor/mruby/test/t/*.rb, and test/*.rb of each gem in
 # the build that has one):
@@ -18,9 +17,7 @@
 #               status must equal the reference.
 # --as-task runs every program (and its reference) as a Task, the way Family
 # mruby starts an application; --quantum N ticks mruby-task's virtual clock
-# once every N instructions (timeslices end), in every run alike;
-# --keep-timeslice: a restored Task goes on with what was left of its
-# timeslice instead of a full one.
+# once every N instructions (timeslices end), in every run alike.
 # Outputs are compared after dropping assert.rb's "Time:" line (wall clock) and
 # masking mkstemp's random file names.
 #
@@ -66,7 +63,6 @@ until args.empty?
   when '--isolate' then opts[:isolate] = true
   when '--as-task' then opts[:as_task] = true
   when '--quantum' then opts[:quantum] = args.shift.to_i
-  when '--keep-timeslice' then opts[:keep_timeslice] = true
   else abort "unknown option #{a}"
   end
 end
@@ -246,7 +242,6 @@ def run_file(gem, file, opts, excl)
     common = ['--gem', gem, '--tmp', dir]
     common << '--as-task' if opts[:as_task]
     common += ['--quantum', opts[:quantum].to_s] if opts[:quantum].to_i > 0
-    common << '--keep-timeslice' if opts[:keep_timeslice]
     log = File.join(dir, 'ref.log')
     ref, err, st = run('64', ['--ref', *common, '--assert', ASSERT, file], log, opts[:timeout])
     _, ends, = parse_log(log)

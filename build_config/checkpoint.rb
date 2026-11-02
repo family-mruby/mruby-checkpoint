@@ -16,20 +16,59 @@
 #                     suite at random safe points, and mrbgems/hal-task-virtual,
 #                     a virtual clock for mruby-task in place of the POSIX timer.
 #                     Never in the normal builds.
+# CHECKPOINT_VIRTUAL_CLOCK=1  only the virtual clock (mrbgems/hal-task-virtual), for
+#                     measuring Task programs with instruction counts (a timer
+#                     makes them depend on time)
 
 CHECKPOINT_ROOT = File.expand_path("..", __dir__)
+
+# mrblib (mruby's and the gems') is compiled with line numbers (mrbc -g), so
+# that a frame running mrblib code has a file and a line, in the image too
+# (section DBG0 of doc/format_v1.md). The file names are relative to the
+# source tree (mrblib/array.rb, mrbgems/mruby-task/mrblib/task.rb): mrbc
+# names a file as it is given, and runs here from the tree's root. The
+# options of a build are kept; only the directory mrbc runs in changes (a
+# spawn option, not Dir.chdir: rake builds in threads).
+module CheckpointMrbcRelativeNames
+  def run(out, infiles, funcname, cdump: true, static: false)
+    infiles = [infiles].flatten.map { |f| File.expand_path(f) }
+    root = [MRUBY_ROOT, CHECKPOINT_ROOT].map { |r| File.expand_path(r) }
+                                        .find { |r| infiles.all? { |f| f.start_with?("#{r}/") } }
+    return super unless root
+    infiles.each_with_index { |f, i| _pp i == 0 ? "MRBC" : "", f.relative_path, indent: 2 }
+    rel = infiles.map { |f| f.delete_prefix("#{root}/") }
+    opt = @compile_options % {funcname: funcname}
+    opt << " -S" if cdump
+    opt << " -s" if static
+    tmpout = File.expand_path("#{out.path}.#{funcname}.mrbcout")
+    opt = opt.sub(/\s-o-(?=\s|\z)/, %Q[ -o "#{tmpout}"])
+    cmd = %["#{File.expand_path(@command || @build.mrbcfile)}" #{opt} #{rel.map { |f| %["#{f}"] }.join(' ')}]
+    puts cmd if Rake.verbose
+    unless system(cmd, chdir: root)
+      rm_f tmpout
+      rm_f out.path
+      fail "Command failed with status (#{$?.exitstatus}): [#{cmd[0, 42]}...]"
+    end
+    out.write File.binread(tmpout)
+    rm_f tmpout
+  end
+end
+MRuby::Command::Mrbc.prepend(CheckpointMrbcRelativeNames)
 
 def checkpoint_common(conf)
   conf.toolchain :gcc
   conf.gembox 'default'
   conf.gem core: 'mruby-task'
   conf.gem "#{CHECKPOINT_ROOT}/mrbgems/mruby-checkpoint" unless ENV['CHECKPOINT_GEM'] == 'no'
-  if ENV['CHECKPOINT_FUZZ'] == '1'
+  if ENV['CHECKPOINT_FUZZ'] == '1' || ENV['CHECKPOINT_VIRTUAL_CLOCK'] == '1'
     conf.gem "#{CHECKPOINT_ROOT}/mrbgems/hal-task-virtual"   # mruby-task's HAL: the virtual clock
+  end
+  if ENV['CHECKPOINT_FUZZ'] == '1'
     conf.gem "#{CHECKPOINT_ROOT}/mrbgems/mruby-checkpoint-fuzz"
     conf.defines << 'MRB_USE_DEBUG_HOOK'   # the per-instruction hook the trigger counts with
     conf.defines << 'CHECKPOINT_TEST_HELPERS'   # Checkpoint.__pass_and_save / __pass_and_suspend
   end
+  conf.mrbc.compile_options += ' -g'   # mrblib with line numbers (above)
   conf.defines += %w(MRB_NO_BOXING MRB_INT64 MRB_UTF8_STRING)
   conf.cc.flags << '-O2'
   if ENV['CHECKPOINT_DEBUG'].to_s.start_with?('asan')

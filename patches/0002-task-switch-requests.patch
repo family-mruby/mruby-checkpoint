@@ -1,0 +1,170 @@
+--- a/include/mruby.h
++++ b/include/mruby.h
+@@ -296,6 +296,9 @@
+   uint8_t irq_nesting;              /* Depth counter for scheduler-IRQ exclusion */
+   mrb_bool loop_running;            /* Active mrb_task_run loop flag */
+   mrb_bool exception_as_result;     /* Return unhandled task exceptions as values */
++  volatile uint32_t switch_requests; /* Count of the scheduler's switch requests
++                                        (it changes whenever the scheduler sets
++                                        switching; only a change means anything) */
+ } mrb_task_state;
+ #endif
+ 
+--- a/mrbgems/mruby-task/include/task.h
++++ b/mrbgems/mruby-task/include/task.h
+@@ -164,6 +164,17 @@
+ #define wakeup_tick_ (mrb->task.wakeup_tick)
+ #define switching_   (mrb->task.switching)
+ 
++/* The scheduler asks the VM for a context switch. Every request also moves
++ * switch_requests, so that code which sets switching for a reason of its own
++ * (mruby-checkpoint's safe point request) can tell afterwards whether the
++ * scheduler asked too, even when the flag was set already. Only a change of
++ * the count means anything: a request made from the tick while the VM thread
++ * makes one may be counted once. */
++#define task_request_switch(mrb) do { \
++  (mrb)->task.switch_requests++; \
++  (mrb)->task.switching = TRUE; \
++} while (0)
++
+ /* Recover the mrb_task that owns the current mruby context */
+ #define MRB2TASK(mrb) ((mrb_task *)((uint8_t *)(mrb)->c - offsetof(mrb_task, c)))
+ 
+--- a/mrbgems/mruby-task/src/task.c
++++ b/mrbgems/mruby-task/src/task.c
+@@ -344,11 +344,13 @@
+       curr->wait.join = NULL;
+       mrb_task_q_insert(mrb, curr);
+       /* If a higher-priority waiter is resumed from task context,
+-       * request a context switch after leaving the critical section. */
+-      if (mrb->c != mrb->root_c && !switching_) {
++       * request a context switch after leaving the critical section.
++       * (Asked even when switching is set already, so that the request
++       * is counted.) */
++      if (mrb->c != mrb->root_c) {
+         mrb_task *running = MRB2TASK(mrb);
+         if (curr->priority < running->priority) {
+-          switching_ = TRUE;
++          task_request_switch(mrb);
+         }
+       }
+     }
+@@ -504,7 +506,7 @@
+   if (t && t->status == MRB_TASK_STATUS_RUNNING && t->timeslice > 0) {
+     t->timeslice--;
+     if (t->timeslice == 0) {
+-      switching_ = TRUE;  /* Trigger context switch */
++      task_request_switch(mrb);  /* Trigger context switch */
+     }
+   }
+ 
+@@ -546,7 +548,7 @@
+           }
+           curr->reason = MRB_TASK_REASON_NONE;
+           mrb_task_q_insert(mrb, curr);
+-          switching_ = TRUE;
++          task_request_switch(mrb);
+         }
+         else if (next_wakeup == UINT32_MAX ||
+                  (int32_t)(curr_wakeup - next_wakeup) < 0) {
+@@ -761,7 +763,7 @@
+   mrb_task_excl_exit(mrb);
+ 
+   /* Trigger context switch */
+-  switching_ = TRUE;
++  task_request_switch(mrb);
+ }
+ 
+ static void
+@@ -794,7 +796,7 @@
+     t->status = MRB_TASK_STATUS_SUSPENDED;
+     mrb_task_q_insert(mrb, t);
+     mrb_task_excl_exit(mrb);
+-    switching_ = TRUE;
++    task_request_switch(mrb);
+     return mrb_nil_value();
+   }
+ 
+@@ -863,7 +865,7 @@
+ 
+   if (q_ready_ && q_ready_->status == MRB_TASK_STATUS_RUNNING) {
+     if (t->priority < q_ready_->priority) {
+-      switching_ = TRUE;
++      task_request_switch(mrb);
+     }
+   }
+ 
+@@ -1006,7 +1008,7 @@
+     }
+ 
+     /* In task context - trigger context switch */
+-    switching_ = TRUE;
++    task_request_switch(mrb);
+   }
+ 
+   return mrb_nil_value();
+@@ -1300,7 +1302,7 @@
+   mrb_task_excl_exit(mrb);
+ 
+   /* Trigger context switch */
+-  switching_ = TRUE;
++  task_request_switch(mrb);
+ 
+   return t->result;
+ }
+@@ -1472,7 +1474,7 @@
+   task_change_state(mrb, t, MRB_TASK_STATUS_SUSPENDED);
+ 
+   if (need_switch) {
+-    switching_ = TRUE;
++    task_request_switch(mrb);
+   }
+ }
+ 
+@@ -1508,7 +1510,7 @@
+   if (target_status == MRB_TASK_STATUS_READY && q_ready_ &&
+       q_ready_->status == MRB_TASK_STATUS_RUNNING) {
+     if (t->priority < q_ready_->priority) {
+-      switching_ = TRUE;
++      task_request_switch(mrb);
+     }
+   }
+ 
+@@ -1570,7 +1572,7 @@
+ 
+   /* If terminating self, trigger context switch */
+   if (was_running) {
+-    switching_ = TRUE;
++    task_request_switch(mrb);
+   }
+ }
+ 
+--- a/mrbgems/mruby-task/src/task_queue.c
++++ b/mrbgems/mruby-task/src/task_queue.c
+@@ -43,7 +43,7 @@
+       curr->wait.queue.target = NULL;
+       curr->wait.queue.wakeup_tick = UINT32_MAX;
+       mrb_task_q_insert(mrb, curr);
+-      switching_ = TRUE;
++      task_request_switch(mrb);
+       break;
+     }
+     curr = next;
+@@ -72,7 +72,7 @@
+     curr = next;
+   }
+   if (woke_any) {
+-    switching_ = TRUE;
++    task_request_switch(mrb);
+   }
+   mrb_task_excl_exit(mrb);
+ }
+@@ -218,7 +218,7 @@
+   }
+   mrb_task_q_insert(mrb, current);
+   mrb_task_excl_exit(mrb);
+-  switching_ = TRUE;
++  task_request_switch(mrb);
+ 
+   /* Return sentinel; the Ruby pop loop will retry after wakeup */
+   return wait_retry_;

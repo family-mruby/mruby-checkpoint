@@ -12,14 +12,14 @@
 ** The trigger: the VM's per-instruction hook (code_fetch_hook, from
 ** MRB_USE_DEBUG_HOOK) counts the fetched instructions. At pseudo-random
 ** counts (gaps uniform in 1..2*mean from a seed) it calls
-** mrb_checkpoint_request_here() before the instruction runs: the program is
-** not involved and calls no Checkpoint method. The image is of that very
-** boundary when it is a safe point (else of the first safe point after: an
-** exception in flight). The image is then restored into a fresh mrb_state,
-** the old state is closed, and the program goes on in the new one, with the
-** instruction of that boundary; every --xproc-th image instead goes on in
-** another process (the --peer binaries in turn, e.g. the 32-bit build),
-** which carries on the same schedule.
+** mrb_checkpoint_request() before the instruction runs: the program is not
+** involved and calls no Checkpoint method. The image is of the first safe
+** point after the request: the next boundary, or later when the instruction
+** enters a block called from C or raises. The image is then restored into a
+** fresh mrb_state, the old state is closed, and the program goes on in the
+** new one, with the instruction of that boundary; every --xproc-th image
+** instead goes on in another process (the --peer binaries in turn, e.g. the
+** 32-bit build), which carries on the same schedule.
 **
 ** The clock of mruby-task is the virtual one of the test builds
 ** (hal-task-virtual): it moves when the scheduler is idle or the root
@@ -31,6 +31,9 @@
 **   --mean N        mean gap between trigger points, in instructions (1000)
 **   --at A,B,...    trigger exactly at these instruction counts (replaces the
 **                   random schedule; to reproduce one point)
+**   --at-send NAME  trigger right before every call of a method NAME (replaces
+**                   the random schedule): the instruction between the request
+**                   and its safe point is that call
 **   --limit K       at most K trigger points
 **   --ref           no trigger: the reference run (counts the instructions)
 **   --xproc N       every N-th written image goes on in another process
@@ -44,8 +47,6 @@
 **   --as-task       run the program as a Task (mrb_create_task + mrb_task_run),
 **                   the way Family mruby starts an application
 **   --quantum N     one tick of mruby-task's clock every N instructions
-**   --keep-timeslice  the restored running Task keeps what was left of its
-**                   timeslice (mrb_checkpoint_keep_timeslice)
 **
 ** Log lines:  P <k> <icount> <outcome> [detail]   one per trigger point
 **             (icount: where the request was made; --at reproduces it)
@@ -74,6 +75,7 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/irep.h>
+#include <mruby/opcode.h>
 #include <mruby/checkpoint.h>
 #include <mruby/proc.h>
 
@@ -103,7 +105,7 @@ static const char *opt_suspend = NULL;  /* write the first image there and end t
 static const char *opt_tmp = "/tmp";
 static int opt_as_task = 0;
 static uint64_t opt_quantum = 0;
-static int opt_keep_timeslice = 0;
+static const char *opt_at_send = NULL;   /* trigger before each call of this method */
 static char **saved_argv;
 
 static uint64_t rng;          /* xorshift64* state */
@@ -124,7 +126,7 @@ rng_next(void)
 static void
 schedule_next(void)
 {
-  if (opt_ref || npoints >= opt_limit) { next_at = UINT64_MAX; return; }
+  if (opt_ref || opt_at_send || npoints >= opt_limit) { next_at = UINT64_MAX; return; }
   if (opt_at) {
     while (at_idx < opt_nat && opt_at[at_idx] <= icount) at_idx++;
     next_at = at_idx < opt_nat ? opt_at[at_idx++] : UINT64_MAX;
@@ -161,22 +163,36 @@ static size_t hop_len = 0;
 static uint64_t hop_point;      /* the point that wrote it */
 static uint64_t hop_req_at;     /* the instruction count of its request (what --at takes) */
 
+/* --at-send: is the instruction at pc a call of the method opt_at_send? */
+static int
+send_of(mrb_state *mrb, const struct mrb_irep *irep, const mrb_code *pc)
+{
+  switch (pc[0]) {
+  case OP_SEND: case OP_SEND0: case OP_SENDB:
+  case OP_SSEND: case OP_SSEND0: case OP_SSENDB:
+    break;
+  default:
+    return 0;   /* (a call with OP_EXT* operands is not looked at) */
+  }
+  if (pc[2] >= irep->slen) return 0;
+  return strcmp(mrb_sym_name(mrb, irep->syms[pc[2]]), opt_at_send) == 0;
+}
+
 static void
 fetch_hook(mrb_state *mrb, const struct mrb_irep *irep, const mrb_code *pc, mrb_value *regs)
 {
-  (void)irep; (void)pc; (void)regs;
+  (void)regs;
   if (hop_ready) {
-    /* the image is of this boundary (or was written at the safe point just
-       passed): nothing of this instruction has run; it runs first, and is
-       counted, in the new state */
+    /* the image was written at the safe point just passed: nothing of this
+       instruction has run; it runs first, and is counted, in the new state */
     longjmp(hop_jmp, 1);
   }
-  if (icount + 1 == next_at) {
+  if (icount + 1 == next_at || (opt_at_send && !opt_ref && npoints < opt_limit && send_of(mrb, irep, pc))) {
     /* point k is the boundary before instruction k */
     npoints++;
     hop_point = npoints;
     hop_req_at = icount + 1;
-    enum mrb_checkpoint_req r = mrb_checkpoint_request_here(mrb);
+    enum mrb_checkpoint_req r = mrb_checkpoint_request(mrb);
     if (r != MRB_CHECKPOINT_REQ_OK) {
       static const char *why[] = { "ok", "not_ready", "fiber", "c_boundary", "tasks", "pending", "exception" };
       logline("P %llu %llu req %s\n", (unsigned long long)npoints, (unsigned long long)(icount + 1),
@@ -315,7 +331,6 @@ open_state(void)
   mrb_checkpoint_set_handler(mrb, image_handler, NULL);
   mrb_checkpoint_set_refusal_handler(mrb, refusal_handler, NULL);
   mrb_checkpoint_keep_dead_registers(mrb, opt_keep_dead);
-  mrb_checkpoint_keep_timeslice(mrb, opt_keep_timeslice);
   return mrb;
 }
 
@@ -451,6 +466,7 @@ hop_xproc(void)
     snprintf(num[2], 32, "%llu", (unsigned long long)opt_limit); args[n++] = "--limit"; args[n++] = num[2];
   }
   if (opt_at_str) { args[n++] = "--at"; args[n++] = (char*)opt_at_str; }
+  if (opt_at_send) { args[n++] = "--at-send"; args[n++] = (char*)opt_at_send; }
   snprintf(num[3], 32, "%llu", (unsigned long long)opt_xproc); args[n++] = "--xproc"; args[n++] = num[3];
   for (int i = 0; i < opt_npeers; i++) { args[n++] = "--peer"; args[n++] = (char*)opt_peers[i]; }
   args[n++] = "--gem"; args[n++] = (char*)opt_gem;
@@ -458,7 +474,6 @@ hop_xproc(void)
   if (opt_images) { args[n++] = "--images"; args[n++] = (char*)opt_images; }
   if (opt_keep_dead) args[n++] = "--keep-dead";
   if (opt_as_task) args[n++] = "--as-task";
-  if (opt_keep_timeslice) args[n++] = "--keep-timeslice";
   if (opt_quantum) {
     snprintf(num[4], 32, "%llu", (unsigned long long)opt_quantum); args[n++] = "--quantum"; args[n++] = num[4];
   }
@@ -572,7 +587,7 @@ main(int argc, char **argv)
     else if (strcmp(a, "--suspend") == 0) opt_suspend = ARG();
     else if (strcmp(a, "--tmp") == 0) opt_tmp = ARG();
     else if (strcmp(a, "--as-task") == 0) opt_as_task = 1;
-    else if (strcmp(a, "--keep-timeslice") == 0) opt_keep_timeslice = 1;
+    else if (strcmp(a, "--at-send") == 0) opt_at_send = ARG();
     else if (strcmp(a, "--quantum") == 0) opt_quantum = strtoull(ARG(), NULL, 10);
     else if (strcmp(a, "--assert") == 0) assert_rb = ARG();
     else if (strcmp(a, "--resume") == 0) resume = ARG();

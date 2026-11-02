@@ -15,7 +15,8 @@
 **     root resumed) goes on in mrb_vm_exec, as the writer's did;
 **   - a Task was running: its slice goes on from the current context (the
 **     Task's own or a Fiber it resumed) inside the same steps as mruby-task's
-**     execute_task (task_slice below, with the remaining timeslice reset).
+**     execute_task (task_slice below), with what was left of its timeslice
+**     (the ticks to the end of the slice, as on the writer).
 **     If the scheduler had asked for a switch at that safe point, the slice
 **     ends right there, as it did on the writer. Then the caller of the
 **     scheduler takes over as it would have: the next round of the loop of
@@ -232,7 +233,7 @@ slice_vm(mrb_state *mrb, void *ud)
    safe point (the scheduler had asked for a switch): only what
    execute_task does after mrb_vm_exec, which returned nil there. */
 static void
-task_slice(mrb_state *mrb, mrb_task *t, struct mrb_context *start, int ended, int keep_timeslice)
+task_slice(mrb_state *mrb, mrb_task *t, struct mrb_context *start, int ended)
 {
   struct mrb_context *prev_c = mrb->c;
   mrb_callinfo *prev_ci = prev_c->ci;
@@ -240,11 +241,9 @@ task_slice(mrb_state *mrb, mrb_task *t, struct mrb_context *start, int ended, in
   mrb_bool error = FALSE;
 
   if (!ended) {
-    /* the timeslice starts full (doc/format_v1.md: the reader's choice);
-       mrb_checkpoint_keep_timeslice: what was left of it on the writer */
-    if (!keep_timeslice || t->timeslice == 0 || t->timeslice > MRB_TIMESLICE_TICK_COUNT) {
-      t->timeslice = MRB_TIMESLICE_TICK_COUNT;
-    }
+    /* t->timeslice is what was left of it on the writer (the restore set
+       it), kept as it is: 0 too (the tick does not end such a slice; it
+       goes on until the Task gives way, as on the writer) */
     t->status = MRB_TASK_STATUS_RUNNING;
     t->c.prev = mrb->c;
     mrb->c = start;
@@ -397,7 +396,7 @@ mrb_checkpoint_continue(mrb_state *mrb)
   }
   mrb->c = e;
   mrb->task.loop_running = plan.loop_running ? TRUE : FALSE;
-  task_slice(mrb, t, plan.current, plan.switch_pending, g->keep_timeslice);
+  task_slice(mrb, t, plan.current, plan.switch_pending);
 
   if (!entry) {
     /* the host's mrb_task_run: the rest of its loop */
@@ -415,13 +414,6 @@ mrb_checkpoint_continue(mrb_state *mrb)
   }
   mrb->c = e;
   return mrb_vm_exec(mrb, e->ci->proc, e->ci->pc);
-}
-
-MRB_API void
-mrb_checkpoint_keep_timeslice(mrb_state *mrb, mrb_bool keep)
-{
-  checkpoint_state *g = checkpoint_get(mrb);
-  if (g) g->keep_timeslice = keep ? 1 : 0;
 }
 
 /* ---- the embedder's Task ---- */

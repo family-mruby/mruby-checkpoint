@@ -1,7 +1,8 @@
 # mruby-checkpoint: build, test and benchmark entry points.
 #
 #   rake build   -- patched mruby + mruby-checkpoint, 64-bit (host) and 32-bit (host32)
-#   rake test    -- run test/samples with and without checkpoints, all combinations
+#   rake test    -- run test/samples with and without checkpoints, all combinations,
+#                   the points aimed at on purpose (tools/targeted.rb) and the short fuzz
 #   rake test:asan, rake test:stress
 #                -- the same with the 64-bit driver built with AddressSanitizer
 #                   (stress: also MRB_GC_STRESS, a full GC at every allocation)
@@ -111,6 +112,9 @@ end
 desc 'run the samples with and without checkpoints, and the short fuzz of the test suite'
 task :test => [:build, 'build:fuzz'] do
   ruby File.join(ROOT, 'tools/run_tests.rb')
+  # points aimed at on purpose: Task.pass right after an external request, an
+  # image written where the call-info stack is full
+  ruby File.join(ROOT, 'tools/targeted.rb')
   # the short version: one fixed seed, about 30 points per test file, as the
   # top-level program and as a Task (the start of a Family mruby application)
   ruby File.join(ROOT, 'tools/fuzz.rb'), '--seeds', '1', '--points', '30', '--quiet'

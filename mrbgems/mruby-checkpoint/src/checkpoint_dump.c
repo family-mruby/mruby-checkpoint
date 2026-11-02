@@ -1293,14 +1293,17 @@ w_sched(dumper *d)
 
 /* ---- debug info (line numbers), the optional last section ---- */
 
-/* the files and (pc, line) changes of a carried irep's debug info */
+/* the files and (pc, line) changes of a carried irep's debug info: the
+   program's ireps and the permanent ones (mrblib) alike, so that a reader
+   with another mrblib, which builds them from their contents, has their
+   lines too */
 static int
 w_debug_irep(dumper *d, gbuf *b, uint32_t id)
 {
   mrb_state *mrb = d->mrb;
   const mrb_irep *irep = d->iq[id - 1];
   const mrb_irep_debug_info *di = irep->debug_info;
-  if (!di || di->flen == 0 || checkpoint_perm_irep(d->P, irep, NULL)) return 0;
+  if (!di || di->flen == 0) return 0;
   for (int i = 0; i < di->flen; i++) {
     if (di->files[i]->line_type != mrb_debug_line_packed_map) return 0;
   }

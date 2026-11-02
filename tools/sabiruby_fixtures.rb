@@ -11,7 +11,7 @@
 #                    (the sample's `sabiruby-refuse K "TEXT"` annotation)
 # For a save sample: NAME.1.ckpt and NAME.1.out (= NAME.resumed.out).
 # NAME.rb is copied too, so that the images can be made again from it.
-# The samples of Tasks and Fibers (task_*, fiber_*), counter and lines are also run as a
+# The samples of Tasks and Fibers (task_*, fiber_*), counter, lines and lines_mrblib are also run as a
 # Task (checkpoint run --as-task, the start of a Family mruby application): NAME-task.K.ckpt
 # and so on. A sample marked `clock virtual` is run with the test builds (build/fuzz), whose
 # mruby-task clock is virtual.
@@ -23,7 +23,7 @@ require 'fileutils'
 ROOT = File.expand_path('..', __dir__)
 NORMAL = { '64' => File.join(ROOT, 'build/mruby/host/bin/checkpoint'), '32' => File.join(ROOT, 'build/mruby/host32/bin/checkpoint') }
 VIRTUAL = { '64' => File.join(ROOT, 'build/fuzz/host/bin/checkpoint'), '32' => File.join(ROOT, 'build/fuzz/host32/bin/checkpoint') }
-AS_TASK = /\A(task_|fiber_|counter\z|lines\z)/
+AS_TASK = /\A(task_|fiber_|counter\z|lines\z|lines_mrblib\z)/
 out_dir = ARGV.shift or abort 'usage: sabiruby_fixtures.rb OUTDIR [sample ...]'
 out_dir = File.expand_path(out_dir)
 FileUtils.mkdir_p(out_dir)
