@@ -75,8 +75,8 @@ svg .elabel { font-size: 11px; fill: var(--muted); }
 svg .lane { fill: var(--bg); stroke: var(--line); }
 svg .lanelabel { font-size: 12px; fill: var(--muted); }
 svg .task rect { fill: var(--panel); stroke: var(--line); }
-svg .task.run rect { stroke: var(--add); stroke-width: 3; }
 svg .task.cur rect { stroke: var(--accent); stroke-width: 3; }
+svg .task.run rect { stroke: var(--add); stroke-width: 3; }
 svg .task .t1 { font-weight: 600; font-size: 13px; }
 svg .task .t2 { font-size: 11px; fill: var(--muted); }
 svg .arrow { fill: none; stroke: var(--warn); stroke-width: 1.5; }

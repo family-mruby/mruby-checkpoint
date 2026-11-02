@@ -245,7 +245,7 @@ window.addEventListener('error', function (e) {
         var x = LW + k * (W + GX);
         pos[t.id] = [x, y];
         var c = t.context ? d.contexts[t.context - 1] : null;
-        var g = s('g', { cls: 'task' + (t.running ? ' run' : '') + (c && c.current ? ' cur' : ''), transform: 'translate(' + x + ',' + y + ')' });
+        var g = s('g', { cls: 'task' + (t.running ? ' run' : ''), transform: 'translate(' + x + ',' + y + ')' });
         g.appendChild(s('rect', { width: W, height: H, rx: 6 }));
         g.appendChild(s('text', { cls: 't1', x: 8, y: 18, text: cut(t.key, 24) + (t.running ? '  ▶' : '') }));
         g.appendChild(s('text', { cls: 't2', x: 8, y: 35, text: t.state + ' ・ 優先度 ' + t.priority + ' ・ 割り当て残り ' + t.timeslice }));
@@ -273,11 +273,11 @@ window.addEventListener('error', function (e) {
       if (!w || !a || t.state !== 'WAITING') return;
       var b = w.reason === 'join' && w.task ? pos[w.task] : (w.reason === 'queue' && w.queue ? qpos[w.queue] : null);
       if (!b) return;
-      var bh = w.reason === 'queue' ? H / 2 : H;
-      arrow(svg, a[0] + W / 2, a[1] + H, b[0] + (w.reason === 'queue' ? 0 : W / 2), b[1] + (w.reason === 'queue' ? bh / 2 : (b[1] > a[1] ? 0 : bh)), '');
+      if (w.reason === 'queue') hArrow(svg, a[0] + W, a[1] + H / 2, b[0], b[1] + H / 4);
+      else arrow(svg, a[0] + W / 2, a[1] + H, b[0] + W / 2, b[1] + (b[1] > a[1] ? 0 : H), '');
     });
     add(m, h('h2', { text: 'スケジューラの列' }), h('div', { cls: 'svgbox' }, svg));
-    add(m, h('p', { cls: 'muted', text: '列の中は左から順番 (この順に動く)。緑の枠は書き出したときに動いていた Task、青の枠は止まった所の文脈を持つもの。橙の矢印は待っている相手 (join・Task::Queue)。' }));
+    add(m, h('p', { cls: 'muted', text: '列の中は左から順番 (この順に動く)。緑の枠は書き出したときに動いていた Task。橙の矢印は待っている相手 (join・Task::Queue)。箱を押すとその Task の呼び出しの枠へ。' }));
 
     // the contexts and who resumed whom
     var cs = d.contexts, CW = 230, CH = 62;
@@ -291,7 +291,7 @@ window.addEventListener('error', function (e) {
       var x = 20 + (i % cols) * (CW + 40), y = 20 + Math.floor(i / cols) * (CH + 40);
       cp[c.id] = [x, y];
       var t = c.task ? d.scheduler.tasks[c.task - 1] : null;
-      var g = s('g', { cls: 'task' + (c.current ? ' cur' : '') + (t && t.running ? ' run' : ''), transform: 'translate(' + x + ',' + y + ')',
+      var g = s('g', { cls: 'task' + (c.current ? ' cur' : ''), transform: 'translate(' + x + ',' + y + ')',
         onclick: function () { go({ view: 'stack' }); var e = document.getElementById('ctx-' + c.id); if (e) e.scrollIntoView(); } });
       g.appendChild(s('rect', { width: CW, height: CH, rx: 6 }));
       g.appendChild(s('text', { cls: 't1', x: 8, y: 18, text: cut('文脈 ' + c.id + ': ' + c.key, 30) }));
@@ -306,7 +306,7 @@ window.addEventListener('error', function (e) {
       arrow(svg2, a[0] + CW / 2, a[1] + CH, b[0] + CW / 2, b[1] + (b[1] > a[1] ? 0 : CH), 'prev');
     });
     add(m, h('h2', { text: '文脈 (resume の鎖)' }), h('div', { cls: 'svgbox' }, svg2));
-    add(m, h('p', { cls: 'muted', text: '青の矢印は resume した文脈から、された文脈へ (prev の鎖)。終わったら戻る先。' }));
+    add(m, h('p', { cls: 'muted', text: '青の枠は書き出したとき動いていた文脈 (止まった所)。青の矢印は resume した文脈から、された文脈へ (prev の鎖。終わったら戻る先)。' }));
 
     var tb = h('table', null, h('tr', null, ['Task', '状態', '列', '優先度', '割り当て残り', '待ち', '値', '文脈'].map(function (x) { return h('th', { text: x }); })));
     sc.tasks.forEach(function (t) {
@@ -325,6 +325,10 @@ window.addEventListener('error', function (e) {
       df.appendChild(mk);
     });
     svg.appendChild(df);
+  }
+  function hArrow(svg, x1, y1, x2, y2) {
+    var mx = (x1 + x2) / 2;
+    svg.appendChild(s('path', { cls: 'arrow', d: 'M' + x1 + ',' + y1 + ' C' + mx + ',' + y1 + ' ' + mx + ',' + y2 + ' ' + x2 + ',' + y2, 'marker-end': 'url(#arrow)' }));
   }
   function arrow(svg, x1, y1, x2, y2, k) {
     var my = (y1 + y2) / 2;
@@ -608,11 +612,21 @@ window.addEventListener('error', function (e) {
       });
     }
     if (df.scheduler.length) add(wrap, h('h2', { text: 'スケジューラ' }), fieldTable(df.scheduler));
-    if (ob.changed.length) {
-      add(wrap, h('h2', { text: '変わったオブジェクト' }));
-      ob.changed.forEach(function (c) {
-        add(wrap, h('div', { cls: 'card' }, h('div', null, pathLink(c.path, 1, c.b), h('span', { cls: 'muted', text: '  ' + c.kind + ' ・ A #' + c.a + ' / B #' + c.b })), fieldTable(c.fields)));
-      });
+    function objectLists(sel, suffix) {
+      var ch = ob.changed.filter(sel), ad = ob.added.filter(sel), rm = ob.removed.filter(sel), mv = ob.moved.filter(sel);
+      if (ch.length) {
+        add(wrap, h('h2', { text: '変わったオブジェクト' + suffix }));
+        ch.forEach(function (c) {
+          add(wrap, h('div', { cls: 'card' }, h('div', null, pathLink(c.path, 1, c.b), h('span', { cls: 'muted', text: '  ' + c.kind + ' ・ A #' + c.a + ' / B #' + c.b })), fieldTable(c.fields)));
+        });
+      }
+      plain('増えたオブジェクト (B だけ)' + suffix, ad, 'add', 1, 'b', 'path');
+      plain('消えたオブジェクト (A だけ)' + suffix, rm, 'del', 0, 'a', 'path');
+      if (mv.length) {
+        var mt = h('table');
+        mv.forEach(function (x) { add(mt, h('tr', null, h('td', null, pathLink(x.a_path, 0, x.a)), h('td', { text: '→' }), h('td', null, pathLink(x.b_path, 1, x.b)), h('td', { cls: 'mono', text: cut(x.label, 40) }))); });
+        add(wrap, h('h2', { text: '道筋が変わったオブジェクト (中身が同じもの)' + suffix }), mt);
+      }
     }
     function plain(title, list, cls, img, idk, pk) {
       if (!list.length) return;
@@ -620,13 +634,8 @@ window.addEventListener('error', function (e) {
       list.forEach(function (x) { add(t, h('tr', null, h('td', { cls: cls, text: cls === 'add' ? '+' : '−' }), h('td', null, pathLink(x[pk], img, x[idk])), h('td', { cls: 'mono', text: cut(x.label, 60) }))); });
       add(wrap, h('h2', { text: title }), t);
     }
-    plain('増えたオブジェクト (B だけ)', ob.added, 'add', 1, 'b', 'path');
-    plain('消えたオブジェクト (A だけ)', ob.removed, 'del', 0, 'a', 'path');
-    if (ob.moved.length) {
-      var mt = h('table');
-      ob.moved.forEach(function (x) { add(mt, h('tr', null, h('td', null, pathLink(x.a_path, 0, x.a)), h('td', { text: '→' }), h('td', null, pathLink(x.b_path, 1, x.b)), h('td', { cls: 'mono', text: cut(x.label, 40) }))); });
-      add(wrap, h('h2', { text: '道筋が変わったオブジェクト (中身が同じもの)' }), mt);
-    }
+    objectLists(function (x) { return !x.temporary; }, '');
+    objectLists(function (x) { return x.temporary; }, ' ・ 一時レジスタからしか届かないもの');
   }
 
   // ---- the image as it is ----

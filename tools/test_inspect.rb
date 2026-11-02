@@ -42,6 +42,13 @@ VIRTUAL = { '64' => File.join(ROOT, 'build/fuzz/host/bin/checkpoint'), '32' => F
 
 $pass = 0
 $fail = 0
+$mark = 0
+# the number of checks since the last call (printed per part)
+def part_done
+  n = $pass + $fail - $mark
+  $mark = $pass + $fail
+  puts "  #{n} checks"
+end
 def check(name, ok, detail = nil)
   if ok
     $pass += 1
@@ -141,6 +148,7 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
   end
 end
 puts "  #{all_images.size} images (#{all_images.sum { |_, b| b.bytesize }} bytes)"
+part_done
 
 # ---- 2. the stacks are the backtraces ----
 
@@ -186,6 +194,8 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
     end
   end
 end
+
+part_done
 
 # ---- 3. the diff of two saves ----
 
@@ -275,6 +285,8 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
   end
 end
 
+part_done
+
 # ---- 4. broken images ----
 
 puts 'broken images:'
@@ -338,6 +350,8 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
   check('--json of a cut image prints the part read and the error (status 1)', st == 1 && j && j['error'] && j['error']['offset'].is_a?(Integer), out[0, 200])
 end
 
+part_done
+
 # ---- 5. the page ----
 
 def chrome
@@ -386,6 +400,8 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
     puts '  SKIP the headless browser check (no CHECKPOINT_CHROME and no Playwright Chromium)'
   end
 end
+
+part_done
 
 puts
 puts "inspect: #{$pass} passed, #{$fail} failed"
