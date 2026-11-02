@@ -1,4 +1,4 @@
-# ghost-test: hop-after "before hop count=11 total=5"
+# checkpoint-test: suspend-after "before suspend count=11 total=5"
 # Closures that write outer local variables: one whose frame is still
 # running (its env lives on the VM stack) and one whose frame has returned
 # (its env lives on the heap).
@@ -14,15 +14,15 @@ inc.call
 total = 0
 add = lambda { |x| total += x }
 add.(5)
-puts "before hop count=#{get.call} total=#{total}"
-Ghost.hop("cl.ghost")
+puts "before suspend count=#{get.call} total=#{total}"
+Checkpoint.suspend("cl.ckpt")
 inc.call
 inc.call
 add.(7)
-puts "after hop count=#{get.call} total=#{total}"
+puts "after suspend count=#{get.call} total=#{total}"
 shared = []
 pusher = proc { |v| shared << v; shared.size }
 [1, 2].each { |v| pusher.call(v) }
-Ghost.hop("cl.ghost")
+Checkpoint.suspend("cl.ckpt")
 pusher.call(3)
 puts "shared #{shared.inspect} lambda?=#{inc.lambda?} #{pusher.lambda?}"

@@ -1,8 +1,11 @@
-# mruby-ghost: build, test and benchmark entry points.
+# mruby-checkpoint: build, test and benchmark entry points.
 #
-#   rake build   -- patched mruby + mruby-ghost, 64-bit (host) and 32-bit (host32)
-#   rake test    -- run test/samples with and without a hop, all combinations
-#   rake bench   -- benchmark: unpatched / patched / patched + mruby-ghost
+#   rake build   -- patched mruby + mruby-checkpoint, 64-bit (host) and 32-bit (host32)
+#   rake test    -- run test/samples with and without checkpoints, all combinations
+#   rake test:asan, rake test:stress
+#                -- the same with the 64-bit driver built with AddressSanitizer
+#                   (stress: also MRB_GC_STRESS, a full GC at every allocation)
+#   rake bench   -- benchmark: unpatched / patched / patched + mruby-checkpoint
 #
 # vendor/mruby (the submodule) is never modified. Its tree is copied into
 # build/src/<variant> and patches/*.patch are applied to the copy.
@@ -13,7 +16,7 @@ require 'digest'
 ROOT = __dir__
 VENDOR = File.join(ROOT, 'vendor/mruby')
 BUILD = File.join(ROOT, 'build')
-CONFIG = File.join(ROOT, 'build_config/ghost.rb')
+CONFIG = File.join(ROOT, 'build_config/checkpoint.rb')
 PATCHES = Dir[File.join(ROOT, 'patches/*.patch')].sort
 
 # mruby's compiler needs Prism, a nested submodule of mruby. It is not
@@ -37,7 +40,7 @@ end
 
 def prepare_source(variant, patches)
   dst = File.join(BUILD, 'src', variant)
-  stamp = File.join(dst, '.ghost-stamp')
+  stamp = File.join(dst, '.checkpoint-stamp')
   key = Digest::SHA256.hexdigest(
     `git -C #{VENDOR} rev-parse HEAD` + patches.map { |p| File.read(p) }.join)
   return dst if File.exist?(stamp) && File.read(stamp) == key
@@ -65,32 +68,43 @@ def mruby_build(src, build_dir, env = {})
   end
 end
 
-desc 'build patched mruby with mruby-ghost (64-bit and 32-bit)'
+desc 'build patched mruby with mruby-checkpoint (64-bit and 32-bit)'
 task :build do
   FileUtils.mkdir_p(BUILD)
   src = prepare_source('patched', PATCHES)
   mruby_build(src, File.join(BUILD, 'mruby'))
   %w(host host32).each do |t|
-    bin = File.join(BUILD, 'mruby', t, 'bin', 'ghost')
+    bin = File.join(BUILD, 'mruby', t, 'bin', 'checkpoint')
     abort "missing #{bin}" unless File.exist?(bin)
     puts "#{t}: #{`file -b #{bin}`.split(',')[0..1].join(',')}"
   end
 end
 
-desc 'run the samples with and without a hop'
+desc 'run the samples with and without checkpoints'
 task :test => :build do
   ruby File.join(ROOT, 'tools/run_tests.rb')
 end
 
-desc 'benchmark: unpatched vs patched vs patched + mruby-ghost (64-bit)'
+namespace :test do
+  { asan: 'asan', stress: 'asan-stress' }.each do |t, name|
+    desc "rake test with the 64-bit driver built as #{name}"
+    task t => :build do
+      sh 'sh', File.join(ROOT, 'tools/asan.sh'), *(t == :stress ? ['stress'] : [])
+      bin = File.join(BUILD, name, 'host', 'bin', 'checkpoint')
+      sh({ 'CHECKPOINT_BIN64' => bin }, 'ruby', File.join(ROOT, 'tools/run_tests.rb'))
+    end
+  end
+end
+
+desc 'benchmark: unpatched vs patched vs patched + mruby-checkpoint (64-bit)'
 task :bench do
   FileUtils.mkdir_p(BUILD)
   orig = prepare_source('orig', [])
   patched = prepare_source('patched', PATCHES)
-  only64 = { 'GHOST_TARGETS' => 'host' }
-  mruby_build(orig, File.join(BUILD, 'bench-orig'), only64.merge('GHOST_GEM' => 'no'))
-  mruby_build(patched, File.join(BUILD, 'bench-patched'), only64.merge('GHOST_GEM' => 'no'))
-  mruby_build(patched, File.join(BUILD, 'bench-ghost'), only64)
+  only64 = { 'CHECKPOINT_TARGETS' => 'host' }
+  mruby_build(orig, File.join(BUILD, 'bench-orig'), only64.merge('CHECKPOINT_GEM' => 'no'))
+  mruby_build(patched, File.join(BUILD, 'bench-patched'), only64.merge('CHECKPOINT_GEM' => 'no'))
+  mruby_build(patched, File.join(BUILD, 'bench-checkpoint'), only64)
   ruby File.join(ROOT, 'tools/bench.rb'), BUILD
 end
 

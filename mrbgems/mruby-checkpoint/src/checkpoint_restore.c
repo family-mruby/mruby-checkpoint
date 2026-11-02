@@ -1,5 +1,5 @@
 /*
-** ghost_restore.c - rebuild a ghost image (format v0) in a fresh mrb_state
+** checkpoint_restore.c - rebuild a checkpoint image (format v0) in a fresh mrb_state
 **
 ** Order:
 **   symbols -> ireps -> objects (pass 1: make every object, pass 2: fill
@@ -22,15 +22,15 @@
 #include <mruby/irep.h>
 #include <mruby/data.h>
 #include <mruby/internal.h>
-#include "ghost_internal.h"
+#include "checkpoint_internal.h"
 
 typedef struct { struct RBasic *h; mrb_value k, v; } hent;
 typedef struct { struct REnv *e; uint32_t off; } senv;
 
 typedef struct {
   mrb_state *mrb;
-  ghost_state *G;
-  ghost_perm *P;
+  checkpoint_state *G;
+  checkpoint_perm *P;
   const uint8_t *p, *end;
   int failed;
   char err[512];
@@ -186,7 +186,7 @@ r_ireps(reader *r)
     uint64_t hash = r_u64(r);
     hashes[i] = hash;
     if (kind == 1) {
-      const mrb_irep *pi = ghost_perm_irep_by_hash(r->P, hash);
+      const mrb_irep *pi = checkpoint_perm_irep_by_hash(r->P, hash);
       if (!pi) {
         rfail(r, "permanent irep %016llx not found in this build (a different mrblib?)",
               (unsigned long long)hash);
@@ -292,7 +292,7 @@ r_ireps(reader *r)
   /* the content hash must match what the writer computed */
   for (uint32_t i = 0; i < r->nirep && !r->failed; i++) {
     if (r->irep_perm[i]) continue;
-    uint64_t h = ghost_irep_hash(mrb, r->ireps[i]);
+    uint64_t h = checkpoint_irep_hash(mrb, r->ireps[i]);
     if (h != hashes[i]) {
       rfail(r, "irep #%u content hash mismatch", i + 1);
     }
@@ -303,8 +303,8 @@ r_ireps(reader *r)
   mrb_free(mrb, hashes);
 }
 
-static ghost_data_ent*
-data_ent_by_name(ghost_state *G, const uint8_t *name, uint32_t len)
+static checkpoint_data_ent*
+data_ent_by_name(checkpoint_state *G, const uint8_t *name, uint32_t len)
 {
   for (int i = 0; i < G->ndata; i++) {
     if (strlen(G->data[i].name) == len && memcmp(G->data[i].name, name, len) == 0) return &G->data[i];
@@ -356,7 +356,7 @@ r_method(reader *r, struct RClass *c)
     aspec = r_u32(r);
     if (r->fill) {
       int is_func = 0;
-      ptr = ghost_perm_lookup(r->P, (const char*)name, len, &is_func);
+      ptr = checkpoint_perm_lookup(r->P, (const char*)name, len, &is_func);
       if (!ptr || !is_func) { rfail(r, "C function '%.*s' not found in this build", (int)len, name); return; }
     }
   }
@@ -400,7 +400,7 @@ r_object(reader *r, uint32_t id)
     uint32_t len; const uint8_t *name = r_str(r, &len);
     if (!r->fill) {
       int is_func = 0;
-      const void *p = ghost_perm_lookup(r->P, (const char*)name, len, &is_func);
+      const void *p = checkpoint_perm_lookup(r->P, (const char*)name, len, &is_func);
       if (!p || is_func) { rfail(r, "permanent object '%.*s' not found in this build", (int)len, name); return; }
       r->objs[id - 1] = (struct RBasic*)p;
     }
@@ -537,7 +537,7 @@ r_object(reader *r, uint32_t id)
       uint32_t aspec = r_u32(r);
       if (r->fill) {
         int is_func = 0;
-        const void *f = ghost_perm_lookup(r->P, (const char*)name, len, &is_func);
+        const void *f = checkpoint_perm_lookup(r->P, (const char*)name, len, &is_func);
         if (!f || !is_func) { rfail(r, "C function '%.*s' not found in this build", (int)len, name); break; }
         p->body.func = (mrb_func_t)f;
         p->flags |= MRB_PROC_CFUNC_FL;
@@ -612,8 +612,8 @@ r_object(reader *r, uint32_t id)
     uint32_t nlen; const uint8_t *name = r_str(r, &nlen);
     uint32_t blen; const uint8_t *blob = r_str(r, &blen);
     if (!r->fill) {
-      ghost_data_ent *de = data_ent_by_name(r->G, name, nlen);
-      if (!de) { rfail(r, "C data type '%.*s' is not in this build's ghost data table", (int)nlen, name); break; }
+      checkpoint_data_ent *de = data_ent_by_name(r->G, name, nlen);
+      if (!de) { rfail(r, "C data type '%.*s' is not in this build's checkpoint data table", (int)nlen, name); break; }
       void *ptr = de->restore(mrb, blob, blen);
       r->objs[id - 1] = (struct RBasic*)mrb_data_object_alloc(mrb, NULL, ptr, de->type);
     }
@@ -770,33 +770,33 @@ reader_free(reader *r)
 }
 
 MRB_API mrb_value
-mrb_ghost_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
+mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
 {
   reader r;
   memset(&r, 0, sizeof(r));
   r.mrb = mrb;
-  r.G = ghost_get(mrb);
+  r.G = checkpoint_get(mrb);
   r.P = r.G->perm;
   r.p = buf; r.end = buf + len;
 
-  struct RClass *eGhost = mrb_class_get_under(mrb, mrb_module_get(mrb, "Ghost"), "Error");
-  if (!r.P) mrb_raise(mrb, eGhost, "no baseline (mrb_ghost_baseline was not called)");
+  struct RClass *eCheckpoint = mrb_class_get_under(mrb, mrb_module_get(mrb, "Checkpoint"), "Error");
+  if (!r.P) mrb_raise(mrb, eCheckpoint, "no baseline (mrb_checkpoint_baseline was not called)");
   if (mrb->c != mrb->root_c || mrb->c->ci != mrb->c->cibase) {
-    mrb_raise(mrb, eGhost, "restore needs an idle root context");
+    mrb_raise(mrb, eCheckpoint, "restore needs an idle root context");
   }
 
   /* header */
-  if (!need(&r, 6) || memcmp(r.p, GHOST_MAGIC, 4) != 0) mrb_raise(mrb, eGhost, "not a ghost image");
+  if (!need(&r, 6) || memcmp(r.p, CHECKPOINT_MAGIC, 4) != 0) mrb_raise(mrb, eCheckpoint, "not a checkpoint image");
   r.p += 4;
   uint16_t ver = r_u16(&r);
-  if (ver != GHOST_FORMAT_VERSION) mrb_raisef(mrb, eGhost, "ghost format %d is not supported", (int)ver);
+  if (ver != CHECKPOINT_FORMAT_VERSION) mrb_raisef(mrb, eCheckpoint, "checkpoint format %d is not supported", (int)ver);
   uint32_t l1; const uint8_t *mv = r_str(&r, &l1);
   uint32_t l2; r_str(&r, &l2);
   uint8_t ibits = r_u8(&r), fbits = r_u8(&r), utf8 = r_u8(&r);
   r_u8(&r); /* writer pointer width */
-  if (r.failed) mrb_raise(mrb, eGhost, r.err);
+  if (r.failed) mrb_raise(mrb, eCheckpoint, r.err);
   if (ibits != 64 || fbits != 64 || utf8 != 1) {
-    mrb_raise(mrb, eGhost, "value representation differs (needs 64-bit Integer, double Float, UTF-8)");
+    mrb_raise(mrb, eCheckpoint, "value representation differs (needs 64-bit Integer, double Float, UTF-8)");
   }
   (void)mv;
 
@@ -854,7 +854,7 @@ mrb_ghost_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
     char msg[600];
     snprintf(msg, sizeof(msg), "restore failed: %s", r.err);
     reader_free(&r);
-    mrb_raise(mrb, eGhost, msg);
+    mrb_raise(mrb, eCheckpoint, msg);
   }
   reader_free(&r);
 

@@ -1,8 +1,8 @@
 /*
-** ghost_util.c - byte buffer, pointer map, hash
+** checkpoint_util.c - byte buffer, pointer map, hash
 */
 
-#include "ghost_internal.h"
+#include "checkpoint_internal.h"
 
 void
 gb_init(gbuf *b)
@@ -65,7 +65,7 @@ gb_str(mrb_state *mrb, gbuf *b, const char *s, size_t n)
 }
 
 MRB_API void
-mrb_ghost_buf_bytes(mrb_state *mrb, mrb_ghost_buf *b, const void *p, size_t len)
+mrb_checkpoint_buf_bytes(mrb_state *mrb, mrb_checkpoint_buf *b, const void *p, size_t len)
 {
   gb_bytes(mrb, b, p, len);
 }

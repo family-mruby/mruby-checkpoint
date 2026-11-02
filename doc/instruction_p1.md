@@ -1,5 +1,7 @@
 # 実装指示書 P1: 形式 v0、同じプロセスの往復、64bit ⇔ 32bit
 
+> この段の後で mruby-checkpoint に改名した (`Ghost.hop` → `Checkpoint.suspend` ほか、`doc/report/p1b.md`)。以下は当時の名前のまま。
+
 `doc/plan.md` を先に読む (方針はそこが正)。この段はスコープの 1-3。
 
 ## 作るもの

@@ -1,21 +1,21 @@
 /*
-** ghost_internal.h - shared between the parts of mruby-ghost
+** checkpoint_internal.h - shared between the parts of mruby-checkpoint
 */
 
-#ifndef GHOST_INTERNAL_H
-#define GHOST_INTERNAL_H
+#ifndef CHECKPOINT_INTERNAL_H
+#define CHECKPOINT_INTERNAL_H
 
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <mruby.h>
 #include <mruby/class.h>
-#include <mruby/ghost.h>
+#include <mruby/checkpoint.h>
 
 /* ---- format constants (doc/format_v0.md) ---- */
 
-#define GHOST_MAGIC "MRGH"
-#define GHOST_FORMAT_VERSION 0
+#define CHECKPOINT_MAGIC "MRCK"
+#define CHECKPOINT_FORMAT_VERSION 0
 
 /* value tags */
 enum {
@@ -47,11 +47,11 @@ enum {
 
 /* ---- byte buffer ---- */
 
-struct mrb_ghost_buf {
+struct mrb_checkpoint_buf {
   uint8_t *p;
   size_t len, cap;
 };
-typedef struct mrb_ghost_buf gbuf;
+typedef struct mrb_checkpoint_buf gbuf;
 
 void gb_init(gbuf *b);
 void gb_free(mrb_state *mrb, gbuf *b);
@@ -106,7 +106,7 @@ typedef struct {
   uint64_t hash;
 } girep_perm;
 
-typedef struct ghost_perm {
+typedef struct checkpoint_perm {
   /* named permanent things (objects and C functions) */
   char **names;
   const void **ptrs;
@@ -122,47 +122,50 @@ typedef struct ghost_perm {
 
   gsnap *snaps; uint32_t nsnaps, capsnaps;
   giv_entry *gv; int ngv;
-} ghost_perm;
+} checkpoint_perm;
 
-typedef struct ghost_data_ent {
+typedef struct checkpoint_data_ent {
   const mrb_data_type *type;
   char *name;
-  mrb_ghost_data_dump dump;
-  mrb_ghost_data_restore restore;
-} ghost_data_ent;
+  mrb_checkpoint_data_dump dump;
+  mrb_checkpoint_data_restore restore;
+} checkpoint_data_ent;
 
-typedef struct ghost_state {
+typedef struct checkpoint_state {
   mrb_state *mrb;
-  ghost_perm *perm;
+  checkpoint_perm *perm;
   int mode;
-  int pending;
+  int pending;                /* a save / suspend waits for the next safe point */
+  enum mrb_checkpoint_kind pending_kind;
   char *pending_path;
+  ptrdiff_t ret_ci;           /* the calling frame (index from cibase) and */
+  ptrdiff_t ret_slot;         /* the stack slot that receives the call's value */
   char *output;
   int resumed;
-  mrb_ghost_hop_handler handler;
+  mrb_checkpoint_handler handler;
   void *handler_ud;
-  ghost_data_ent *data; int ndata;
-} ghost_state;
+  checkpoint_data_ent *data; int ndata;
+} checkpoint_state;
 
-ghost_state *ghost_get(mrb_state *mrb);
+checkpoint_state *checkpoint_get(mrb_state *mrb);
 
-ghost_perm *ghost_perm_build(mrb_state *mrb);
-void ghost_perm_free(mrb_state *mrb, ghost_perm *P);
-const char *ghost_perm_name_of(ghost_perm *P, const void *obj);
-const char *ghost_perm_func_name(ghost_perm *P, mrb_func_t f);
-const void *ghost_perm_lookup(ghost_perm *P, const char *name, size_t len, int *is_func);
-int ghost_perm_irep(ghost_perm *P, const mrb_irep *irep, uint64_t *hash);
-const mrb_irep *ghost_perm_irep_by_hash(ghost_perm *P, uint64_t hash);
-gsnap *ghost_perm_snap(ghost_perm *P, const void *obj);
-uint64_t ghost_irep_hash(mrb_state *mrb, const mrb_irep *irep);
-uint64_t ghost_content_digest(mrb_state *mrb, struct RBasic *obj);
+checkpoint_perm *checkpoint_perm_build(mrb_state *mrb);
+void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);
+const char *checkpoint_perm_name_of(checkpoint_perm *P, const void *obj);
+const char *checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f);
+const void *checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is_func);
+int checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash);
+const mrb_irep *checkpoint_perm_irep_by_hash(checkpoint_perm *P, uint64_t hash);
+gsnap *checkpoint_perm_snap(checkpoint_perm *P, const void *obj);
+uint64_t checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep);
+uint64_t checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj);
 
 /* snapshots of a class's method table and ivars (also used by the dumper) */
-void ghost_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n);
-void ghost_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n);
-void ghost_collect_gv(mrb_state *mrb, giv_entry **out, int *n);
+void checkpoint_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n);
+void checkpoint_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n);
+void checkpoint_collect_gv(mrb_state *mrb, giv_entry **out, int *n);
 
 /* dump: returns 0 on success; on failure fills err */
-int ghost_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen);
+int checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen);
 
 #endif

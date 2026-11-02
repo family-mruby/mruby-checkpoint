@@ -1,5 +1,5 @@
 /*
-** ghost_dump.c - write the running state as a logical graph (format v0)
+** checkpoint_dump.c - write the running state as a logical graph (format v0)
 **
 ** Called at a safe point (see patches/0001-vm-safepoint-hook.patch): every
 ** frame's pc and registers are in memory, no exception is in flight and no
@@ -23,12 +23,12 @@
 #include <mruby/data.h>
 #include <mruby/internal.h>
 #include <mruby/version.h>
-#include "ghost_internal.h"
+#include "checkpoint_internal.h"
 
 typedef struct {
   mrb_state *mrb;
-  ghost_state *G;
-  ghost_perm *P;
+  checkpoint_state *G;
+  checkpoint_perm *P;
   gbuf syms, ireps, objs, patches, vm;
   uint32_t nsym, nirep, nobj, npatch;
   pmap symid, irepid, objid;
@@ -169,7 +169,7 @@ w_ivars(dumper *d, gbuf *b, struct RBasic *o, uint32_t id)
 {
   giv_entry *iv; int n;
   char label[160];
-  ghost_collect_iv(d->mrb, mrb_obj_value(o), &iv, &n);
+  checkpoint_collect_iv(d->mrb, mrb_obj_value(o), &iv, &n);
   gb_u32(d->mrb, b, (uint32_t)n);
   for (int i = 0; i < n; i++) {
     gb_u32(d->mrb, b, sym_ref(d, iv[i].sym));
@@ -197,7 +197,7 @@ w_method(dumper *d, gbuf *b, struct RClass *c, mrb_sym sym, uint32_t flags, cons
     gb_u8(mrb, b, GM_UNDEF);
   }
   else if (flags & MRB_METHOD_FUNC_FL) {
-    const char *fname = ghost_perm_func_name(d->P, (mrb_func_t)ptr);
+    const char *fname = checkpoint_perm_func_name(d->P, (mrb_func_t)ptr);
     if (!fname) {
       fail(d, "method %s of %s is a C function that has no name in the baseline",
            mrb_sym_name(mrb, sym), where);
@@ -231,8 +231,8 @@ inst_type(enum mrb_vtype tt)
   }
 }
 
-static ghost_data_ent*
-data_ent(ghost_state *G, const mrb_data_type *t)
+static checkpoint_data_ent*
+data_ent(checkpoint_state *G, const mrb_data_type *t)
 {
   for (int i = 0; i < G->ndata; i++) {
     if (G->data[i].type == t) return &G->data[i];
@@ -273,7 +273,7 @@ w_object(dumper *d, uint32_t id)
   const char *reach = d->olabel[id - 1];
   char label[200];
 
-  const char *pname = ghost_perm_name_of(d->P, o);
+  const char *pname = checkpoint_perm_name_of(d->P, o);
   if (pname) {
     gb_u8(mrb, b, GK_PERM);
     gb_str(mrb, b, pname, strlen(pname));
@@ -377,7 +377,7 @@ w_object(dumper *d, uint32_t id)
                             ((c->flags & MRB_FL_CLASS_IS_INHERITED) ? 2 : 0)));
     w_ivars(d, b, o, id);
     gmt_entry *mt; int n;
-    ghost_collect_mt(mrb, c, &mt, &n);
+    checkpoint_collect_mt(mrb, c, &mt, &n);
     gb_u32(mrb, b, (uint32_t)n);
     snprintf(label, sizeof(label), "#%u", id);
     for (int i = 0; i < n; i++) w_method(d, b, c, mt[i].sym, mt[i].flags, mt[i].ptr, label);
@@ -405,7 +405,7 @@ w_object(dumper *d, uint32_t id)
     HEADER(GK_PROC);
     gb_u8(mrb, b, fl);
     if (MRB_PROC_CFUNC_P(p)) {
-      const char *fname = ghost_perm_func_name(d->P, p->body.func);
+      const char *fname = checkpoint_perm_func_name(d->P, p->body.func);
       if (!fname) {
         fail(d, "Proc made from a C function that has no name in the baseline (%s)", reach);
         fname = "";
@@ -467,9 +467,9 @@ w_object(dumper *d, uint32_t id)
 
   case MRB_TT_CDATA: {
     struct RData *rd = (struct RData*)o;
-    ghost_data_ent *de = rd->type ? data_ent(d->G, rd->type) : NULL;
+    checkpoint_data_ent *de = rd->type ? data_ent(d->G, rd->type) : NULL;
     if (!de) {
-      fail(d, "C data of class %s (type '%s') has no entry in the ghost data table (%s)",
+      fail(d, "C data of class %s (type '%s') has no entry in the checkpoint data table (%s)",
            class_name(mrb, o->c), rd->type ? rd->type->struct_name : "untyped", reach);
       gb_u8(mrb, b, GK_PERM); gb_str(mrb, b, "", 0);
       break;
@@ -503,13 +503,13 @@ w_irep(dumper *d, uint32_t id)
   const mrb_irep *irep = d->iq[id - 1];
   uint64_t h;
 
-  if (ghost_perm_irep(d->P, irep, &h)) {
+  if (checkpoint_perm_irep(d->P, irep, &h)) {
     gb_u8(mrb, b, 1);
     gb_u64(mrb, b, h);
     return;
   }
   gb_u8(mrb, b, 0);
-  gb_u64(mrb, b, ghost_irep_hash(mrb, irep));
+  gb_u64(mrb, b, checkpoint_irep_hash(mrb, irep));
   gb_u16(mrb, b, irep->nlocals);
   gb_u16(mrb, b, irep->nregs);
   gb_u16(mrb, b, irep->clen);
@@ -600,20 +600,20 @@ static void
 w_patches(dumper *d)
 {
   mrb_state *mrb = d->mrb;
-  ghost_perm *P = d->P;
+  checkpoint_perm *P = d->P;
   char label[200];
 
   for (uint32_t k = 0; k < P->nsnaps && !d->failed; k++) {
     gsnap *s = &P->snaps[k];
     struct RBasic *o = s->obj;
-    const char *name = ghost_perm_name_of(P, o);
+    const char *name = checkpoint_perm_name_of(P, o);
     snprintf(label, sizeof(label), "permanent %s", name);
 
     switch (o->tt) {
     case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS: {
       struct RClass *c = (struct RClass*)o;
       gmt_entry *mt; int n;
-      ghost_collect_mt(mrb, c, &mt, &n);
+      checkpoint_collect_mt(mrb, c, &mt, &n);
       for (int i = 0; i < n; i++) {
         int j;
         for (j = 0; j < s->nmt; j++) if (s->mt[j].sym == mt[i].sym) break;
@@ -648,13 +648,13 @@ w_patches(dumper *d)
       /* fall through */
     case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: {
       giv_entry *iv; int n;
-      ghost_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
+      checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
       diff_iv(d, o, s->iv, s->niv, iv, n, name);  /* refers to o only if something changed */
       mrb_free(mrb, iv);
       break;
     }
     case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_HASH:
-      if (ghost_content_digest(mrb, o) != s->digest) {
+      if (checkpoint_content_digest(mrb, o) != s->digest) {
         fail(d, "permanent %s (%s) was modified; format v0 carries only changes to "
              "classes, ivars and globals", name, type_name(o->tt));
       }
@@ -666,7 +666,7 @@ w_patches(dumper *d)
 
   /* globals */
   giv_entry *gv; int ngv;
-  ghost_collect_gv(mrb, &gv, &ngv);
+  checkpoint_collect_gv(mrb, &gv, &ngv);
   for (int i = 0; i < ngv; i++) {
     int j;
     for (j = 0; j < P->ngv; j++) if (P->gv[j].sym == gv[i].sym) break;
@@ -747,18 +747,18 @@ w_vm(dumper *d)
 }
 
 int
-ghost_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
+checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
 {
   dumper d;
   memset(&d, 0, sizeof(d));
   d.mrb = mrb;
-  d.G = ghost_get(mrb);
+  d.G = checkpoint_get(mrb);
   d.P = d.G->perm;
   d.err = err; d.errlen = errlen;
   err[0] = 0;
 
   if (!d.P) {
-    snprintf(err, errlen, "no baseline (mrb_ghost_baseline was not called)");
+    snprintf(err, errlen, "no baseline (mrb_checkpoint_baseline was not called)");
     return -1;
   }
   if (mrb->c != mrb->root_c) {
@@ -783,8 +783,8 @@ ghost_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
 
   if (!d.failed) {
     char tmp[64];
-    gb_bytes(mrb, out, GHOST_MAGIC, 4);
-    gb_u16(mrb, out, GHOST_FORMAT_VERSION);
+    gb_bytes(mrb, out, CHECKPOINT_MAGIC, 4);
+    gb_u16(mrb, out, CHECKPOINT_FORMAT_VERSION);
     snprintf(tmp, sizeof(tmp), "mruby %s", MRUBY_VERSION);
     gb_str(mrb, out, tmp, strlen(tmp));
     gb_str(mrb, out, "RITE0400", 8);

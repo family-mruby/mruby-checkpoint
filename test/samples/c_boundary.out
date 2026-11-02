@@ -1,8 +1,11 @@
 cmp 1
+refused: Checkpoint.suspend inside a block called from C (Array#sort!): the C frame cannot be carried
 cmp 2
 cmp 3
 sorted [1, 2, 3]
+refused: Checkpoint.save inside a block called from C (Array#initialize): the C frame cannot be carried
 make 0
 make 1
 make 2
 made [0, 1, 4]
+after 3 5

@@ -1,10 +1,10 @@
-# ghost-test: hop-after "depth 3 before"
+# checkpoint-test: suspend-after "depth 3 before"
 # Stops three methods deep, with arguments, locals and a keyword argument
-# on the stack, and returns through all of them after the hop.
+# on the stack, and returns through all of them after the suspend.
 def leaf(n, scale: 10)
   local = n * scale
   puts "depth 3 before"
-  Ghost.hop("m.ghost")
+  Checkpoint.suspend("m.ckpt")
   puts "depth 3 after local=#{local}"
   local + 1
 end

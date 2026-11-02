@@ -1,6 +1,6 @@
-# Print a ghost image (format v0) in readable form.
+# Print a checkpoint image (format v0) in readable form.
 #
-#   ruby tools/ghost_inspect.rb IMAGE [--iseq]
+#   ruby tools/checkpoint_inspect.rb IMAGE [--iseq]
 #
 # Written from doc/format_v0.md alone, as a second reader of the format.
 
@@ -22,11 +22,11 @@ class Reader
   end
 end
 
-path = ARGV.find { |a| !a.start_with?('--') } or abort 'usage: ghost_inspect.rb IMAGE [--iseq]'
+path = ARGV.find { |a| !a.start_with?('--') } or abort 'usage: checkpoint_inspect.rb IMAGE [--iseq]'
 show_iseq = ARGV.include?('--iseq')
 r = Reader.new(File.binread(path))
 
-abort 'not a ghost image' unless r.take(4) == 'MRGH'
+abort 'not a checkpoint image' unless r.take(4) == 'MRCK'
 ver = r.u16
 impl = r.str
 rite = r.str

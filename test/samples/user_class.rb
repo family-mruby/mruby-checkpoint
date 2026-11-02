@@ -1,4 +1,4 @@
-# ghost-test: hop-after "built"
+# checkpoint-test: suspend-after "built"
 # User classes and modules: attributes, inheritance, an included module
 # (and a permanent one, Comparable), class methods, class variables,
 # constants, singleton methods on an object.
@@ -34,7 +34,7 @@ zoo = [Animal.new("cat", 4), Bird.new("crow"), Animal.new("snake", 0)]
 odd = Animal.new("odd", 3)
 def odd.special = "only me"
 puts "built"
-Ghost.hop("u.ghost")
+Checkpoint.suspend("u.ckpt")
 zoo << Bird.new("owl")
 puts zoo.sort.map(&:to_s).join(" ")
 puts zoo[1].fly, zoo[0].greet, odd.special

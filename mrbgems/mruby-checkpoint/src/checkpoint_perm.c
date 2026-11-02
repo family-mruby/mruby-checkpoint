@@ -1,5 +1,5 @@
 /*
-** ghost_perm.c - the baseline: what mrb_open() made, and its names
+** checkpoint_perm.c - the baseline: what mrb_open() made, and its names
 **
 ** Both sides (the writer before running the program, the reader before
 ** restoring) walk the fresh state the same way and give every reachable
@@ -31,7 +31,7 @@
 #include <mruby/irep.h>
 #include <mruby/gc.h>
 #include <mruby/data.h>
-#include "ghost_internal.h"
+#include "checkpoint_internal.h"
 
 mrb_value mrb_attr_reader(mrb_state *mrb, mrb_value obj);
 mrb_value mrb_attr_writer(mrb_state *mrb, mrb_value obj);
@@ -56,7 +56,7 @@ mt_cb(mrb_state *mrb, mrb_sym sym, mrb_method_t m, void *p)
 }
 
 void
-ghost_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n)
+checkpoint_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n)
 {
   mt_acc acc = { NULL, 0, 0, mrb };
   mrb_mt_foreach(mrb, c, mt_cb, &acc);
@@ -80,7 +80,7 @@ iv_cb(mrb_state *mrb, mrb_sym sym, mrb_value v, void *p)
 }
 
 void
-ghost_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n)
+checkpoint_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n)
 {
   iv_acc acc = { NULL, 0, 0 };
   mrb_iv_foreach(mrb, obj, iv_cb, &acc);
@@ -88,7 +88,7 @@ ghost_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n)
 }
 
 void
-ghost_collect_gv(mrb_state *mrb, giv_entry **out, int *n)
+checkpoint_collect_gv(mrb_state *mrb, giv_entry **out, int *n)
 {
   /* the global table has the same layout as an object's ivar table; walk
      it through a stand-in object (no API exposes the table itself) */
@@ -96,7 +96,7 @@ ghost_collect_gv(mrb_state *mrb, giv_entry **out, int *n)
   memset(&tmp, 0, sizeof(tmp));
   tmp.tt = MRB_TT_OBJECT;
   tmp.iv = mrb->globals;
-  ghost_collect_iv(mrb, mrb_obj_value(&tmp), out, n);
+  checkpoint_collect_iv(mrb, mrb_obj_value(&tmp), out, n);
 }
 
 /* ---- sorting by symbol name ---- */
@@ -162,7 +162,7 @@ hash_digest_cb(mrb_state *mrb, mrb_value k, mrb_value v, void *p)
 }
 
 uint64_t
-ghost_content_digest(mrb_state *mrb, struct RBasic *obj)
+checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj)
 {
   uint64_t h = FNV_INIT;
   mrb_value v = mrb_obj_value(obj);
@@ -189,7 +189,7 @@ ghost_content_digest(mrb_state *mrb, struct RBasic *obj)
 /* ---- irep content hash ---- */
 
 uint64_t
-ghost_irep_hash(mrb_state *mrb, const mrb_irep *irep)
+checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep)
 {
   uint64_t h = FNV_INIT;
   h = fnv_u64(h, irep->nlocals);
@@ -228,7 +228,7 @@ ghost_irep_hash(mrb_state *mrb, const mrb_irep *irep)
   }
   h = fnv_u64(h, irep->rlen);
   for (int i = 0; i < irep->rlen; i++) {
-    h = fnv_u64(h, (irep->reps && irep->reps[i]) ? ghost_irep_hash(mrb, irep->reps[i]) : 0);
+    h = fnv_u64(h, (irep->reps && irep->reps[i]) ? checkpoint_irep_hash(mrb, irep->reps[i]) : 0);
   }
   return h;
 }
@@ -236,7 +236,7 @@ ghost_irep_hash(mrb_state *mrb, const mrb_irep *irep)
 /* ---- building ---- */
 
 static void
-add_name(mrb_state *mrb, ghost_perm *P, const char *name, const void *ptr, int is_func)
+add_name(mrb_state *mrb, checkpoint_perm *P, const char *name, const void *ptr, int is_func)
 {
   if (P->n == P->cap) {
     P->cap = P->cap ? P->cap * 2 : 1024;
@@ -255,13 +255,13 @@ add_name(mrb_state *mrb, ghost_perm *P, const char *name, const void *ptr, int i
 }
 
 static int
-named_obj(ghost_perm *P, const void *p)
+named_obj(checkpoint_perm *P, const void *p)
 {
   return pm_get(&P->obj2name, p, NULL);
 }
 
 static gsnap*
-new_snap(mrb_state *mrb, ghost_perm *P, struct RBasic *obj)
+new_snap(mrb_state *mrb, checkpoint_perm *P, struct RBasic *obj)
 {
   if (P->nsnaps == P->capsnaps) {
     P->capsnaps = P->capsnaps ? P->capsnaps * 2 : 256;
@@ -274,7 +274,7 @@ new_snap(mrb_state *mrb, ghost_perm *P, struct RBasic *obj)
 }
 
 static void
-add_irep(mrb_state *mrb, ghost_perm *P, const mrb_irep *irep)
+add_irep(mrb_state *mrb, checkpoint_perm *P, const mrb_irep *irep)
 {
   if (!irep || pm_get(&P->irep2idx, irep, NULL)) return;
   if (P->nireps == P->capireps) {
@@ -282,16 +282,16 @@ add_irep(mrb_state *mrb, ghost_perm *P, const mrb_irep *irep)
     P->ireps = (girep_perm*)mrb_realloc(mrb, P->ireps, sizeof(girep_perm) * P->capireps);
   }
   P->ireps[P->nireps].irep = irep;
-  P->ireps[P->nireps].hash = ghost_irep_hash(mrb, irep);
+  P->ireps[P->nireps].hash = checkpoint_irep_hash(mrb, irep);
   P->nireps++;
   pm_put(mrb, &P->irep2idx, irep, P->nireps);
   for (int i = 0; irep->reps && i < irep->rlen; i++) add_irep(mrb, P, irep->reps[i]);
 }
 
-static void snap_object(mrb_state *mrb, ghost_perm *P, struct RBasic *o);
+static void snap_object(mrb_state *mrb, checkpoint_perm *P, struct RBasic *o);
 
 static void
-name_value(mrb_state *mrb, ghost_perm *P, mrb_value v, const char *name)
+name_value(mrb_state *mrb, checkpoint_perm *P, mrb_value v, const char *name)
 {
   if (mrb_immediate_p(v)) return;
   struct RBasic *o = mrb_basic_ptr(v);
@@ -301,22 +301,22 @@ name_value(mrb_state *mrb, ghost_perm *P, mrb_value v, const char *name)
 }
 
 static void
-snap_object(mrb_state *mrb, ghost_perm *P, struct RBasic *o)
+snap_object(mrb_state *mrb, checkpoint_perm *P, struct RBasic *o)
 {
   gsnap *s;
   switch (o->tt) {
   case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
     s = new_snap(mrb, P, o);
-    ghost_collect_iv(mrb, mrb_obj_value(o), &s->iv, &s->niv);
+    checkpoint_collect_iv(mrb, mrb_obj_value(o), &s->iv, &s->niv);
     break;
   case MRB_TT_STRING: case MRB_TT_ARRAY:
     s = new_snap(mrb, P, o);
-    s->digest = ghost_content_digest(mrb, o);
+    s->digest = checkpoint_content_digest(mrb, o);
     break;
   case MRB_TT_HASH:
     s = new_snap(mrb, P, o);
-    s->digest = ghost_content_digest(mrb, o);
-    ghost_collect_iv(mrb, mrb_obj_value(o), &s->iv, &s->niv);
+    s->digest = checkpoint_content_digest(mrb, o);
+    checkpoint_collect_iv(mrb, mrb_obj_value(o), &s->iv, &s->niv);
     break;
   default:
     break;
@@ -331,7 +331,7 @@ const_name_p(mrb_state *mrb, mrb_sym sym)
 }
 
 static void
-visit_class(mrb_state *mrb, ghost_perm *P, struct RClass *c, const char *path)
+visit_class(mrb_state *mrb, checkpoint_perm *P, struct RClass *c, const char *path)
 {
   char buf[512];
 
@@ -340,8 +340,8 @@ visit_class(mrb_state *mrb, ghost_perm *P, struct RClass *c, const char *path)
 
   gsnap *s = new_snap(mrb, P, (struct RBasic*)c);
   s->super = c->super;
-  ghost_collect_mt(mrb, c, &s->mt, &s->nmt);
-  ghost_collect_iv(mrb, mrb_obj_value(c), &s->iv, &s->niv);
+  checkpoint_collect_mt(mrb, c, &s->mt, &s->nmt);
+  checkpoint_collect_iv(mrb, mrb_obj_value(c), &s->iv, &s->niv);
 
   /* methods, in name order */
   if (s->nmt > 0) {
@@ -441,11 +441,11 @@ heap_cb(mrb_state *mrb, struct RBasic *obj, void *data)
   return MRB_EACH_OBJ_OK;
 }
 
-ghost_perm*
-ghost_perm_build(mrb_state *mrb)
+checkpoint_perm*
+checkpoint_perm_build(mrb_state *mrb)
 {
   char buf[512];
-  ghost_perm *P = (ghost_perm*)mrb_calloc(mrb, 1, sizeof(ghost_perm));
+  checkpoint_perm *P = (checkpoint_perm*)mrb_calloc(mrb, 1, sizeof(checkpoint_perm));
   pm_init(&P->obj2name); pm_init(&P->func2name); pm_init(&P->heap); pm_init(&P->irep2idx);
 
   /* C functions the core puts in closures */
@@ -462,7 +462,7 @@ ghost_perm_build(mrb_state *mrb)
   if (mrb->stack_err) add_name(mrb, P, "X:stack_err", mrb->stack_err, 0);
 
   /* globals */
-  ghost_collect_gv(mrb, &P->gv, &P->ngv);
+  checkpoint_collect_gv(mrb, &P->gv, &P->ngv);
   if (P->ngv > 0) {
     giv_entry *gv = (giv_entry*)mrb_malloc(mrb, sizeof(giv_entry) * P->ngv);
     memcpy(gv, P->gv, sizeof(giv_entry) * P->ngv);
@@ -491,7 +491,7 @@ ghost_perm_build(mrb_state *mrb)
 }
 
 void
-ghost_perm_free(mrb_state *mrb, ghost_perm *P)
+checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P)
 {
   if (!P) return;
   for (uint32_t i = 0; i < P->n; i++) mrb_free(mrb, P->names[i]);
@@ -508,7 +508,7 @@ ghost_perm_free(mrb_state *mrb, ghost_perm *P)
 }
 
 const char*
-ghost_perm_name_of(ghost_perm *P, const void *obj)
+checkpoint_perm_name_of(checkpoint_perm *P, const void *obj)
 {
   uint32_t i;
   if (!pm_get(&P->obj2name, obj, &i)) return NULL;
@@ -516,7 +516,7 @@ ghost_perm_name_of(ghost_perm *P, const void *obj)
 }
 
 const char*
-ghost_perm_func_name(ghost_perm *P, mrb_func_t f)
+checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f)
 {
   uint32_t i;
   if (!pm_get(&P->func2name, (const void*)f, &i)) return NULL;
@@ -524,7 +524,7 @@ ghost_perm_func_name(ghost_perm *P, mrb_func_t f)
 }
 
 const void*
-ghost_perm_lookup(ghost_perm *P, const char *name, size_t len, int *is_func)
+checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is_func)
 {
   for (uint32_t i = 0; i < P->n; i++) {
     if (strlen(P->names[i]) == len && memcmp(P->names[i], name, len) == 0) {
@@ -536,7 +536,7 @@ ghost_perm_lookup(ghost_perm *P, const char *name, size_t len, int *is_func)
 }
 
 int
-ghost_perm_irep(ghost_perm *P, const mrb_irep *irep, uint64_t *hash)
+checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash)
 {
   uint32_t i;
   if (!pm_get(&P->irep2idx, irep, &i)) return 0;
@@ -545,7 +545,7 @@ ghost_perm_irep(ghost_perm *P, const mrb_irep *irep, uint64_t *hash)
 }
 
 const mrb_irep*
-ghost_perm_irep_by_hash(ghost_perm *P, uint64_t hash)
+checkpoint_perm_irep_by_hash(checkpoint_perm *P, uint64_t hash)
 {
   for (uint32_t i = 0; i < P->nireps; i++) {
     if (P->ireps[i].hash == hash) return P->ireps[i].irep;
@@ -554,7 +554,7 @@ ghost_perm_irep_by_hash(ghost_perm *P, uint64_t hash)
 }
 
 gsnap*
-ghost_perm_snap(ghost_perm *P, const void *obj)
+checkpoint_perm_snap(checkpoint_perm *P, const void *obj)
 {
   for (uint32_t i = 0; i < P->nsnaps; i++) {
     if (P->snaps[i].obj == obj) return &P->snaps[i];

@@ -1,4 +1,4 @@
-# mruby-ghost: mruby の VM の実行状態を運ぶ原理検証
+# mruby-checkpoint: mruby の VM の実行状態を運ぶ原理検証
 
 > 状態: 進行中 | 更新: 2026-11-02 | mruby 単体と SabiRuby 単体で、VM の実行状態を書き出して続きから動かせることを確かめる
 
@@ -19,7 +19,7 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 - **形式は mruby の意味論の層で定義する** (C の mruby の構造体の写しにしない)。
   SabiRuby でも読めることが、それを確かめる手段になる。
 - **mruby 本体への patch は最小にする**。本体側は安全点への相乗りくらいに抑え、
-  直列化・復元は独立した gem (`mrbgems/mruby-ghost`) に置く。RData の dump /
+  直列化・復元は独立した gem (`mrbgems/mruby-checkpoint`) に置く。RData の dump /
   restore は `mrb_data_type` に欄を足さず、「`mrb_data_type` のポインタ →
   コールバック」の別表に登録する。
 - **安全点は既存のタスク切り替えの判定に相乗りする**。`vm.c` の
@@ -42,10 +42,12 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 
 ## 受け入れ条件
 
-- カウンタのプログラムが、`hop` の次の行から、別のプロセス (64bit → 32bit と
+- カウンタのプログラムが、`Checkpoint.suspend` の次の行から、別のプロセス (64bit → 32bit と
   32bit → 64bit) で数え続ける。
 - 対応していない型を持つ状態は、理由を出して書き出しを拒否する (黙って壊さない)。
-- 改造の前後で、mruby のベンチマークの普段の速さの差が 1% 以内。
+- 改造の前後で、mruby のベンチマークの普段の速さの差が 1% 以内。ホストでは valgrind
+  の命令数で比べ、時間は ESP32 で測る (ホストの時間は `mrb_vm_exec` の命令の配置で
+  ±10% 動くため。`doc/report/p1.md` の追加の調査)。
 - (5 まで進んだら) 試験一式のランダムな安全点での往復が、往復なしと完全に一致する。
 
 ## 段
@@ -53,21 +55,31 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 | 段 | 内容 | 状態 |
 |---|---|---|
 | P1 | 形式 v0、同じプロセスの往復、64bit ⇔ 32bit (スコープ 1-3) | 検収済 (2026-11-02) |
-| P1b | mruby-checkpoint への改名、`save` / `suspend`、C の境目の中は例外 | 指示済 |
+| P1b | mruby-checkpoint への改名、`save` / `suspend`、C の境目の中は例外 | 実装済・検収待ち |
 | P2 | mruby → SabiRuby の片道 (スコープ 4) | 未 |
 | P3 | 試験一式のランダムな安全点での往復 (スコープ 5) | 未 |
 
 ## 決まったこと (2026-11-02)
 
-- SabiRuby 側の変更は、SabiRuby のリポジトリの中の `ghost` の feature (既定は off) として
-  ブランチで足す (feature 名は P2 で改めて決める)。計画は SabiRuby の `docs/plans/` に
+- SabiRuby 側の変更は、SabiRuby のリポジトリの中の feature (既定は off) として
+  ブランチで足す (feature 名は P2 で決める)。計画は SabiRuby の `docs/plans/` に
   作者向けの案として置く。
 - P2 では、止まっていたフレームが指す mrblib の irep だけ中身も運び、他の mrblib は
   名前で引き当てる (SabiRuby の mrblib は 4.1.0-rc2 で作られ、ハッシュが合わない)。
 
+## 決まったこと (2026-11-02、P1b)
+
+- 汎用の機能の名前は `mruby-checkpoint` (Linux の CRIU と同じ言葉)。Ghost の名前は
+  この上に作るデモの層にだけ残し、このリポジトリからは消す。
+- Ruby の口: `Checkpoint.save(path)` は書き出して動き続け、`Checkpoint.suspend(path)`
+  は書き出してプロセスを終える。どちらもドライバの `resume` で次の行から続く。
+  呼び出しの戻り値は、書いた側が `:saved`、復元した側が `:resumed`。
+- 止め方は P1 のまま (印を立て、呼び出しの直後の安全点で書き出す)。C の関数が
+  呼んだブロックの中で頼んだら、その時点で `Checkpoint::Error` にする (先送りしない)。
+- 像の拡張子は `.ckpt`、形式の先頭の印は `MRCK`。形式の版は v0 のまま。
+
 ## 未確定事項
 
-- `hop` を Ruby から呼ぶ形 (cfunc の呼び出し自体が C の境目になる)。P1 で案を出す。
 - 書き出す前のフル GC と、Env の切り離しの扱い。
 - Family mruby の mruby には patch がある (`vm.c` の自前の時分割、mruby-task、
   アロケータ estalloc)。持ち込むときに差を見る。

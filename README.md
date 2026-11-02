@@ -1,4 +1,4 @@
-# mruby-ghost
+# mruby-checkpoint
 
 mruby の VM の実行状態 (ヒープ・callinfo・VM スタック) を、動いている途中で
 書き出し、別の `mrb_state`・別のプロセス・別のアーキテクチャ (64bit / 32bit)・
@@ -12,13 +12,19 @@ mruby の VM の実行状態 (ヒープ・callinfo・VM スタック) を、動�
 
 ```
 rake build    # build/mruby/host (64bit) と build/mruby/host32 (32bit)
-rake test     # test/samples を hop あり・なしで比べる
+rake test     # test/samples を checkpoint あり・なしで比べる
+rake test:asan, rake test:stress   # 64bit を AddressSanitizer (stress は GC の負荷も) で
 rake bench    # patch なし / patch のみ / patch + gem のベンチマーク
 ```
 
 - ビルドには mruby の構文解析器 Prism が要る。`build/prism` に固定のコミットで
   clone する (既定の取得元は GitHub。`PRISM_SRC=<手元の clone>` で置き換えられる)。
-- `build/mruby/host/bin/ghost run prog.rb` で動かし、`Ghost.hop("x.ghost")` で状態を
-  書き出して終わる。`ghost resume x.ghost` で続きから動く (`--inproc` は同じ
-  プロセスの新しい `mrb_state` で続ける)。
-- 形式は `doc/format_v0.md`、P1 の報告は `doc/report/p1.md`。
+- `build/mruby/host/bin/checkpoint run prog.rb` で動かす。プログラムの中で
+  - `Checkpoint.save("x.ckpt")` は状態を書き出して動き続ける。戻り値は `:saved`。
+  - `Checkpoint.suspend("x.ckpt")` は状態を書き出してプロセスを終える。
+  - `checkpoint resume x.ckpt` で、どちらも呼び出しの次の行から続く。復元した側
+    では呼び出しの戻り値が `:resumed` になる (`Checkpoint.resumed?` は復元した
+    状態なら真)。`--inproc` は同じプロセスの新しい `mrb_state` で続ける。
+  - C の関数が呼んだブロックの中 (`sort { }` など) では、頼んだ時点で
+    `Checkpoint::Error` になる。
+- 形式は `doc/format_v0.md`、報告は `doc/report/` (`p1.md`・`p1b.md`)。

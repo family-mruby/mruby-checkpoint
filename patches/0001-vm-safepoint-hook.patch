@@ -4,7 +4,7 @@
    return FALSE;
  }
  
-+/* Safe point hook (mruby-ghost). Called from the task-switch check, only
++/* Safe point hook (mruby-checkpoint). Called from the task-switch check, only
 +   while task.switching is pending and only where a task switch would be
 +   allowed apart from the root-context rule: no exception in flight, no
 +   ObjectSpace walk, no C call boundary on the call-info stack. At that

@@ -1,39 +1,60 @@
-# Run test/samples/*.rb with and without a hop and compare the outputs.
+# Run test/samples/*.rb with and without checkpoints and compare the outputs.
 #
 #   ruby tools/run_tests.rb [--bless] [sample ...]
 #
 # For each sample:
-#   reference   ghost run --no-hop (64-bit); must equal test/samples/NAME.out
+#   reference   checkpoint run --ignore (64-bit); must equal test/samples/NAME.out
 #               and the 32-bit reference
-#   inproc      ghost run --inproc: the hop restores into a new mrb_state in
-#               the same process (64 and 32)
-#   A->B        ghost run on A, then ghost resume alternating B, A, B ... while
-#               the program keeps hopping; the joined output must equal the
-#               reference. A->B is 64->64, 64->32, 32->64, 32->32. Every image
-#               must also read cleanly with tools/ghost_inspect.rb.
-# Annotations in the sample (lines "# ghost-test: ..."):
-#   hop-after "LINE"  the first process's output must end with LINE
-#                     (the hop happened right there)
-#   refuse            no image may be written; the hop output must equal NAME.out
-# --bless writes NAME.out from the reference run.
+# Samples that suspend (Checkpoint.suspend):
+#   inproc      checkpoint run --inproc: each suspend restores into a new
+#               mrb_state in the same process (64 and 32)
+#   A->B        checkpoint run on A, then checkpoint resume alternating B, A, B ...
+#               while the program keeps suspending; the joined output must equal
+#               the reference. A->B is 64->64, 64->32, 32->64, 32->32.
+# Samples that save (Checkpoint.save, annotation save-after):
+#   A           checkpoint run on A: the saving side goes on, its output must
+#               equal the reference, and it must have written an image
+#   A->B        checkpoint resume of that image on B: the restored side's output
+#               must equal test/samples/NAME.resumed.out
+#   inproc      checkpoint run --inproc: the restored program runs to its end
+#               inside the save, then the saving one goes on; the output must be
+#               the reference up to LINE, NAME.resumed.out, the rest of the
+#               reference
+# Every image must also read cleanly with tools/checkpoint_inspect.rb.
+#
+# Annotations in the sample (lines "# checkpoint-test: ..."):
+#   suspend-after "LINE"  the first process's output must end with LINE
+#                         (the suspend happened right there)
+#   save-after "LINE"     a save sample; the save happens right after LINE
+#   refuse                no image may be written; the output of a run that
+#                         asks for checkpoints must equal NAME.out
+# --bless writes NAME.out from the reference run (and NAME.resumed.out from
+# the 64->64 resume of a save sample).
+#
+# CHECKPOINT_BIN64 replaces the 64-bit driver (the ASan builds, see Rakefile).
 
 require 'open3'
 require 'tmpdir'
 require 'fileutils'
 
 ROOT = File.expand_path('..', __dir__)
-INSPECT = File.join(ROOT, 'tools/ghost_inspect.rb')
-GHOST = {
-  '64' => File.join(ROOT, 'build/mruby/host/bin/ghost'),
-  '32' => File.join(ROOT, 'build/mruby/host32/bin/ghost'),
+INSPECT = File.join(ROOT, 'tools/checkpoint_inspect.rb')
+CHECKPOINT = {
+  '64' => ENV['CHECKPOINT_BIN64'] ? File.expand_path(ENV['CHECKPOINT_BIN64']) : File.join(ROOT, 'build/mruby/host/bin/checkpoint'),
+  '32' => File.join(ROOT, 'build/mruby/host32/bin/checkpoint'),
 }
+CHECKPOINT.each_value { |b| abort "missing #{b}" unless File.exist?(b) }
 
 bless = ARGV.delete('--bless')
 samples = ARGV.empty? ? Dir[File.join(ROOT, 'test/samples/*.rb')].sort : ARGV.map { |a| File.expand_path(a) }
 
 def run(arch, *args, dir:)
-  out, err, st = Open3.capture3(GHOST.fetch(arch), *args, chdir: dir)
+  out, err, st = Open3.capture3(CHECKPOINT.fetch(arch), *args, chdir: dir)
   [out, err, st.exitstatus]
+end
+
+def inspect_ok?(img)
+  `ruby #{INSPECT} #{img}`.lines.last&.chomp == 'end'
 end
 
 $fail = 0
@@ -59,20 +80,22 @@ end
 samples.each do |path|
   name = File.basename(path, '.rb')
   src = File.read(path)
-  ann = src.lines.grep(/^# ghost-test:/).map { |l| l.sub(/^# ghost-test:\s*/, '').strip }
+  ann = src.lines.grep(/^# checkpoint-test:/).map { |l| l.sub(/^# checkpoint-test:\s*/, '').strip }
   refuse = ann.include?('refuse')
-  hop_after = ann.map { |a| a[/\Ahop-after "(.*)"\z/, 1] }.compact.first
+  suspend_after = ann.map { |a| a[/\Asuspend-after "(.*)"\z/, 1] }.compact.first
+  save_after = ann.map { |a| a[/\Asave-after "(.*)"\z/, 1] }.compact.first
   golden_path = path.sub(/\.rb\z/, '.out')
+  resumed_path = path.sub(/\.rb\z/, '.resumed.out')
   puts "#{name}:"
 
-  Dir.mktmpdir('ghost-test') do |dir|
+  Dir.mktmpdir('checkpoint-test') do |dir|
     FileUtils.cp(path, dir)
     file = File.basename(path)
-    img = File.join(dir, 'img.ghost')
+    img = File.join(dir, 'img.ckpt')
 
-    ref, err, st = run('64', 'run', '--no-hop', file, dir: dir)
+    ref, err, st = run('64', 'run', '--ignore', file, dir: dir)
     check('reference runs', st == 0 && err.empty?, err)
-    ref32, err32, st32 = run('32', 'run', '--no-hop', file, dir: dir)
+    ref32, err32, st32 = run('32', 'run', '--ignore', file, dir: dir)
     check('reference 32 = 64', ref32 == ref && st32 == 0, err32 + diff(ref, ref32))
 
     if refuse
@@ -95,6 +118,44 @@ samples.each do |path|
     golden = File.exist?(golden_path) ? File.read(golden_path) : nil
     check('reference = golden', golden == ref, golden ? diff(golden, ref) : 'no golden file')
 
+    if save_after
+      at = ref.lines.index { |l| l.chomp == save_after }
+      check("reference has the line #{save_after.inspect}", at)
+      next unless at
+      if bless
+        FileUtils.rm_f(img)
+        run('64', 'run', '--out', img, file, dir: dir)
+        out, = run('64', 'resume', img, dir: dir)
+        File.write(resumed_path, out)
+      end
+      resumed = File.exist?(resumed_path) ? File.read(resumed_path) : nil
+      check('resumed golden file exists', resumed)
+      next unless resumed
+
+      %w(64 32).each do |a|
+        FileUtils.rm_f(img)
+        out, err, st = run(a, 'run', '--out', img, file, dir: dir)
+        check("#{a} save: the saving side goes on, output = reference",
+              out == ref && st == 0 && err.empty? && File.exist?(img), err + diff(ref, out))
+        next unless File.exist?(img)
+        check("#{a} save: the image reads with tools/checkpoint_inspect.rb", inspect_ok?(img))
+        %w(64 32).each do |b|
+          o, e, s = run(b, 'resume', img, dir: dir)
+          check("#{a}->#{b} save: the restored side goes on, output = #{File.basename(resumed_path)}",
+                o == resumed && s == 0 && e.empty?, e + diff(resumed, o))
+        end
+      end
+
+      expect = ref.lines[0..at].join + resumed + ref.lines[(at + 1)..].join
+      %w(64 32).each do |a|
+        FileUtils.rm_f(img)
+        out, err, st = run(a, 'run', '--inproc', '--out', img, file, dir: dir)
+        check("#{a} inproc save (restored side first, then the saving side)",
+              out == expect && st == 0 && err.empty?, err + diff(expect, out))
+      end
+      next
+    end
+
     %w(64 32).each do |a|
       FileUtils.rm_f(img)
       out, err, st = run(a, 'run', '--inproc', '--out', img, file, dir: dir)
@@ -107,23 +168,23 @@ samples.each do |path|
       out, err, st = run(a, 'run', '--out', img, file, dir: dir)
       first = out.dup
       errs = err.dup
-      hops = 0
+      n = 0
       archs = [b, a]
       parsed = true
-      while File.exist?(img) && hops < 20 && st == 0
+      while File.exist?(img) && n < 20 && st == 0
         # the image must also read cleanly with the reader written from the spec
-        parsed &&= `ruby #{INSPECT} #{img}`.lines.last&.chomp == 'end'
+        parsed &&= inspect_ok?(img)
         FileUtils.mv(img, img + '.in')
-        o, e, st = run(archs[hops % 2], 'resume', '--out', img, img + '.in', dir: dir)
+        o, e, st = run(archs[n % 2], 'resume', '--out', img, img + '.in', dir: dir)
         out << o
         errs << e
-        hops += 1
+        n += 1
       end
-      ok = hops > 0 && out == ref && st == 0 && errs.empty? && parsed
-      ok &&= first.lines.last&.chomp == hop_after if hop_after
-      check("#{a}->#{b} (#{hops} hop#{hops == 1 ? '' : 's'})", ok,
+      ok = n > 0 && out == ref && st == 0 && errs.empty? && parsed
+      ok &&= first.lines.last&.chomp == suspend_after if suspend_after
+      check("#{a}->#{b} (#{n} suspend#{n == 1 ? '' : 's'})", ok,
             "#{errs}#{diff(ref, out)}\nfirst process ended with #{first.lines.last.inspect}" \
-            "#{parsed ? '' : "\ntools/ghost_inspect.rb could not read an image"}")
+            "#{parsed ? '' : "\ntools/checkpoint_inspect.rb could not read an image"}")
     end
   end
 end

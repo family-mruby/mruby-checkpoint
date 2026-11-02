@@ -1,4 +1,4 @@
-# ghost-test: hop-after "filled"
+# checkpoint-test: suspend-after "filled"
 # Hashes are rebuilt key by key on the other side (the hash values of keys
 # are recomputed there): String, Symbol, Array, Float and user-object keys,
 # a default value, a default proc, ranges as values.
@@ -17,7 +17,7 @@ memo[3]
 ranges = { small: (1..3), open: (5...), excl: (1...4) }
 nested = { list: [1, { deep: "x" }], again: h }
 puts "filled"
-Ghost.hop("h.ghost")
+Checkpoint.suspend("h.ckpt")
 puts h["str"], h[:sym], h[[1, 2]], h[1.5], h[Key.new(7)], h[nil]
 puts h.keys.map(&:class).inspect
 puts counts.inspect, counts["zzz"], memo[4], memo.inspect

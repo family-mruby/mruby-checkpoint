@@ -1,4 +1,4 @@
-# ghost-test: hop-after "patched"
+# checkpoint-test: suspend-after "patched"
 # Changes to classes that mrb_open made: methods added to String and
 # Integer, an alias of a C method in Array, a top-level method (a private
 # method of Object), an ivar on main, globals, a new constant in Object.
@@ -21,7 +21,7 @@ $seen = ["g1"]
 $level = 3
 LIMIT = 42
 puts "patched"
-Ghost.hop("bp.ghost")
+Checkpoint.suspend("bp.ckpt")
 $seen << "g2"
 puts "abc".shout, 21.double, [1, 2, 3].count_of, helper(1)
 puts @main_ivar.inspect, $seen.inspect, $level, LIMIT
