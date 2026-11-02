@@ -1,13 +1,16 @@
 /*
-** checkpoint_restore.c - rebuild a checkpoint image (format v0) in a fresh mrb_state
+** checkpoint_restore.c - rebuild a checkpoint image (format v1) in a fresh mrb_state
 **
 ** Order:
 **   symbols -> ireps -> objects (pass 1: make every object, pass 2: fill
 **   the fields) -> changes to permanent objects -> included-module classes
-**   -> frozen bits (not of Hashes) -> the VM (stack and frames) -> line
+**   -> frozen bits (not of Hashes) -> the VM (the contexts with their
+**   stacks and frames, the Tasks in their queues, the clock) -> line
 **   numbers, GC settings -> Hash entries (they may call #hash / #eql? of
-**   restored objects, which may run closures over the restored stack) ->
-**   frozen bits of Hashes -> full GC -> GC settings -> continue.
+**   restored objects, which may run closures over the restored stacks) ->
+**   frozen bits of Hashes -> full GC -> GC settings -> continue
+**   (mrb_checkpoint_continue, checkpoint_task.c: the context or the Task
+**   that was running goes on).
 ** The GC is off until the whole graph hangs from the roots.
 */
 
@@ -29,9 +32,33 @@
 #include <mruby/throw.h>
 #include <mruby/numeric.h>
 #include "checkpoint_internal.h"
+#include "task.h"
 
 typedef struct { struct RBasic *h; mrb_value k, v; uint8_t set; } hent;
-typedef struct { struct REnv *e; uint32_t off; } senv;
+typedef struct { struct REnv *e; uint32_t ctx, off; } senv;
+typedef struct { struct RFiber *f; uint32_t ctx; } sfib;
+
+/* a context as read, before it is put in place */
+typedef struct {
+  uint8_t status, flags;
+  uint32_t prev;
+  struct RBasic *fib;
+  uint32_t nvals; mrb_value *vals;
+  uint32_t nframes; mrb_callinfo *frames; uint32_t *offs;
+  struct mrb_context *c;
+} rctx;
+
+/* a Task as read */
+typedef struct {
+  struct RBasic *self;
+  uint32_t ctx;
+  uint8_t status, queue, priority, reason, timeslice;
+  mrb_value name, result;
+  int32_t remaining; uint8_t has_deadline;
+  uint32_t join;
+  struct RBasic *queue_obj;
+  mrb_task *t;
+} rtask;
 typedef struct { struct RBasic *o; checkpoint_data_ent *de; const uint8_t *blob; size_t len; } dfix;
 
 typedef struct {
@@ -54,6 +81,12 @@ typedef struct {
   dfix *dfix; size_t ndfix, capdfix;   /* C data built from the filled object */
   struct RClass **pre; size_t npre, cappre;   /* classes with prepended modules */
   struct RBasic **fl; size_t nfl, capfl;      /* permanent Hashes frozen after their entries */
+  /* v1 */
+  sfib *sfibs; size_t nsfib, capsfib;         /* Fiber objects and their contexts */
+  uint32_t *task_of_obj;                      /* object -> its Task record (Task objects) */
+  const mrb_data_type *task_type;             /* mruby-task's (static there; probed) */
+  rctx *ctxs; uint32_t nctx;
+  rtask *tasks; uint32_t ntask;
 } reader;
 
 static void
@@ -716,15 +749,16 @@ r_object(reader *r, uint32_t id)
       e->flags = (e->flags & ~(0xfu << 16)) | ((uint32_t)vis << 16);
     }
     if (onstack) {
+      uint32_t cx = r_u32(r);
       uint32_t off = r_u32(r);
       if (r->fill) {
-        e->cxt = mrb->root_c;
+        e->cxt = NULL;     /* the context and the stack once the contexts are built */
         e->stack = NULL;
         if (r->nsenv == r->capsenv) {
           r->capsenv = r->capsenv ? r->capsenv * 2 : 16;
           r->senvs = (senv*)mrb_realloc(mrb, r->senvs, sizeof(senv) * r->capsenv);
         }
-        r->senvs[r->nsenv].e = e; r->senvs[r->nsenv].off = off; r->nsenv++;
+        r->senvs[r->nsenv].e = e; r->senvs[r->nsenv].ctx = cx; r->senvs[r->nsenv].off = off; r->nsenv++;
       }
     }
     else {
@@ -853,6 +887,32 @@ r_object(reader *r, uint32_t id)
     break;
   }
 
+  case GK_FIBER: {
+    uint32_t cx = r_u32(r);
+    if (!r->fill) r->objs[id - 1] = alloc_obj(r, MRB_TT_FIBER);
+    else if (cx) {
+      if (r->nsfib == r->capsfib) {
+        r->capsfib = r->capsfib ? r->capsfib * 2 : 8;
+        r->sfibs = (sfib*)mrb_realloc(mrb, r->sfibs, sizeof(sfib) * r->capsfib);
+      }
+      r->sfibs[r->nsfib].f = (struct RFiber*)o; r->sfibs[r->nsfib].ctx = cx; r->nsfib++;
+    }
+    break;
+  }
+
+  case GK_TASK: {
+    uint32_t ti = r_u32(r);
+    if (!r->fill) {
+      /* the object now, its mrb_task with the scheduler section */
+      if (!r->task_type) r->task_type = checkpoint_task_type(mrb);
+      if (!r->task_type) { rfail(r, "this build has no Task"); break; }
+      r->objs[id - 1] = (struct RBasic*)mrb_data_object_alloc(mrb, NULL, NULL, r->task_type);
+      r->task_of_obj[id - 1] = ti;
+    }
+    r_ivars(r, o);
+    break;
+  }
+
   case GK_DATA: {
     uint32_t nlen; const uint8_t *name = r_str(r, &nlen);
     uint32_t blen; const uint8_t *blob = r_str(r, &blen);
@@ -895,6 +955,7 @@ r_objects(reader *r)
   r->objs = (struct RBasic**)mrb_calloc(r->mrb, r->nobj + 1, sizeof(void*));
   r->okind = (uint8_t*)mrb_calloc(r->mrb, r->nobj + 1, 1);
   r->ofrozen = (uint8_t*)mrb_calloc(r->mrb, r->nobj + 1, 1);
+  r->task_of_obj = (uint32_t*)mrb_calloc(r->mrb, r->nobj + 1, sizeof(uint32_t));
   const uint8_t *start = r->p;
   r->fill = 0;
   for (uint32_t i = 1; i <= r->nobj && !r->failed; i++) r_object(r, i);
@@ -1018,65 +1079,342 @@ r_patches(reader *r)
   }
 }
 
+/* one frame of a context (format v1 section 10) */
+static void
+r_frame(reader *r, rctx *x, uint32_t cid, uint32_t k)
+{
+  mrb_callinfo *ci = &x->frames[k];
+  uint8_t kind = r_u8(r);
+  ci->mid = r_sym(r);
+  ci->proc = (const struct RProc*)r_obj(r);
+  if (kind == GF_CFUNC) {
+    uint32_t len; const uint8_t *name = r_str(r, &len);
+    if (r->failed) return;
+    /* only the functions that wait for a context switch (see the writer) */
+    if (!checkpoint_switch_func_name((const char*)name, len)) {
+      rfail(r, "context %u waits in the C function %.*s, which this reader cannot start again", cid, (int)len, name);
+      return;
+    }
+    if (k + 1 != x->nframes) { rfail(r, "a C function frame below the top of context %u", cid); return; }
+    if (ci->proc && !MRB_PROC_CFUNC_P(ci->proc)) { rfail(r, "C function frame %u with a Ruby proc", k); return; }
+  }
+  else if (kind != GF_RUBY) {
+    rfail(r, "bad frame kind %u", kind);
+    return;
+  }
+  uint32_t off = r_u32(r);
+  uint32_t pc = r_u32(r);
+  ci->n = r_u8(r) & 0xf;
+  ci->nk = r_u8(r) & 0xf;
+  ci->cci = r_u8(r);
+  ci->vis = r_u8(r);
+  ci->blk = (struct RProc*)r_obj(r);
+  uint8_t uk = r_u8(r);
+  struct RBasic *u = r_obj(r);
+  if (r->failed) return;
+  if (kind == GF_RUBY && (!ci->proc || MRB_PROC_CFUNC_P(ci->proc))) { rfail(r, "frame %u of context %u has no Ruby proc", k, cid); return; }
+  if (off > x->nvals) { rfail(r, "frame %u stack offset out of range", k); return; }
+  x->offs[k] = off;
+  ci->pc = NULL;
+  if (kind == GF_RUBY && pc != UINT32_MAX) {
+    if (pc > ci->proc->body.irep->ilen) { rfail(r, "frame %u pc out of range", k); return; }
+    ci->pc = ci->proc->body.irep->iseq + pc;
+  }
+  if (uk == 1) ci->u.env = (struct REnv*)u;
+  else if (uk == 2) ci->u.target_class = (struct RClass*)u;
+}
+
+static void
+r_contexts(reader *r)
+{
+  mrb_state *mrb = r->mrb;
+  r->nctx = r_u32(r);
+  if (r->failed) return;
+  if (r->nctx == 0) { rfail(r, "no contexts"); return; }
+  r->ctxs = (rctx*)mrb_calloc(mrb, r->nctx, sizeof(rctx));
+  for (uint32_t i = 0; i < r->nctx && !r->failed; i++) {
+    rctx *x = &r->ctxs[i];
+    x->status = r_u8(r);
+    x->flags = r_u8(r);
+    x->prev = r_u32(r);
+    x->fib = r_obj(r);
+    if (x->prev > r->nctx) { rfail(r, "context #%u out of range", x->prev); return; }
+    if (x->status > MRB_FIBER_TERMINATED) { rfail(r, "bad context status %u", x->status); return; }
+    x->nvals = r_u32(r);
+    if (r->failed) return;
+    if (x->nvals > (size_t)(r->end - r->p)) { rfail(r, "truncated image"); return; }
+    x->vals = (mrb_value*)mrb_calloc(mrb, x->nvals + 1, sizeof(mrb_value));
+    for (uint32_t k = 0; k < x->nvals && !r->failed; k++) x->vals[k] = r_value(r);
+    x->nframes = r_u32(r);
+    if (r->failed) return;
+    if (x->nframes > (size_t)(r->end - r->p)) { rfail(r, "truncated image"); return; }
+    if (x->nframes == 0 && x->nvals > 0) { rfail(r, "a stack without frames in context %u", i + 1); return; }
+    x->frames = (mrb_callinfo*)mrb_calloc(mrb, x->nframes + 1, sizeof(mrb_callinfo));
+    x->offs = (uint32_t*)mrb_calloc(mrb, x->nframes + 1, sizeof(uint32_t));
+    for (uint32_t k = 0; k < x->nframes && !r->failed; k++) r_frame(r, x, i + 1, k);
+  }
+  if (!r->failed && r->ctxs[0].nframes == 0 && r->ctxs[0].status != MRB_FIBER_CREATED &&
+      r->ctxs[0].status != MRB_FIBER_RUNNING && r->ctxs[0].status != MRB_FIBER_RESUMED) {
+    rfail(r, "bad state of the root context");
+  }
+}
+
+static int32_t
+r_i32(reader *r)
+{
+  return (int32_t)r_u32(r);
+}
+
+static void
+r_sched(reader *r, int *switch_pending, int *loop_running, uint16_t *unit, uint32_t *tick,
+        uint8_t *has_wakeup, int32_t *wakeup, uint32_t *running, uint32_t *host)
+{
+  mrb_state *mrb = r->mrb;
+  uint8_t fl = r_u8(r);
+  *switch_pending = fl & 1;
+  *loop_running = (fl & 2) != 0;
+  *unit = r_u16(r);
+  *tick = r_u32(r);
+  *has_wakeup = r_u8(r);
+  *wakeup = r_i32(r);
+  r->ntask = r_u32(r);
+  if (r->failed) return;
+  if (r->ntask > (size_t)(r->end - r->p)) { rfail(r, "truncated image"); return; }
+  r->tasks = (rtask*)mrb_calloc(mrb, r->ntask + 1, sizeof(rtask));
+  int nmain = 0;
+  for (uint32_t i = 0; i < r->ntask && !r->failed; i++) {
+    rtask *t = &r->tasks[i];
+    t->self = r_obj(r);
+    t->ctx = r_u32(r);
+    t->status = r_u8(r);
+    t->queue = r_u8(r);
+    t->priority = r_u8(r);
+    t->reason = r_u8(r);
+    t->timeslice = r_u8(r);
+    t->name = r_value(r);
+    t->result = r_value(r);
+    switch (t->reason) {
+    case MRB_TASK_REASON_NONE: break;
+    case MRB_TASK_REASON_SLEEP: t->has_deadline = 1; t->remaining = r_i32(r); break;
+    case MRB_TASK_REASON_JOIN: t->join = r_u32(r); break;
+    case MRB_TASK_REASON_QUEUE:
+      t->queue_obj = r_obj(r);
+      t->has_deadline = r_u8(r);
+      t->remaining = r_i32(r);
+      break;
+    default: rfail(r, "Task #%u waits for reason %u", i + 1, t->reason); break;
+    }
+    if (r->failed) break;
+    if (!t->self || t->self->tt != MRB_TT_CDATA || DATA_TYPE(mrb_obj_value(t->self)) != r->task_type) {
+      rfail(r, "Task #%u has no Task object", i + 1); break;
+    }
+    if (t->queue == 255) {
+      if (t->ctx != 0 || ++nmain > 1) { rfail(r, "bad main Task #%u", i + 1); break; }
+    }
+    else {
+      if (t->queue >= MRB_NUM_TASK_QUEUE || t->ctx == 0 || t->ctx > r->nctx || t->ctx == 1) {
+        rfail(r, "bad Task #%u", i + 1); break;
+      }
+      if (i > 0 && r->tasks[i - 1].queue != 255 && r->tasks[i - 1].queue > t->queue) {
+        rfail(r, "Tasks out of the order of their queues"); break;
+      }
+    }
+    if (t->join > r->ntask) { rfail(r, "Task #%u joins Task #%u out of range", i + 1, t->join); break; }
+    if (t->reason == MRB_TASK_REASON_QUEUE && t->queue_obj &&
+        (t->queue_obj->tt != MRB_TT_CDATA || !DATA_TYPE(mrb_obj_value(t->queue_obj)) ||
+         strcmp(DATA_TYPE(mrb_obj_value(t->queue_obj))->struct_name, "Task::Queue") != 0)) {
+      rfail(r, "Task #%u waits on something that is not a Task::Queue", i + 1); break;
+    }
+  }
+  *running = r_u32(r);
+  *host = r_u32(r);
+  if (!r->failed && (*running > r->ntask || *host > r->ntask)) rfail(r, "Task out of range");
+  if (!r->failed && *running && r->tasks[*running - 1].status != MRB_TASK_STATUS_RUNNING) {
+    rfail(r, "the running Task is not RUNNING");
+  }
+}
+
+/* the ticks of the writer's clock in this one's */
+static uint32_t
+conv_ticks(uint32_t t, uint16_t unit)
+{
+  if (unit == MRB_TICK_UNIT || unit == 0) return t;
+  return (uint32_t)(((uint64_t)t * unit + MRB_TICK_UNIT - 1) / MRB_TICK_UNIT);
+}
+
+static int32_t
+conv_remaining(int32_t t, uint16_t unit)
+{
+  if (unit == MRB_TICK_UNIT || unit == 0) return t;
+  int64_t ms = (int64_t)t * unit;
+  return (int32_t)(ms >= 0 ? (ms + MRB_TICK_UNIT - 1) / MRB_TICK_UNIT : ms / MRB_TICK_UNIT);
+}
+
 static void
 r_vm(reader *r)
 {
   mrb_state *mrb = r->mrb;
-  struct mrb_context *c = mrb->root_c;
-
-  uint32_t live = r_u32(r);
+  r_contexts(r);
+  uint32_t current = r_u32(r);
+  if (!r->failed && (current == 0 || current > r->nctx)) rfail(r, "current context out of range");
+  int switch_pending = 0, loop_running = 0;
+  uint16_t unit = 0; uint32_t tick = 0, running = 0, host = 0;
+  uint8_t has_wakeup = 0; int32_t wakeup = 0;
+  if (!r->failed) r_sched(r, &switch_pending, &loop_running, &unit, &tick, &has_wakeup, &wakeup, &running, &host);
   if (r->failed) return;
-  size_t size = (size_t)(c->stend - c->stbase);
-  if (size < (size_t)live + 128) {
-    size_t nsize = (size_t)live + 128;
-    c->stbase = (mrb_value*)mrb_realloc(mrb, c->stbase, sizeof(mrb_value) * nsize);
-    c->stend = c->stbase + nsize;
-    size = nsize;
-  }
-  for (size_t i = 0; i < size; i++) c->stbase[i] = mrb_nil_value();
-  for (uint32_t i = 0; i < live && !r->failed; i++) c->stbase[i] = r_value(r);
 
-  uint32_t nframes = r_u32(r);
-  if (r->failed) return;
-  if (nframes == 0) { rfail(r, "no frames"); return; }
-  size_t cisize = (size_t)(c->ciend - c->cibase);
-  if (cisize < (size_t)nframes + 16) {
-    size_t nsize = (size_t)nframes + 16;
-    c->cibase = (mrb_callinfo*)mrb_realloc(mrb, c->cibase, sizeof(mrb_callinfo) * nsize);
-    c->ciend = c->cibase + nsize;
-    cisize = nsize;
+  /* which context is whose: the root, the Tasks', the others (Fibers') */
+  uint8_t *owner = (uint8_t*)mrb_calloc(mrb, r->nctx + 1, 1);
+  owner[0] = 1;
+  for (uint32_t i = 0; i < r->ntask && !r->failed; i++) {
+    if (r->tasks[i].queue == 255) continue;
+    if (owner[r->tasks[i].ctx - 1]) rfail(r, "context %u belongs to two owners", r->tasks[i].ctx);
+    owner[r->tasks[i].ctx - 1] = 2;
   }
-  memset(c->cibase, 0, sizeof(mrb_callinfo) * cisize);
-  for (uint32_t k = 0; k < nframes && !r->failed; k++) {
-    mrb_callinfo *ci = c->cibase + k;
-    ci->mid = r_sym(r);
-    ci->proc = (const struct RProc*)r_obj(r);
-    uint32_t off = r_u32(r);
-    uint32_t pc = r_u32(r);
-    ci->n = r_u8(r) & 0xf;
-    ci->nk = r_u8(r) & 0xf;
-    ci->cci = r_u8(r);
-    ci->vis = r_u8(r);
-    ci->blk = (struct RProc*)r_obj(r);
-    uint8_t uk = r_u8(r);
-    struct RBasic *u = r_obj(r);
-    if (r->failed) break;
-    if (!ci->proc || MRB_PROC_CFUNC_P(ci->proc)) { rfail(r, "frame %u has no Ruby proc", k); break; }
-    if (off >= size) { rfail(r, "frame %u stack offset out of range", k); break; }
-    ci->stack = c->stbase + off;
-    if (pc != UINT32_MAX) {
-      if (pc > ci->proc->body.irep->ilen) { rfail(r, "frame %u pc out of range", k); break; }
-      ci->pc = ci->proc->body.irep->iseq + pc;
+  for (size_t i = 0; i < r->nsfib && !r->failed; i++) {
+    uint32_t cx = r->sfibs[i].ctx;
+    if (cx == 0 || cx > r->nctx) { rfail(r, "Fiber's context out of range"); break; }
+    /* Fiber.current at the root or in a Task names that context; a Fiber's
+       own context belongs to the Fiber */
+    if (owner[cx - 1] == 0) owner[cx - 1] = 3;
+  }
+  for (uint32_t i = 0; i < r->nctx && !r->failed; i++) {
+    if (!owner[i]) rfail(r, "context %u belongs to no Fiber or Task", i + 1);
+  }
+  for (size_t i = 0; i < r->nsenv && !r->failed; i++) {
+    uint32_t cx = r->senvs[i].ctx;
+    if (cx == 0 || cx > r->nctx || r->senvs[i].off >= r->ctxs[cx - 1].nvals) rfail(r, "env stack position out of range");
+  }
+  if (r->failed) { mrb_free(mrb, owner); return; }
+
+  /* the Tasks' structs (mruby-task's mrb_task) */
+  for (uint32_t i = 0; i < r->ntask; i++) {
+    rtask *rt = &r->tasks[i];
+    mrb_task *t = (mrb_task*)mrb_calloc(mrb, 1, sizeof(mrb_task));
+    rt->t = t;
+    t->priority = rt->priority;
+    t->status = rt->status;
+    t->reason = rt->reason;
+    t->timeslice = rt->timeslice;
+    t->name = rt->name;
+    t->result = rt->result;
+    t->self = mrb_obj_value(rt->self);
+    DATA_PTR(t->self) = t;
+    if (rt->queue != 255) r->ctxs[rt->ctx - 1].c = &t->c;
+  }
+
+  /* the contexts in place */
+  for (uint32_t i = 0; i < r->nctx; i++) {
+    rctx *x = &r->ctxs[i];
+    struct mrb_context *c;
+    if (i == 0) c = mrb->root_c;
+    else if (x->c) c = x->c;
+    else c = (struct mrb_context*)mrb_calloc(mrb, 1, sizeof(struct mrb_context));
+    x->c = c;
+    if (x->nframes == 0) {
+      if (i == 0) {
+        /* the root of a host that runs the scheduler from C: idle */
+        for (mrb_value *v = c->stbase; v < c->stend; v++) *v = mrb_nil_value();
+        if (c->stbase < c->stend) c->stbase[0] = mrb_top_self(mrb);
+        memset(c->cibase, 0, sizeof(mrb_callinfo));
+        c->ci = c->cibase;
+        c->ci->stack = c->stbase;
+        c->ci->u.target_class = mrb->object_class;
+      }
+      else {
+        c->stbase = c->stend = NULL;
+        c->cibase = c->ci = c->ciend = NULL;
+      }
+      continue;
     }
-    if (uk == 1) ci->u.env = (struct REnv*)u;
-    else if (uk == 2) ci->u.target_class = (struct RClass*)u;
+    size_t size = (size_t)x->nvals + 128;
+    size_t cisize = (size_t)x->nframes + 16;
+    if (i == 0) {
+      if ((size_t)(c->stend - c->stbase) < size) {
+        c->stbase = (mrb_value*)mrb_realloc(mrb, c->stbase, sizeof(mrb_value) * size);
+        c->stend = c->stbase + size;
+      }
+      if ((size_t)(c->ciend - c->cibase) < cisize) {
+        c->cibase = (mrb_callinfo*)mrb_realloc(mrb, c->cibase, sizeof(mrb_callinfo) * cisize);
+        c->ciend = c->cibase + cisize;
+      }
+      size = (size_t)(c->stend - c->stbase);
+      cisize = (size_t)(c->ciend - c->cibase);
+    }
+    else {
+      c->stbase = (mrb_value*)mrb_malloc(mrb, sizeof(mrb_value) * size);
+      c->stend = c->stbase + size;
+      c->cibase = (mrb_callinfo*)mrb_malloc(mrb, sizeof(mrb_callinfo) * cisize);
+      c->ciend = c->cibase + cisize;
+    }
+    for (size_t k = 0; k < size; k++) c->stbase[k] = k < x->nvals ? x->vals[k] : mrb_nil_value();
+    memset(c->cibase, 0, sizeof(mrb_callinfo) * cisize);
+    for (uint32_t k = 0; k < x->nframes; k++) {
+      c->cibase[k] = x->frames[k];
+      c->cibase[k].stack = c->stbase + x->offs[k];
+    }
+    c->ci = c->cibase + x->nframes - 1;
   }
-  c->ci = c->cibase + nframes - 1;
-
+  for (uint32_t i = 0; i < r->nctx; i++) {
+    rctx *x = &r->ctxs[i];
+    x->c->status = (enum mrb_fiber_state)x->status;
+    x->c->vmexec = (x->flags & 1) ? TRUE : FALSE;
+    x->c->prev = x->prev ? r->ctxs[x->prev - 1].c : NULL;
+    x->c->fib = (struct RFiber*)x->fib;
+  }
+  for (size_t i = 0; i < r->nsfib; i++) r->sfibs[i].f->cxt = r->ctxs[r->sfibs[i].ctx - 1].c;
   for (size_t i = 0; i < r->nsenv; i++) {
-    if (r->senvs[i].off >= size) { rfail(r, "env stack offset out of range"); break; }
+    struct mrb_context *c = r->ctxs[r->senvs[i].ctx - 1].c;
+    r->senvs[i].e->cxt = c;
     r->senvs[i].e->stack = c->stbase + r->senvs[i].off;
   }
+  mrb_free(mrb, owner);
+
+  /* the clock goes on from the writer's: the program may hold ticks (a
+     Task::Queue#pop deadline, Task.tick); what a wait has left is the same */
+  uint32_t now = conv_ticks(tick, unit);
+  mrb->task.tick = now;
+  mrb->task.wakeup_tick = has_wakeup ? mrb_task_normalize_wakeup(now + (uint32_t)conv_remaining(wakeup, unit)) : UINT32_MAX;
+
+  /* the queues, in their order */
+  mrb_task *last[MRB_NUM_TASK_QUEUE] = { NULL, NULL, NULL, NULL };
+  for (int q = 0; q < MRB_NUM_TASK_QUEUE; q++) mrb->task.queues[q] = NULL;
+  for (uint32_t i = 0; i < r->ntask; i++) {
+    rtask *rt = &r->tasks[i];
+    mrb_task *t = rt->t;
+    if (rt->reason == MRB_TASK_REASON_SLEEP) {
+      t->wait.wakeup_tick = mrb_task_normalize_wakeup(now + (uint32_t)conv_remaining(rt->remaining, unit));
+    }
+    else if (rt->reason == MRB_TASK_REASON_JOIN) {
+      t->wait.join = rt->join ? r->tasks[rt->join - 1].t : NULL;
+    }
+    else if (rt->reason == MRB_TASK_REASON_QUEUE) {
+      t->wait.queue.target = rt->queue_obj ? (struct mrb_task_queue*)DATA_PTR(mrb_obj_value(rt->queue_obj)) : NULL;
+      t->wait.queue.wakeup_tick = rt->has_deadline ?
+        mrb_task_normalize_wakeup(now + (uint32_t)conv_remaining(rt->remaining, unit)) : UINT32_MAX;
+    }
+    if (rt->queue == 255) {
+      mrb->task.main_task = t;
+      if (mrb_nil_p(t->name)) t->name = mrb_str_new_cstr(mrb, "main");
+    }
+    else {
+      t->next = NULL;
+      if (last[rt->queue]) last[rt->queue]->next = t;
+      else mrb->task.queues[rt->queue] = t;
+      last[rt->queue] = t;
+    }
+    mrb_gc_register(mrb, t->self);
+  }
+  mrb->task.switching = FALSE;
+  mrb->task.loop_running = FALSE;
+
+  /* what mrb_checkpoint_continue starts again */
+  r->G->plan.set = 1;
+  r->G->plan.current = r->ctxs[current - 1].c;
+  r->G->plan.task = running ? r->tasks[running - 1].t : NULL;
+  r->G->plan.switch_pending = switch_pending;
+  r->G->plan.loop_running = loop_running;
+  r->G->host_task = host ? r->tasks[host - 1].t : NULL;
 }
 
 /* line numbers of carried ireps (section 13) */
@@ -1131,6 +1469,15 @@ reader_free(reader *r)
   mrb_free(mrb, r->dfix);
   mrb_free(mrb, r->pre);
   mrb_free(mrb, r->fl);
+  mrb_free(mrb, r->sfibs);
+  mrb_free(mrb, r->task_of_obj);
+  for (uint32_t i = 0; r->ctxs && i < r->nctx; i++) {
+    mrb_free(mrb, r->ctxs[i].vals);
+    mrb_free(mrb, r->ctxs[i].frames);
+    mrb_free(mrb, r->ctxs[i].offs);
+  }
+  mrb_free(mrb, r->ctxs);
+  mrb_free(mrb, r->tasks);
 }
 
 MRB_API void
@@ -1148,6 +1495,10 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
   if (mrb->c != mrb->root_c || mrb->c->ci != mrb->c->cibase) {
     mrb_raise(mrb, eCheckpoint, "restore needs an idle root context");
   }
+  for (int q = 0; q < MRB_NUM_TASK_QUEUE; q++) {
+    if (mrb->task.queues[q]) mrb_raise(mrb, eCheckpoint, "restore needs a state without Tasks");
+  }
+  memset(&r.G->plan, 0, sizeof(r.G->plan));
 
   /* header */
   if (!need(&r, 6) || memcmp(r.p, CHECKPOINT_MAGIC, 4) != 0) mrb_raise(mrb, eCheckpoint, "not a checkpoint image");
@@ -1312,6 +1663,8 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     }
     /* leave the root context idle again */
     mrb->root_c->ci = mrb->root_c->cibase;
+    memset(&r.G->plan, 0, sizeof(r.G->plan));
+    r.G->host_task = NULL;
     char msg[600];
     snprintf(msg, sizeof(msg), "restore failed: %s", r.err);
     reader_free(&r);
@@ -1341,17 +1694,6 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     mrb->gc.sched_driven = (gcs.flags & 8) != 0;
     mrb->gc.disabled = (gcs.flags & 1) != 0;
   }
-}
-
-MRB_API mrb_value
-mrb_checkpoint_continue(mrb_state *mrb)
-{
-  mrb_callinfo *top = mrb->root_c->ci;
-  if (top == mrb->root_c->cibase && !top->proc) {
-    mrb_raise(mrb, mrb_class_get_under(mrb, mrb_module_get(mrb, "Checkpoint"), "Error"),
-              "nothing restored");
-  }
-  return mrb_vm_exec(mrb, top->proc, top->pc);
 }
 
 MRB_API mrb_value

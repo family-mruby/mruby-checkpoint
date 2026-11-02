@@ -437,3 +437,22 @@ checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint
   mrb_free(mrb, cache);
   mrb_free(mrb, covered);
 }
+
+/* The instruction that ends at byte pos (a caller's pc right after a call):
+   its start, opcode and operands. 0 if no instruction ends there. */
+int
+checkpoint_insn_ending_at(const mrb_irep *irep, uint32_t pos, uint32_t *start, uint8_t *op,
+                          uint32_t *a, uint32_t *b, uint32_t *c)
+{
+  uint32_t p = 0;
+  linsn in;
+  while (p < pos) {
+    if (!decode(irep, p, &in)) return 0;
+    if (in.end == pos) {
+      *start = in.pos; *op = in.op; *a = in.a; *b = in.b; *c = in.c;
+      return 1;
+    }
+    p = in.end;
+  }
+  return 0;
+}

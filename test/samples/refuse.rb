@@ -1,7 +1,10 @@
 # checkpoint-test: refuse
-# The state holds what format v0 cannot carry: an open file (a resource of
-# this process) and a running Fiber. The suspend is refused with the reason
-# (Checkpoint::Error), nothing is written and the program goes on.
+# checkpoint-test: no-as-task
+# The state holds what cannot be carried: an open file (a resource of this
+# process), and a suspend inside a block that a C function (Array#sort) calls,
+# here inside a Fiber, whose C frame cannot be carried. The suspend is refused
+# with the reason (Checkpoint::Error), nothing is written and the program
+# goes on. (Only as the top-level program: the reason names the context.)
 t = File.open(__FILE__)
 begin
   Checkpoint.suspend("x.ckpt")
@@ -13,10 +16,13 @@ t.close
 t = nil
 
 f = Fiber.new do
-  begin
-    Checkpoint.suspend("x.ckpt")
-  rescue Checkpoint::Error => e
-    puts "refused in fiber: #{e.message}"
+  [2, 1].sort do |a, b|
+    begin
+      Checkpoint.suspend("x.ckpt")
+    rescue Checkpoint::Error => e
+      puts "refused in fiber: #{e.message}"
+    end
+    a <=> b
   end
   :fiber_done
 end

@@ -36,7 +36,17 @@
 # with `rake sabiruby`). Without one, or with one built without the feature, these checks
 # are skipped and the run says so.
 #
+# Every sample runs in the two start shapes: as the top-level program, and as a
+# Task (checkpoint run --as-task: the program is made a Task and the
+# scheduler runs, the way Family mruby starts an application). Both must
+# print NAME.out; the images of one shape are resumed as they are (resume
+# takes no shape).
+#
 # Annotations in the sample (lines "# checkpoint-test: ..."):
+#   clock virtual         run with the test builds (build/fuzz), whose mruby-task
+#                         clock is virtual (the same ticks in every run); for
+#                         samples whose output depends on when Tasks wake
+#   no-as-task            only as the top-level program
 #   suspend-after "LINE"  the first process's output must end with LINE
 #                         (the suspend happened right there)
 #   save-after "LINE"     a save sample; the save happens right after LINE
@@ -58,12 +68,20 @@ CHECKPOINT = {
   '32' => File.join(ROOT, 'build/mruby/host32/bin/checkpoint'),
 }
 CHECKPOINT.each_value { |b| abort "missing #{b}" unless File.exist?(b) }
+VIRTUAL = {
+  '64' => File.join(ROOT, 'build/fuzz/host/bin/checkpoint'),
+  '32' => File.join(ROOT, 'build/fuzz/host32/bin/checkpoint'),
+}
+VIRTUAL.each_value { |b| abort "missing #{b} (rake build:fuzz)" unless File.exist?(b) }
+$bins = CHECKPOINT
+$as_task = false
 
 bless = ARGV.delete('--bless')
 samples = ARGV.empty? ? Dir[File.join(ROOT, 'test/samples/*.rb')].sort : ARGV.map { |a| File.expand_path(a) }
 
 def run(arch, *args, dir:)
-  out, err, st = Open3.capture3(CHECKPOINT.fetch(arch), *args, chdir: dir)
+  args = [args[0], '--as-task', *args[1..]] if $as_task && args[0] == 'run'
+  out, err, st = Open3.capture3($bins.fetch(arch), *args, chdir: dir)
   [out, err, st.exitstatus]
 end
 
@@ -91,16 +109,20 @@ def diff(a, b)
   i ? "line #{i + 1}: expected #{la[i].inspect}, got #{lb[i].inspect}" : 'same'
 end
 
-samples.each do |path|
+samples.product([false, true]).each do |path, as_task|
   name = File.basename(path, '.rb')
   src = File.read(path)
   ann = src.lines.grep(/^# checkpoint-test:/).map { |l| l.sub(/^# checkpoint-test:\s*/, '').strip }
+  next if as_task && ann.include?('no-as-task')
+  $as_task = as_task
+  $bins = ann.include?('clock virtual') ? VIRTUAL : CHECKPOINT
+  blessing = bless && !as_task   # the golden files come from the top-level shape
   refuse = ann.include?('refuse')
   suspend_after = ann.map { |a| a[/\Asuspend-after "(.*)"\z/, 1] }.compact.first
   save_after = ann.map { |a| a[/\Asave-after "(.*)"\z/, 1] }.compact.first
   golden_path = path.sub(/\.rb\z/, '.out')
   resumed_path = path.sub(/\.rb\z/, '.resumed.out')
-  puts "#{name}:"
+  puts "#{name}#{as_task ? ' (as a Task)' : ''}#{$bins.equal?(VIRTUAL) ? ' [virtual clock]' : ''}:"
 
   Dir.mktmpdir('checkpoint-test') do |dir|
     FileUtils.cp(path, dir)
@@ -113,7 +135,7 @@ samples.each do |path|
     check('reference 32 = 64', ref32 == ref && st32 == 0, err32 + diff(ref, ref32))
 
     if refuse
-      if bless
+      if blessing
         out, = run('64', 'run', '--out', img, file, dir: dir)
         File.write(golden_path, out)
       end
@@ -128,7 +150,7 @@ samples.each do |path|
       next
     end
 
-    File.write(golden_path, ref) if bless
+    File.write(golden_path, ref) if blessing
     golden = File.exist?(golden_path) ? File.read(golden_path) : nil
     check('reference = golden', golden == ref, golden ? diff(golden, ref) : 'no golden file')
 
@@ -136,7 +158,7 @@ samples.each do |path|
       at = ref.lines.index { |l| l.chomp == save_after }
       check("reference has the line #{save_after.inspect}", at)
       next unless at
-      if bless
+      if blessing
         FileUtils.rm_f(img)
         run('64', 'run', '--out', img, file, dir: dir)
         out, = run('64', 'resume', img, dir: dir)

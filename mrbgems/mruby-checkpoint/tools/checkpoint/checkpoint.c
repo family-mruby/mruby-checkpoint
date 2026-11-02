@@ -1,7 +1,7 @@
 /*
 ** checkpoint - run a Ruby program that may save or suspend, or resume an image
 **
-**   checkpoint run [--ignore] [--inproc] [--out FILE] prog.rb
+**   checkpoint run [--ignore] [--inproc] [--as-task] [--out FILE] prog.rb
 **       Runs prog.rb. Checkpoint.save(path) writes the state to path (or
 **       FILE) and goes on; Checkpoint.suspend(path) writes it and ends the
 **       process (status 0).
@@ -10,6 +10,11 @@
 **                 process: after a suspend the program goes on there; after
 **                 a save the restored program runs to its end first, then
 **                 the saving program goes on
+**       --as-task the start of a Family mruby application: the program is
+**                 compiled, made a Task (mrb_create_task, named after the
+**                 file) and the scheduler runs (mrb_task_run) until every
+**                 Task is done. An exception the program does not rescue
+**                 becomes the Task's value; it is printed as the error.
 **   checkpoint resume [--inproc] [--out FILE] image
 **       Restores image in a new process and continues from the line after
 **       the save / suspend.
@@ -31,6 +36,37 @@
 #include <mruby/array.h>
 #include <mruby/variable.h>
 #include <mruby/checkpoint.h>
+#include <mruby/proc.h>
+
+#include <mruby/gc.h>
+#include "task.h"
+
+/* mruby-task with mruby-fiber (f56d44ecc): Fiber.current inside a Task (as
+   Enumerator#next does) makes a Fiber whose context is the one embedded in
+   the Task's struct, and mrb_close frees a Fiber's context, that is, an
+   address inside the Task (free(): invalid pointer at the end of such a run,
+   with checkpoints or without). Such a Fiber is let go of its context
+   before the state is closed. */
+static int
+detach_cb(mrb_state *mrb, struct RBasic *obj, void *ud)
+{
+  (void)ud;
+  if (obj->tt != MRB_TT_FIBER) return MRB_EACH_OBJ_OK;
+  struct RFiber *f = (struct RFiber*)obj;
+  for (int q = 0; f->cxt && q < 4; q++) {
+    for (mrb_task *t = mrb->task.queues[q]; t; t = t->next) {
+      if (f->cxt == &t->c) { f->cxt = NULL; break; }
+    }
+  }
+  return MRB_EACH_OBJ_OK;
+}
+
+static void
+close_state(mrb_state *mrb)
+{
+  mrb_objspace_each_objects(mrb, detach_cb, NULL);
+  mrb_close(mrb);
+}
 
 static void
 print_name(const char *name, int is_func, void *ud)
@@ -43,7 +79,7 @@ static int
 usage(void)
 {
   fprintf(stderr,
-          "usage: checkpoint run [--ignore] [--inproc] [--out FILE] prog.rb\n"
+          "usage: checkpoint run [--ignore] [--inproc] [--as-task] [--out FILE] prog.rb\n"
           "       checkpoint resume [--inproc] [--out FILE] image\n"
           "       checkpoint names\n");
   return 2;
@@ -89,6 +125,20 @@ open_state(void)
   return mrb;
 }
 
+/* the host's Task ended with an exception: print it as the error */
+static int
+host_task_status(mrb_state *mrb)
+{
+  mrb_value t = mrb_checkpoint_host_task(mrb);
+  if (mrb_nil_p(t)) return 0;
+  mrb_value v = mrb_funcall(mrb, t, "value", 0);
+  if (!mrb_obj_is_kind_of(mrb, v, mrb->eException_class)) return 0;
+  mrb->exc = mrb_obj_ptr(v);
+  mrb_print_error(mrb);
+  mrb->exc = NULL;
+  return 1;
+}
+
 /* restore into a fresh state and run to the end; returns the exit status */
 static int
 resume_run(const uint8_t *buf, size_t len)
@@ -116,8 +166,11 @@ resume_run(const uint8_t *buf, size_t len)
     mrb_print_error(mrb);
     status = 1;
   }
+  else {
+    status = host_task_status(mrb);
+  }
   fflush(stdout);
-  mrb_close(mrb);
+  close_state(mrb);
   return status;
 }
 
@@ -144,7 +197,7 @@ inproc_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path,
 int
 main(int argc, char **argv)
 {
-  int ignore = 0;
+  int ignore = 0, as_task = 0;
   const char *file = NULL;
 
   if (argc < 2) return usage();
@@ -153,11 +206,12 @@ main(int argc, char **argv)
     if (argc != 2) return usage();
     mrb_state *mrb = open_state();
     mrb_checkpoint_each_name(mrb, print_name, NULL);
-    mrb_close(mrb);
+    close_state(mrb);
     return 0;
   }
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--ignore") == 0) ignore = 1;
+    else if (strcmp(argv[i], "--as-task") == 0) as_task = 1;
     else if (strcmp(argv[i], "--inproc") == 0) inproc = 1;
     else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_override = argv[++i];
     else if (argv[i][0] == '-') return usage();
@@ -170,7 +224,7 @@ main(int argc, char **argv)
     size_t len;
     uint8_t *buf = read_file(file, &len);
     if (!buf) { fprintf(stderr, "checkpoint: cannot read %s\n", file); return 2; }
-    if (ignore) return usage();
+    if (ignore || as_task) return usage();
     int status = resume_run(buf, len);
     free(buf);
     return status;
@@ -186,15 +240,39 @@ main(int argc, char **argv)
 
   mrb_ccontext *c = mrb_ccontext_new(mrb);
   mrb_ccontext_filename(mrb, c, file);
-  mrb_load_file_cxt(mrb, fp, c);
-  fclose(fp);
   int status = 0;
-  if (mrb->exc) {
-    mrb_print_error(mrb);
-    status = 1;
+  if (as_task) {
+    /* compiled only; the scheduler runs it as a Task */
+    c->no_exec = TRUE;
+    mrb_value proc = mrb_load_file_cxt(mrb, fp, c);
+    fclose(fp);
+    if (mrb->exc) {
+      mrb_print_error(mrb);
+      status = 1;
+    }
+    else {
+      const char *base = strrchr(file, '/');
+      mrb_value task = mrb_create_task(mrb, mrb_proc_ptr(proc), mrb_str_new_cstr(mrb, base ? base + 1 : file),
+                                       mrb_nil_value(), mrb_nil_value());
+      mrb_checkpoint_set_host_task(mrb, task);
+      mrb_task_run(mrb);
+      if (mrb->exc) {
+        mrb_print_error(mrb);
+        status = 1;
+      }
+      else status = host_task_status(mrb);
+    }
+  }
+  else {
+    mrb_load_file_cxt(mrb, fp, c);
+    fclose(fp);
+    if (mrb->exc) {
+      mrb_print_error(mrb);
+      status = 1;
+    }
   }
   mrb_ccontext_free(mrb, c);
   fflush(stdout);
-  mrb_close(mrb);
+  close_state(mrb);
   return status;
 }

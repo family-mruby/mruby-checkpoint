@@ -12,13 +12,19 @@
 ** The trigger: the VM's per-instruction hook (code_fetch_hook, from
 ** MRB_USE_DEBUG_HOOK) counts the fetched instructions. At pseudo-random
 ** counts (gaps uniform in 1..2*mean from a seed) it calls
-** mrb_checkpoint_request(): the program is not involved and calls no
-** Checkpoint method. The request is written at the next safe point (the
-** instruction boundary right after, unless that instruction entered a block
-** called from C). The image is then restored into a fresh mrb_state, the old
-** state is closed, and the program goes on in the new one; every --xproc-th
-** image instead goes on in another process (the --peer binaries in turn,
-** e.g. the 32-bit build), which carries on the same schedule.
+** mrb_checkpoint_request_here() before the instruction runs: the program is
+** not involved and calls no Checkpoint method. The image is of that very
+** boundary when it is a safe point (else of the first safe point after: an
+** exception in flight). The image is then restored into a fresh mrb_state,
+** the old state is closed, and the program goes on in the new one, with the
+** instruction of that boundary; every --xproc-th image instead goes on in
+** another process (the --peer binaries in turn, e.g. the 32-bit build),
+** which carries on the same schedule.
+**
+** The clock of mruby-task is the virtual one of the test builds
+** (hal-task-virtual): it moves when the scheduler is idle or the root
+** sleeps, and with --quantum N also once every N instructions (counted like
+** the trigger points, across states and processes), which ends timeslices.
 **
 ** Options:
 **   --seed N        seed of the schedule (default 1)
@@ -35,6 +41,11 @@
 **   --keep-dead     write dead registers as they are (no liveness pass)
 **   --tmp DIR       where images for another process go (default /tmp)
 **   --suspend FILE  write the first image to FILE and end (for another VM)
+**   --as-task       run the program as a Task (mrb_create_task + mrb_task_run),
+**                   the way Family mruby starts an application
+**   --quantum N     one tick of mruby-task's clock every N instructions
+**   --keep-timeslice  the restored running Task keeps what was left of its
+**                   timeslice (mrb_checkpoint_keep_timeslice)
 **
 ** Log lines:  P <k> <icount> <outcome> [detail]   one per trigger point
 **             (icount: where the request was made; --at reproduces it)
@@ -63,8 +74,16 @@
 #include <mruby/variable.h>
 #include <mruby/irep.h>
 #include <mruby/checkpoint.h>
+#include <mruby/proc.h>
 
 void checkpoint_fuzz_test_env(mrb_state *mrb, const char *gemname);
+/* mruby-task (include/task.h) */
+MRB_API mrb_value mrb_create_task(mrb_state *mrb, struct RProc *proc, mrb_value name, mrb_value priority, mrb_value top_self);
+MRB_API mrb_value mrb_task_run(mrb_state *mrb);
+MRB_API void mrb_tick(mrb_state *mrb);
+#include "task.h"
+#include <mruby/gc.h>
+static struct mrb_context *task_context(struct mrb_task *t) { return &t->c; }
 
 /* ---- options and the schedule ---- */
 
@@ -81,6 +100,9 @@ static const char *opt_images = NULL;
 static int opt_keep_dead = 0;
 static const char *opt_suspend = NULL;  /* write the first image there and end the process */
 static const char *opt_tmp = "/tmp";
+static int opt_as_task = 0;
+static uint64_t opt_quantum = 0;
+static int opt_keep_timeslice = 0;
 static char **saved_argv;
 
 static uint64_t rng;          /* xorshift64* state */
@@ -143,22 +165,29 @@ fetch_hook(mrb_state *mrb, const struct mrb_irep *irep, const mrb_code *pc, mrb_
 {
   (void)irep; (void)pc; (void)regs;
   if (hop_ready) {
-    /* the image was written at the boundary just passed: nothing of this
-       instruction has run; it runs first in the new state */
+    /* the image is of this boundary (or was written at the safe point just
+       passed): nothing of this instruction has run; it runs first, and is
+       counted, in the new state */
     longjmp(hop_jmp, 1);
   }
-  icount++;
-  if (icount != next_at) return;
-  npoints++;
-  enum mrb_checkpoint_req r = mrb_checkpoint_request(mrb);
-  if (r != MRB_CHECKPOINT_REQ_OK) {
-    static const char *why[] = { "ok", "not_ready", "fiber", "c_boundary", "tasks", "pending", "exception" };
-    logline("P %llu %llu req %s\n", (unsigned long long)npoints, (unsigned long long)icount,
-            (unsigned)r < sizeof(why) / sizeof(why[0]) ? why[r] : "?");
+  if (icount + 1 == next_at) {
+    /* point k is the boundary before instruction k */
+    npoints++;
+    hop_point = npoints;
+    hop_req_at = icount + 1;
+    enum mrb_checkpoint_req r = mrb_checkpoint_request_here(mrb);
+    if (r != MRB_CHECKPOINT_REQ_OK) {
+      static const char *why[] = { "ok", "not_ready", "fiber", "c_boundary", "tasks", "pending", "exception" };
+      logline("P %llu %llu req %s\n", (unsigned long long)npoints, (unsigned long long)(icount + 1),
+              (unsigned)r < sizeof(why) / sizeof(why[0]) ? why[r] : "?");
+    }
+    icount++;
+    schedule_next();
+    icount--;
+    if (hop_ready) longjmp(hop_jmp, 1);
   }
-  hop_point = npoints;
-  if (r == MRB_CHECKPOINT_REQ_OK) hop_req_at = icount;
-  schedule_next();
+  icount++;
+  if (opt_quantum && icount % opt_quantum == 0) mrb_tick(mrb);
 }
 
 static void
@@ -199,7 +228,7 @@ image_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path,
     FILE *fp = fopen(opt_suspend, "wb");
     if (!fp || fwrite(buf, 1, len, fp) != len || fclose(fp) != 0) { fprintf(stderr, "checkpoint-fuzz: cannot write %s\n", opt_suspend); exit(2); }
     logline("P %llu %llu ok %zu %u suspend written-at %llu\n", (unsigned long long)hop_point,
-            (unsigned long long)hop_req_at, len, mrb_checkpoint_last_dead(mrb), (unsigned long long)icount);
+            (unsigned long long)hop_req_at, len, mrb_checkpoint_last_dead(mrb), (unsigned long long)icount + 1);
     fflush(stdout);
     _exit(0);
   }
@@ -220,7 +249,7 @@ image_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path,
   hop_ready = 1;
   logline("P %llu %llu ok %zu %u %s%s written-at %llu\n", (unsigned long long)hop_point,
           (unsigned long long)hop_req_at, len, dead, xproc ? "xproc:" : "inproc",
-          xproc ? opt_peers[peer_turn % opt_npeers] : "", (unsigned long long)icount);
+          xproc ? opt_peers[peer_turn % opt_npeers] : "", (unsigned long long)icount + 1);
 }
 
 /* ---- states ---- */
@@ -233,6 +262,34 @@ static uint16_t open_atexit;   /* atexit entries mrb_open made (the gems' finals
 static mrb_ccontext *prog_cxt;   /* the compile context of the program, while it runs */
 static mrb_state *prog_cxt_mrb;
 
+/* mruby-task with mruby-fiber (f56d44ecc): Fiber.current inside a Task makes
+   a Fiber whose context is the one embedded in the Task's struct, and
+   mrb_close frees a Fiber's context: it frees an address inside the Task
+   (seen with Enumerator#next in a Task, at the end of any such run). Such a
+   Fiber is let go of its context before the state is closed. This tool
+   closes states in the middle of the program (each hop), where the run
+   without checkpoints closes only at the end. */
+static int
+detach_cb(mrb_state *mrb, struct RBasic *obj, void *ud)
+{
+  (void)ud;
+  if (obj->tt != MRB_TT_FIBER) return MRB_EACH_OBJ_OK;
+  struct RFiber *f = (struct RFiber*)obj;
+  for (int q = 0; f->cxt && q < 4; q++) {
+    for (struct mrb_task *t = mrb->task.queues[q]; t; t = t->next) {
+      if (f->cxt == task_context(t)) { f->cxt = NULL; break; }
+    }
+  }
+  return MRB_EACH_OBJ_OK;
+}
+
+static void
+close_state(mrb_state *mrb)
+{
+  mrb_objspace_each_objects(mrb, detach_cb, NULL);
+  mrb_close(mrb);
+}
+
 static void
 abandon_state(mrb_state *mrb)
 {
@@ -241,7 +298,7 @@ abandon_state(mrb_state *mrb)
     prog_cxt = NULL;
   }
   if (mrb->atexit_stack_len > open_atexit) mrb->atexit_stack_len = open_atexit;
-  mrb_close(mrb);
+  close_state(mrb);
 }
 
 static mrb_state*
@@ -257,6 +314,7 @@ open_state(void)
   mrb_checkpoint_set_handler(mrb, image_handler, NULL);
   mrb_checkpoint_set_refusal_handler(mrb, refusal_handler, NULL);
   mrb_checkpoint_keep_dead_registers(mrb, opt_keep_dead);
+  mrb_checkpoint_keep_timeslice(mrb, opt_keep_timeslice);
   return mrb;
 }
 
@@ -273,6 +331,19 @@ finish(mrb_state *mrb, mrb_value r, mrb_bool error)
     mrb_print_error(mrb);
     status = 1;
   }
+  else {
+    /* --as-task: the program's Task ended with an exception */
+    mrb_value t = mrb_checkpoint_host_task(mrb);
+    if (!mrb_nil_p(t)) {
+      mrb_value v = mrb_funcall(mrb, t, "value", 0);
+      if (mrb_obj_is_kind_of(mrb, v, mrb->eException_class)) {
+        mrb->exc = mrb_obj_ptr(v);
+        mrb_print_error(mrb);
+        mrb->exc = NULL;
+        status = 1;
+      }
+    }
+  }
   fflush(stdout);
   return status;
 }
@@ -286,9 +357,17 @@ run_program(mrb_state *mrb, void *ud)
   mrb_ccontext *c = mrb_ccontext_new(mrb);
   prog_cxt = c; prog_cxt_mrb = mrb;
   mrb_ccontext_filename(mrb, c, p->name);
+  if (opt_as_task) c->no_exec = TRUE;
   mrb_value v = mrb_load_nstring_cxt(mrb, p->src, p->len, c);
   mrb_ccontext_free(mrb, c);
   prog_cxt = NULL;
+  if (opt_as_task && !mrb->exc) {
+    /* compiled only: the scheduler runs it as a Task */
+    mrb_value task = mrb_create_task(mrb, mrb_proc_ptr(v), mrb_str_new_cstr(mrb, "test"),
+                                     mrb_nil_value(), mrb_nil_value());
+    mrb_checkpoint_set_host_task(mrb, task);
+    v = mrb_task_run(mrb);
+  }
   if (mrb->exc) {
     mrb_value e = mrb_obj_value(mrb->exc);
     mrb->exc = NULL;
@@ -337,7 +416,7 @@ restore_state(const uint8_t *buf, size_t len)
             (unsigned long long)hop_req_at, msg);
     fprintf(stderr, "checkpoint-fuzz: restore failed at point %llu: %s\n",
             (unsigned long long)hop_point, msg);
-    mrb_close(mrb);
+    close_state(mrb);
     return NULL;
   }
   return mrb;
@@ -377,6 +456,11 @@ hop_xproc(void)
   if (opt_log) { args[n++] = "--log"; args[n++] = (char*)opt_log; }
   if (opt_images) { args[n++] = "--images"; args[n++] = (char*)opt_images; }
   if (opt_keep_dead) args[n++] = "--keep-dead";
+  if (opt_as_task) args[n++] = "--as-task";
+  if (opt_keep_timeslice) args[n++] = "--keep-timeslice";
+  if (opt_quantum) {
+    snprintf(num[4], 32, "%llu", (unsigned long long)opt_quantum); args[n++] = "--quantum"; args[n++] = num[4];
+  }
   args[n++] = "--tmp"; args[n++] = (char*)opt_tmp;
   args[n++] = "--resume"; args[n++] = img;
   args[n++] = "--state"; args[n++] = state;
@@ -393,7 +477,8 @@ hop_xproc(void)
   int st = 0;
   while (waitpid(pid, &st, 0) < 0) {}
   unlink(img);
-  _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 2);
+  /* the same status as if this process had gone on (a signal: 128 + it) */
+  _exit(WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 2);
 }
 
 /* run the program (or the restored state) to the end, hopping as the
@@ -411,7 +496,7 @@ drive(mrb_state *mrb_in, prog *p)
                           : mrb_protect_error(mrb, continue_program, NULL, &error);
       int status = finish(mrb, r, error);
       logline("E %llu %llu %d\n", (unsigned long long)icount, (unsigned long long)npoints, status);
-      mrb_close(mrb);
+      close_state(mrb);
       return status;
     }
     /* back from the old state, which is dropped */
@@ -485,6 +570,9 @@ main(int argc, char **argv)
     else if (strcmp(a, "--keep-dead") == 0) opt_keep_dead = 1;
     else if (strcmp(a, "--suspend") == 0) opt_suspend = ARG();
     else if (strcmp(a, "--tmp") == 0) opt_tmp = ARG();
+    else if (strcmp(a, "--as-task") == 0) opt_as_task = 1;
+    else if (strcmp(a, "--keep-timeslice") == 0) opt_keep_timeslice = 1;
+    else if (strcmp(a, "--quantum") == 0) opt_quantum = strtoull(ARG(), NULL, 10);
     else if (strcmp(a, "--assert") == 0) assert_rb = ARG();
     else if (strcmp(a, "--resume") == 0) resume = ARG();
     else if (strcmp(a, "--state") == 0) state = ARG();

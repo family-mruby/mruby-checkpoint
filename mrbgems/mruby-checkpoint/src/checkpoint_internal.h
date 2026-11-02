@@ -12,10 +12,10 @@
 #include <mruby/class.h>
 #include <mruby/checkpoint.h>
 
-/* ---- format constants (doc/format_v0.md) ---- */
+/* ---- format constants (doc/format_v1.md) ---- */
 
 #define CHECKPOINT_MAGIC "MRCK"
-#define CHECKPOINT_FORMAT_VERSION 0
+#define CHECKPOINT_FORMAT_VERSION 1
 
 /* value tags */
 enum {
@@ -33,7 +33,13 @@ enum {
   GK_BIGINT = 16, GK_STRUCT = 17, GK_SET = 18, GK_RATIONAL = 19, GK_COMPLEX = 20,
   GK_BREAK = 21, GK_RANDOM = 23, GK_ORIGIN = 24,
   GK_BSTRING = 25,   /* a String marked binary (String#b): like 3 */
+  /* v1 */
+  GK_TASK = 26,      /* a Task object: its record in the scheduler section */
+  GK_FIBER = 27,     /* a Fiber object: its execution context */
 };
+
+/* frame kinds (v1) */
+enum { GF_RUBY = 0, GF_CFUNC = 1 };
 
 /* irep record kinds */
 enum { GR_CARRIED = 0, GR_PERM = 1, GR_PERM_CARRIED = 2 };
@@ -210,6 +216,25 @@ typedef struct checkpoint_state {
   int keep_dead;              /* write dead registers too (no liveness pass) */
   char **fnames; mrb_func_t *funcs; int nfuncs;   /* mrb_checkpoint_register_func */
   uint32_t last_dead;         /* non-nil registers the last image wrote as nil */
+  /* v1: Tasks and Fibers */
+  struct mrb_context *ret_ctx;  /* the context of the save / suspend call */
+  int dump_switch;            /* the image is taken where the scheduler asked for a switch */
+  void *host_task;            /* the embedder's Task (mrb_checkpoint_set_host_task), an mrb_task */
+  const mrb_data_type *task_type;   /* mruby-task's (static there; probed) */
+  int keep_timeslice;         /* the running Task goes on with what was left of its timeslice */
+  /* the scheduler as the request found it (see mark_switch in checkpoint.c) */
+  int own_switch;             /* the request set task.switching (it was clear) */
+  void *snap_task;            /* the running Task then */
+  void **snap_wait; uint8_t *snap_reason; int nsnap_wait;   /* the waiting Tasks and why */
+  void **snap_ready; int nsnap_ready;                       /* the ready ones */
+  /* what mrb_checkpoint_continue starts again (set by the restore) */
+  struct checkpoint_resume_plan {
+    int set;
+    struct mrb_context *current;  /* the context that was running */
+    void *task;                   /* the Task that was running, an mrb_task (NULL: none) */
+    int switch_pending;           /* the scheduler had asked for a switch there */
+    int loop_running;             /* the scheduler's loop was running */
+  } plan;
 } checkpoint_state;
 
 checkpoint_state *checkpoint_get(mrb_state *mrb);
@@ -237,5 +262,16 @@ void checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots,
 
 /* dump: returns 0 on success; on failure fills err */
 int checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen);
+
+/* the instruction that ends at pos (checkpoint_live.c) */
+int checkpoint_insn_ending_at(const mrb_irep *irep, uint32_t pos, uint32_t *start, uint8_t *op,
+                              uint32_t *a, uint32_t *b, uint32_t *c);
+
+/* Tasks and Fibers (checkpoint_task.c) */
+int checkpoint_switch_func_name(const char *name, size_t len);
+const mrb_data_type *checkpoint_task_type(mrb_state *mrb);
+void checkpoint_task_register(mrb_state *mrb);
+struct mrb_task *checkpoint_task_of_context(mrb_state *mrb, struct mrb_context *c);
+struct mrb_task *checkpoint_running_task(mrb_state *mrb);
 
 #endif

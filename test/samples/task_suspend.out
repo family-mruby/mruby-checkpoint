@@ -1,0 +1,9 @@
+worker 0
+worker 1
+worker 2
+suspended: SUSPENDED SUSPENDED
+boss resumes them
+worker 3
+worker 4
+sleeper woke
+[:boss_done, :worker_done, :sleeper_done]

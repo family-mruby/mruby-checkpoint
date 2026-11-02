@@ -1,0 +1,16 @@
+fib 0 = 0
+fib 1 = 1
+fib 2 = 1
+fib 3 = 2
+fib 4 = 3
+fib 5 = 5
+fib 6 = 8
+fib 7 = 13
+square 1
+square 4
+square 9
+square 16
+square 25
+square 36
+fib then 21
+true

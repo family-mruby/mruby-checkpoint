@@ -10,7 +10,8 @@
 #                   SABIRUBY_DIR (a SabiRuby checkout); rake test then also resumes
 #                   every image on it (skipped, with a notice, without one)
 #   rake build:fuzz -- the test builds (build/fuzz): the external trigger
-#                   checkpoint-fuzz, never in the normal builds
+#                   checkpoint-fuzz and the virtual clock of mruby-task
+#                   (mrbgems/hal-task-virtual), never in the normal builds
 #   rake fuzz[seed,runs,points] -- mruby's test suite stopped from outside at random
 #                   safe points, compared with the run without (tools/fuzz.rb)
 #   rake fuzz:sabiruby[seed,points] -- a part of it resumed on SabiRuby
@@ -94,6 +95,12 @@ desc 'build the test builds with the external trigger (build/fuzz, 64-bit and 32
 task 'build:fuzz' do
   FileUtils.mkdir_p(BUILD)
   src = prepare_source('patched', PATCHES)
+  # mruby-task's POSIX timer left in the archive by a build from before the
+  # virtual clock (hal-task-virtual replaces it): the archive is made again
+  %w(host host32).each do |t|
+    lib = File.join(FUZZ_BUILD, t, 'lib', 'libmruby.a')
+    FileUtils.rm_f(lib) if File.exist?(lib) && `ar t #{lib}`.split.include?('task_hal.o')
+  end
   mruby_build(src, FUZZ_BUILD, 'CHECKPOINT_FUZZ' => '1')
   %w(host host32).each do |t|
     bin = File.join(FUZZ_BUILD, t, 'bin', 'checkpoint-fuzz')
@@ -104,14 +111,17 @@ end
 desc 'run the samples with and without checkpoints, and the short fuzz of the test suite'
 task :test => [:build, 'build:fuzz'] do
   ruby File.join(ROOT, 'tools/run_tests.rb')
-  # the short version: one fixed seed, about 30 points per test file
+  # the short version: one fixed seed, about 30 points per test file, as the
+  # top-level program and as a Task (the start of a Family mruby application)
   ruby File.join(ROOT, 'tools/fuzz.rb'), '--seeds', '1', '--points', '30', '--quiet'
+  ruby File.join(ROOT, 'tools/fuzz.rb'), '--seeds', '1', '--points', '30', '--quiet', '--as-task'
 end
 
-desc 'fuzz the test suite: rake fuzz[seed,runs,points] (defaults 1, 10, 200)'
+desc 'fuzz the test suite: rake fuzz[seed,runs,points] (defaults 1, 10, 200); FUZZ_ARGS="--as-task --quantum 300" adds options'
 task :fuzz, [:seed, :runs, :points] => 'build:fuzz' do |_, a|
   args = ['--seed-from', (a[:seed] || 1).to_s, '--runs', (a[:runs] || 10).to_s,
           '--points', (a[:points] || 200).to_s, '--isolate']
+  args += ENV['FUZZ_ARGS'].split if ENV['FUZZ_ARGS']
   args += ['--json', ENV['FUZZ_JSON']] if ENV['FUZZ_JSON']
   args += ['--table', ENV['FUZZ_TABLE']] if ENV['FUZZ_TABLE']
   ruby File.join(ROOT, 'tools/fuzz.rb'), *args

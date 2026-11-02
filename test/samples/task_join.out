@@ -1,0 +1,10 @@
+worker 1 step 0
+worker 2 step 0
+worker 1 step 1
+worker 2 step 1
+worker 1 step 2
+worker 2 step 2
+worker 1 ended with 10
+worker 2 ended with 20
+30
+[:DORMANT, :DORMANT]

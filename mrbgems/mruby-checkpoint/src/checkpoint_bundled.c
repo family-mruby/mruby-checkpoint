@@ -1,6 +1,6 @@
 /*
 ** checkpoint_bundled.c - checkpoint data entries for the C data of mruby's
-** bundled gems (format v0, section 7, kind 14)
+** bundled gems (format v1, section 7, kind 14)
 **
 ** Registered by mrb_checkpoint_baseline() for the gems the build has (found
 ** at run time: no link dependency). The gems keep their structs and data

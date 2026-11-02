@@ -1,13 +1,15 @@
 /*
-** checkpoint_dump.c - write the running state as a logical graph (format v0)
+** checkpoint_dump.c - write the running state as a logical graph (format v1)
 **
 ** Called at a safe point (see patches/0001-vm-safepoint-hook.patch): every
 ** frame's pc and registers are in memory, no exception is in flight and no
-** C function is between the root frame and the current one.
+** C function is between the base frame and the current one.
 **
-** Roots are the VM (the root context's stack and call frames) and the
-** changes made to permanent objects since the baseline (methods, ivars and
-** constants of permanent classes, ivars of top_self, globals).
+** Roots are the VM (every execution context: the root, each Task's, each
+** Fiber's, with their stacks and call frames), the scheduler (the Tasks in
+** their queues, the clock) and the changes made to permanent objects since
+** the baseline (methods, ivars and constants of permanent classes, ivars of
+** top_self, globals).
 */
 
 #include <stdio.h>
@@ -26,6 +28,7 @@
 #include <mruby/debug.h>
 #include <mruby/numeric.h>
 #include "checkpoint_internal.h"
+#include "task.h"
 
 typedef struct {
   mrb_state *mrb;
@@ -37,6 +40,15 @@ typedef struct {
   pmap body;        /* permanent Procs a frame runs: their irep is carried too */
   struct RBasic **oq; char **olabel; size_t oq_cap;
   const mrb_irep **iq; size_t iq_cap;
+  /* execution contexts (v1): numbered as they are reached, the root first */
+  gbuf ctxs, sched;
+  pmap ctxid;
+  struct mrb_context **cq; size_t cq_cap; uint32_t nctx;
+  /* the Tasks: the queues in order, then the main Task (Task.current at the root) */
+  mrb_task **tq; uint32_t ntask;
+  pmap taskid;
+  pmap queues;      /* Task::Queue struct -> index + 1 in qobj (only when a Task waits on one) */
+  struct RBasic **qobj; uint32_t nqobj, qobj_cap;
   int failed;
   char *err; size_t errlen;
 } dumper;
@@ -122,6 +134,22 @@ obj_ref(dumper *d, const void *p, const char *label)
   d->olabel[id - 1] = (char*)mrb_malloc(d->mrb, n + 1);
   memcpy(d->olabel[id - 1], label, n + 1);
   pm_put(d->mrb, &d->objid, p, id);
+  return id;
+}
+
+static uint32_t
+ctx_ref(dumper *d, struct mrb_context *c)
+{
+  uint32_t id;
+  if (!c) return 0;
+  if (pm_get(&d->ctxid, c, &id)) return id;
+  id = ++d->nctx;
+  if (id > d->cq_cap) {
+    d->cq_cap = d->cq_cap ? d->cq_cap * 2 : 16;
+    d->cq = (struct mrb_context**)mrb_realloc(d->mrb, d->cq, sizeof(void*) * d->cq_cap);
+  }
+  d->cq[id - 1] = c;
+  pm_put(d->mrb, &d->ctxid, c, id);
   return id;
 }
 
@@ -250,9 +278,10 @@ data_ent(checkpoint_state *G, const mrb_data_type *t)
 }
 
 static mrb_callinfo*
-frame_with_env(mrb_state *mrb, struct REnv *e)
+frame_with_env(struct mrb_context *c, struct REnv *e)
 {
-  for (mrb_callinfo *ci = mrb->c->cibase; ci <= mrb->c->ci; ci++) {
+  if (!c->cibase || !c->ci) return NULL;
+  for (mrb_callinfo *ci = c->cibase; ci <= c->ci; ci++) {
     if (mrb_vm_ci_env(ci) == e) return ci;
   }
   return NULL;
@@ -409,7 +438,7 @@ w_object(dumper *d, uint32_t id)
     gb_u32(mrb, b, obj_ref(d, c->super, label));
     uint8_t it = inst_type(MRB_INSTANCE_TT(c));
     if (it == GI_OTHER) {
-      fail(d, "class %s makes instances of type %s, not in format v0 (%s)",
+      fail(d, "class %s makes instances of type %s, not in format v1 (%s)",
            class_name(mrb, c), type_name(MRB_INSTANCE_TT(c)), reach);
     }
     gb_u8(mrb, b, it);
@@ -505,15 +534,18 @@ w_object(dumper *d, uint32_t id)
     gb_u8(mrb, b, (uint8_t)MRB_ENV_BIDX(e));
     gb_u8(mrb, b, (uint8_t)((e->flags >> 16) & 0xf));
     if (MRB_ENV_ONSTACK_P(e)) {
-      struct mrb_context *c = mrb->c;
-      if (e->cxt != c || e->stack < c->stbase || e->stack >= c->stend) {
-        fail(d, "env shared with another context (%s)", reach);
+      /* the registers of a frame still running in some context: the
+         context and the position in its stack */
+      struct mrb_context *c = e->cxt;
+      if (!c || !c->stbase || e->stack < c->stbase || e->stack >= c->stend) {
+        fail(d, "env on the stack of no live context (%s)", reach);
       }
-      else if (!frame_with_env(mrb, e)) {
+      else if (!frame_with_env(c, e)) {
         fail(d, "env on the stack without a frame (%s)", reach);
       }
       gb_u8(mrb, b, 1);
-      gb_u32(mrb, b, (uint32_t)(e->stack - c->stbase));
+      gb_u32(mrb, b, ctx_ref(d, c));
+      gb_u32(mrb, b, c && c->stbase ? (uint32_t)(e->stack - c->stbase) : 0);
     }
     else {
       gb_u8(mrb, b, 0);
@@ -538,7 +570,7 @@ w_object(dumper *d, uint32_t id)
 
   case MRB_TT_ISTRUCT: {
     if (!is_random(mrb, o)) {
-      fail(d, "type istruct (class %s) is not in format v0 (%s)", class_name(mrb, o->c), reach);
+      fail(d, "type istruct (class %s) is not in format v1 (%s)", class_name(mrb, o->c), reach);
       gb_u8(mrb, b, GK_PERM); gb_str(mrb, b, "", 0);
       break;
     }
@@ -624,8 +656,28 @@ w_object(dumper *d, uint32_t id)
     break;
   }
 
+  case MRB_TT_FIBER: {
+    /* its execution context, in the context table */
+    struct RFiber *f = (struct RFiber*)o;
+    HEADER(GK_FIBER);
+    gb_u32(mrb, b, ctx_ref(d, f->cxt));
+    break;
+  }
+
   case MRB_TT_CDATA: {
     struct RData *rd = (struct RData*)o;
+    if (rd->type && strcmp(rd->type->struct_name, "Task") == 0 &&
+        mrb_obj_is_kind_of(mrb, mrb_obj_value(o), mrb_class_get(mrb, "Task"))) {
+      /* a Task: its record in the scheduler section */
+      uint32_t ti = 0;
+      if (!rd->data || !pm_get(&d->taskid, rd->data, &ti)) {
+        fail(d, "a Task that is in no queue of the scheduler (%s)", reach);
+      }
+      HEADER(GK_TASK);
+      gb_u32(mrb, b, ti);
+      w_ivars(d, b, o, id);
+      break;
+    }
     if (!rd->type && !rd->data) {
       /* allocated, not initialized yet (Regexp.allocate ...): no type, no
          pointer; carried as such (type name "") */
@@ -655,7 +707,7 @@ w_object(dumper *d, uint32_t id)
   }
 
   default:
-    fail(d, "type %s (class %s) is not in format v0 (%s)",
+    fail(d, "type %s (class %s) is not in format v1 (%s)",
          type_name(o->tt), class_name(mrb, o->c), reach);
     gb_u8(mrb, b, GK_PERM); gb_str(mrb, b, "", 0);
     break;
@@ -777,9 +829,14 @@ w_patches(dumper *d)
   checkpoint_perm *P = d->P;
   char label[200];
 
+  /* the C side's GC roots (mrb_gc_register: the Tasks, a host's own values)
+     are not the program's: the reader's scheduler and host register theirs */
+  mrb_sym gc_root = mrb_intern_lit(mrb, "_gc_root_");
+  mrb_value roots = mrb_gv_get(mrb, gc_root);
   for (uint32_t k = 0; k < P->nsnaps && !d->failed; k++) {
     gsnap *s = &P->snaps[k];
     struct RBasic *o = s->obj;
+    if (mrb_array_p(roots) && o == mrb_basic_ptr(roots)) continue;
     const char *name = checkpoint_perm_name_of(P, o);
     snprintf(label, sizeof(label), "permanent %s", name);
 
@@ -892,6 +949,7 @@ w_patches(dumper *d)
   checkpoint_collect_gv(mrb, &gv, &ngv);
   for (int i = 0; i < ngv; i++) {
     int j;
+    if (gv[i].sym == gc_root) continue;
     for (j = 0; j < P->ngv; j++) if (P->gv[j].sym == gv[i].sym) break;
     if (j < P->ngv && same_value(P->gv[j].val, gv[i].val)) continue;
     gb_u8(mrb, &d->patches, GP_GV_SET);
@@ -902,6 +960,7 @@ w_patches(dumper *d)
   }
   for (int j = 0; j < P->ngv; j++) {
     int i;
+    if (P->gv[j].sym == gc_root) continue;
     for (i = 0; i < ngv; i++) if (P->gv[j].sym == gv[i].sym) break;
     if (i < ngv) continue;
     gb_u8(mrb, &d->patches, GP_GV_REMOVE);
@@ -911,15 +970,76 @@ w_patches(dumper *d)
   mrb_free(mrb, gv);
 }
 
-/* ---- the VM ---- */
+/* ---- the VM: execution contexts ---- */
 
-static void
-w_vm(dumper *d)
+/* The C functions a frame may wait in: they only switch the context, and
+   the value they return is written by whoever switches back (Fiber#resume,
+   Fiber#transfer, Fiber.yield), or they are the scheduler's loop, which the
+   reader starts again from the state of the queues (Task.run, Task.pass). */
+static const char *const switch_funcs[] = {
+  "F:Fiber#resume", "F:Fiber#transfer", "F:S:Fiber#yield",
+  "F:S:Task#run", "F:S:Task#pass",
+};
+
+/* the name of the C function a frame runs (NULL when it has none) */
+static const char*
+cframe_func_name(dumper *d, struct mrb_context *c, mrb_callinfo *ci)
 {
   mrb_state *mrb = d->mrb;
-  struct mrb_context *c = mrb->c;
-  gbuf *b = &d->vm;
+  const struct RProc *p = ci->proc;
+  if (p && MRB_PROC_CFUNC_P(p)) return checkpoint_perm_func_name(d->P, p->body.func);
+  if (p || !ci->mid) return NULL;
+  /* a method stored as a function: found again from the receiver */
+  struct RClass *k = ci->stack < c->stend ? mrb_class(mrb, ci->stack[0]) : NULL;
+  if (!k) return NULL;
+  mrb_method_t m = mrb_method_search_vm(mrb, &k, ci->mid);
+  if (MRB_METHOD_UNDEF_P(m)) return NULL;
+  if (MRB_METHOD_FUNC_P(m)) return checkpoint_perm_func_name(d->P, MRB_METHOD_FUNC(m));
+  const struct RProc *mp = MRB_METHOD_PROC(m);
+  if (mp && MRB_PROC_CFUNC_P(mp)) return checkpoint_perm_func_name(d->P, mp->body.func);
+  return NULL;
+}
+
+static int
+switch_func_p(const char *name)
+{
+  if (!name) return 0;
+  for (size_t i = 0; i < sizeof(switch_funcs) / sizeof(switch_funcs[0]); i++) {
+    if (strcmp(name, switch_funcs[i]) == 0) return 1;
+  }
+  return 0;
+}
+
+/* a context with no frame: the root of a host that runs the scheduler
+   from C (mrb_task_run: the root is idle, its first frame is what the last
+   run at the top left there), or a finished Fiber */
+static int
+no_frames_p(mrb_state *mrb, struct mrb_context *c)
+{
+  if (!c->cibase || !c->ci) return 1;
+  if (c == mrb->root_c) return c != mrb->c && c->ci == c->cibase;
+  return 0;
+}
+
+static void
+w_context(dumper *d, uint32_t id)
+{
+  mrb_state *mrb = d->mrb;
+  struct mrb_context *c = d->cq[id - 1];
+  gbuf *b = &d->ctxs;
   char label[200];
+
+  gb_u8(mrb, b, (uint8_t)c->status);
+  gb_u8(mrb, b, c->vmexec ? 1 : 0);
+  gb_u32(mrb, b, ctx_ref(d, c->prev));
+  snprintf(label, sizeof(label), "fiber of context %u", id);
+  gb_u32(mrb, b, obj_ref(d, c->fib, label));
+
+  if (no_frames_p(mrb, c)) {
+    gb_u32(mrb, b, 0);   /* stack */
+    gb_u32(mrb, b, 0);   /* frames */
+    return;
+  }
 
   mrb_callinfo *top = c->ci;
   size_t live = (size_t)(top->stack - c->stbase) + (size_t)mrb_ci_nregs(top);
@@ -928,7 +1048,6 @@ w_vm(dumper *d)
   uint8_t *keep = (uint8_t*)mrb_malloc(mrb, live + 1);
   if (d->G->keep_dead) memset(keep, 1, live);
   else checkpoint_live_slots(mrb, c, live, keep);
-  d->G->last_dead = 0;
   gb_u32(mrb, b, (uint32_t)live);
   for (size_t i = 0; i < live; i++) {
     if (!keep[i]) {
@@ -936,7 +1055,7 @@ w_vm(dumper *d)
       gb_u8(mrb, b, GV_NIL);
       continue;
     }
-    snprintf(label, sizeof(label), "stack slot %d", (int)i);
+    snprintf(label, sizeof(label), "stack slot %d of context %u", (int)i, id);
     w_value(d, b, c->stbase[i], label);
   }
   mrb_free(mrb, keep);
@@ -946,35 +1065,60 @@ w_vm(dumper *d)
   for (uint32_t k = 0; k < nframes; k++) {
     mrb_callinfo *ci = c->cibase + k;
     const struct RProc *p = ci->proc;
-    if (!p || MRB_PROC_CFUNC_P(p)) {
-      fail(d, "frame %u (%s) is a C function; not a safe point", k,
-           ci->mid ? mrb_sym_name(mrb, ci->mid) : "?");
+    const char *mname = ci->mid ? mrb_sym_name(mrb, ci->mid) : "?";
+    if (ci->cci != 0) {
+      fail(d, "frame %u (%s) of context %u was entered from C: the C frame cannot be carried",
+           k, mname, id);
       return;
     }
-    if (!MRB_PROC_ALIAS_P(p) && checkpoint_perm_name_of(d->P, p) &&
-        checkpoint_perm_irep(d->P, p->body.irep, NULL)) {
-      pm_put(mrb, &d->body, p, 1);
+    if (!p || MRB_PROC_CFUNC_P(p)) {
+      const char *fname = cframe_func_name(d, c, ci);
+      if (ci != top || c == mrb->c) {
+        fail(d, "frame %u (%s) of context %u is a C function; not a safe point", k, mname, id);
+        return;
+      }
+      if (!switch_func_p(fname)) {
+        fail(d, "context %u waits in the C function %s: its C frame cannot be carried",
+             id, fname ? fname : mname);
+        return;
+      }
+      gb_u8(mrb, b, GF_CFUNC);
+      gb_u32(mrb, b, sym_ref(d, ci->mid));
+      snprintf(label, sizeof(label), "proc of frame %u of context %u", k, id);
+      gb_u32(mrb, b, obj_ref(d, p, label));
+      gb_str(mrb, b, fname, strlen(fname));
     }
-    gb_u32(mrb, b, sym_ref(d, ci->mid));
-    snprintf(label, sizeof(label), "proc of frame %u", k);
-    gb_u32(mrb, b, obj_ref(d, p, label));
+    else {
+      if (ci->pc && (ci->pc < p->body.irep->iseq || ci->pc > p->body.irep->iseq + p->body.irep->ilen)) {
+        fail(d, "frame %u (%s) of context %u stands outside its code (the VM ran past it)", k, mname, id);
+        return;
+      }
+      if (!MRB_PROC_ALIAS_P(p) && checkpoint_perm_name_of(d->P, p) &&
+          checkpoint_perm_irep(d->P, p->body.irep, NULL)) {
+        pm_put(mrb, &d->body, p, 1);
+      }
+      gb_u8(mrb, b, GF_RUBY);
+      gb_u32(mrb, b, sym_ref(d, ci->mid));
+      snprintf(label, sizeof(label), "proc of frame %u of context %u", k, id);
+      gb_u32(mrb, b, obj_ref(d, p, label));
+    }
     gb_u32(mrb, b, (uint32_t)(ci->stack - c->stbase));
-    gb_u32(mrb, b, ci->pc ? (uint32_t)(ci->pc - p->body.irep->iseq) : UINT32_MAX);
+    gb_u32(mrb, b, (ci->pc && p && !MRB_PROC_CFUNC_P(p)) ? (uint32_t)(ci->pc - p->body.irep->iseq) : UINT32_MAX);
     gb_u8(mrb, b, ci->n);
     gb_u8(mrb, b, ci->nk);
     gb_u8(mrb, b, ci->cci);
     gb_u8(mrb, b, ci->vis);
-    snprintf(label, sizeof(label), "block of frame %u", k);
+    snprintf(label, sizeof(label), "block of frame %u of context %u", k, id);
     gb_u32(mrb, b, obj_ref(d, ci->blk, label));
     struct REnv *e = mrb_vm_ci_env(ci);
     if (e) {
       gb_u8(mrb, b, 1);
-      snprintf(label, sizeof(label), "env of frame %u", k);
+      snprintf(label, sizeof(label), "env of frame %u of context %u", k, id);
       gb_u32(mrb, b, obj_ref(d, e, label));
     }
     else if (ci->u.target_class) {
       gb_u8(mrb, b, 2);
-      snprintf(label, sizeof(label), "target class of frame %u", k);
+      snprintf(label, sizeof(label), "target class of frame %u of context %u", k, id);
       gb_u32(mrb, b, obj_ref(d, ci->u.target_class, label));
     }
     else {
@@ -982,6 +1126,168 @@ w_vm(dumper *d)
       gb_u32(mrb, b, 0);
     }
   }
+}
+
+/* ---- the scheduler (mruby-task) ---- */
+
+static int
+queue_obj_cb(mrb_state *mrb, struct RBasic *obj, void *ud)
+{
+  dumper *d = (dumper*)ud;
+  if (obj->tt == MRB_TT_CDATA) {
+    struct RData *rd = (struct RData*)obj;
+    if (rd->type && rd->data && strcmp(rd->type->struct_name, "Task::Queue") == 0 &&
+        !pm_get(&d->queues, rd->data, NULL)) {
+      if (d->nqobj == d->qobj_cap) {
+        d->qobj_cap = d->qobj_cap ? d->qobj_cap * 2 : 8;
+        d->qobj = (struct RBasic**)mrb_realloc(mrb, d->qobj, sizeof(void*) * d->qobj_cap);
+      }
+      d->qobj[d->nqobj++] = obj;
+      pm_put(mrb, &d->queues, rd->data, d->nqobj);
+    }
+  }
+  return MRB_EACH_OBJ_OK;
+}
+
+static void
+w_remaining(dumper *d, gbuf *b, uint32_t deadline)
+{
+  gb_u32(d->mrb, b, (uint32_t)(int32_t)(deadline - d->mrb->task.tick));
+}
+
+static void
+w_sched(dumper *d)
+{
+  mrb_state *mrb = d->mrb;
+  gbuf *b = &d->sched;
+  char label[200];
+
+  uint8_t fl = 0;
+  if (d->G->dump_switch) fl |= 1;
+  if (mrb->task.loop_running) fl |= 2;
+  gb_u8(mrb, b, fl);
+  gb_u16(mrb, b, MRB_TICK_UNIT);
+  gb_u32(mrb, b, mrb->task.tick);
+  if (mrb->task.wakeup_tick == UINT32_MAX) {
+    gb_u8(mrb, b, 0);
+    gb_u32(mrb, b, 0);
+  }
+  else {
+    gb_u8(mrb, b, 1);
+    w_remaining(d, b, mrb->task.wakeup_tick);
+  }
+
+  /* the Task::Queue objects the waiting Tasks name by their struct */
+  int need_queues = 0;
+  for (uint32_t i = 0; i < d->ntask; i++) {
+    if (d->tq[i]->reason == MRB_TASK_REASON_QUEUE) need_queues = 1;
+  }
+  if (need_queues) mrb_objspace_each_objects(mrb, queue_obj_cb, d);
+
+  uint32_t running = 0;
+  gb_u32(mrb, b, d->ntask);
+  for (uint32_t i = 0; i < d->ntask && !d->failed; i++) {
+    mrb_task *t = d->tq[i];
+    int is_main = (t == mrb->task.main_task);
+    snprintf(label, sizeof(label), "Task #%u", i + 1);
+    gb_u32(mrb, b, obj_ref(d, mrb_obj_ptr(t->self), label));
+    gb_u32(mrb, b, is_main ? 0 : ctx_ref(d, &t->c));
+    gb_u8(mrb, b, t->status);
+    uint8_t q = 255;
+    if (!is_main) {
+      switch (t->status) {
+      case MRB_TASK_STATUS_READY: case MRB_TASK_STATUS_RUNNING: q = MRB_TASK_QUEUE_READY; break;
+      case MRB_TASK_STATUS_WAITING: q = MRB_TASK_QUEUE_WAITING; break;
+      case MRB_TASK_STATUS_SUSPENDED: q = MRB_TASK_QUEUE_SUSPENDED; break;
+      default: q = MRB_TASK_QUEUE_DORMANT; break;
+      }
+      if (t->status == MRB_TASK_STATUS_RUNNING) {
+        if (running) fail(d, "two Tasks are running");
+        running = i + 1;
+      }
+    }
+    gb_u8(mrb, b, q);
+    gb_u8(mrb, b, t->priority);
+    gb_u8(mrb, b, t->reason);
+    gb_u8(mrb, b, t->timeslice);
+    if (is_main) {
+      /* mruby-task keeps the main Task's name and value alive through
+         nothing (it is in no queue; its object holds them by a pointer the
+         GC does not follow), so they may be gone: not read. The reader
+         names it "main", as Task.current does. */
+      gb_u8(mrb, b, GV_NIL);
+      gb_u8(mrb, b, GV_NIL);
+    }
+    else {
+      snprintf(label, sizeof(label), "name of Task #%u", i + 1);
+      w_value(d, b, t->name, label);
+      snprintf(label, sizeof(label), "value of Task #%u", i + 1);
+      w_value(d, b, t->result, label);
+    }
+    switch (t->reason) {
+    case MRB_TASK_REASON_NONE:
+      break;
+    case MRB_TASK_REASON_SLEEP:
+      w_remaining(d, b, t->wait.wakeup_tick);
+      break;
+    case MRB_TASK_REASON_JOIN: {
+      uint32_t ji = 0;
+      if (t->wait.join && !pm_get(&d->taskid, t->wait.join, &ji) &&
+          t->status != MRB_TASK_STATUS_DORMANT) {
+        fail(d, "Task #%u joins a Task that is in no queue", i + 1);
+      }
+      gb_u32(mrb, b, ji);
+      break;
+    }
+    case MRB_TASK_REASON_QUEUE: {
+      uint32_t qi = 0;
+      /* (a finished Task keeps the reason it last waited for: its queue may be gone) */
+      if (t->wait.queue.target && !pm_get(&d->queues, t->wait.queue.target, &qi) &&
+          t->status != MRB_TASK_STATUS_DORMANT) {
+        fail(d, "Task #%u waits on a Task::Queue that is not alive", i + 1);
+      }
+      snprintf(label, sizeof(label), "the Task::Queue Task #%u waits on", i + 1);
+      gb_u32(mrb, b, qi ? obj_ref(d, d->qobj[qi - 1], label) : 0);
+      if (t->wait.queue.wakeup_tick == UINT32_MAX) {
+        gb_u8(mrb, b, 0);
+        gb_u32(mrb, b, 0);
+      }
+      else {
+        gb_u8(mrb, b, 1);
+        w_remaining(d, b, t->wait.queue.wakeup_tick);
+      }
+      break;
+    }
+    default:
+      fail(d, "Task #%u waits for reason %u, not in format v1", i + 1, t->reason);
+      break;
+    }
+  }
+
+  /* the running Task: the context it was entered from runs the scheduler's
+     loop (Task.run), one step of it (Task.pass) or nothing (a host that
+     called mrb_task_run from C) */
+  if (running && !d->failed) {
+    mrb_task *t = d->tq[running - 1];
+    struct mrb_context *e = t->c.prev;
+    if (!e) {
+      fail(d, "the running Task has no context it was entered from");
+    }
+    else if (no_frames_p(mrb, e)) {
+      if (e != mrb->root_c) fail(d, "the running Task was entered from a context with no frame");
+    }
+    else {
+      const char *fname = (!e->ci->proc || MRB_PROC_CFUNC_P(e->ci->proc)) ? cframe_func_name(d, e, e->ci) : NULL;
+      if (!fname || (strcmp(fname, "F:S:Task#run") != 0 && strcmp(fname, "F:S:Task#pass") != 0)) {
+        fail(d, "the scheduler runs from the C function %s: its C frame cannot be carried",
+             fname ? fname : "(unknown)");
+      }
+    }
+  }
+  gb_u32(mrb, b, running);
+  uint32_t host = 0;
+  if (d->G->host_task) pm_get(&d->taskid, d->G->host_task, &host);
+  gb_u32(mrb, b, host);
 }
 
 /* ---- debug info (line numbers), the optional last section ---- */
@@ -1039,15 +1345,9 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     snprintf(err, errlen, "no baseline (mrb_checkpoint_baseline was not called)");
     return -1;
   }
-  if (mrb->c != mrb->root_c) {
-    snprintf(err, errlen, "running in a Fiber or Task; format v0 carries only the root context");
+  if (mrb->task.scheduler_lock > 0) {
+    snprintf(err, errlen, "inside a synchronous Task (mrb_execute_proc_synchronously): its C frame cannot be carried");
     return -1;
-  }
-  for (int i = 0; i < 4; i++) {
-    if (mrb->task.queues[i]) {
-      snprintf(err, errlen, "Tasks exist; format v0 does not carry Tasks");
-      return -1;
-    }
   }
 
   gc_settings gcs;
@@ -1055,10 +1355,38 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   mrb_bool gc_was = mrb->gc.disabled;
   mrb->gc.disabled = TRUE;
   int ai = mrb_gc_arena_save(mrb);
+  d.G->last_dead = 0;
 
-  w_vm(&d);
+  /* the Tasks, queue by queue in order, then the main Task (Task.current
+     at the root: no context, in no queue) */
+  for (int q = 0; q < MRB_NUM_TASK_QUEUE; q++) {
+    for (mrb_task *t = mrb->task.queues[q]; t; t = t->next) {
+      d.tq = (mrb_task**)mrb_realloc(mrb, d.tq, sizeof(void*) * (d.ntask + 1));
+      d.tq[d.ntask++] = t;
+      pm_put(mrb, &d.taskid, t, d.ntask);
+    }
+  }
+  if (mrb->task.main_task) {
+    d.tq = (mrb_task**)mrb_realloc(mrb, d.tq, sizeof(void*) * (d.ntask + 1));
+    d.tq[d.ntask++] = mrb->task.main_task;
+    pm_put(mrb, &d.taskid, mrb->task.main_task, d.ntask);
+  }
+
+  /* the contexts: the root first, the Tasks' in their order, the current one */
+  ctx_ref(&d, mrb->root_c);
+  for (uint32_t i = 0; i < d.ntask; i++) {
+    if (d.tq[i] != mrb->task.main_task) ctx_ref(&d, &d.tq[i]->c);
+  }
+  uint32_t current = ctx_ref(&d, mrb->c);
+
+  w_sched(&d);
   if (!d.failed) w_patches(&d);
-  for (uint32_t i = 1; i <= d.nobj && !d.failed; i++) w_object(&d, i);  /* nobj grows while we go */
+  /* contexts and objects reach each other: go on until both are written */
+  uint32_t nc = 1, no = 1;
+  while (!d.failed && (nc <= d.nctx || no <= d.nobj)) {
+    if (nc <= d.nctx) w_context(&d, nc++);
+    else w_object(&d, no++);
+  }
   for (uint32_t i = 1; i <= d.nirep && !d.failed; i++) w_irep(&d, i);
 
   if (!d.failed) {
@@ -1076,9 +1404,12 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     gb_u32(mrb, out, d.nirep);  gb_bytes(mrb, out, d.ireps.p, d.ireps.len);
     gb_u32(mrb, out, d.nobj);   gb_bytes(mrb, out, d.objs.p, d.objs.len);
     gb_u32(mrb, out, d.npatch); gb_bytes(mrb, out, d.patches.p, d.patches.len);
-    gb_bytes(mrb, out, d.vm.p, d.vm.len);
-    /* line numbers of the carried ireps (format v0 section 13, optional:
-       left out when no carried irep has them) */
+    /* the VM: the contexts, the current one, the scheduler */
+    gb_u32(mrb, out, d.nctx);   gb_bytes(mrb, out, d.ctxs.p, d.ctxs.len);
+    gb_u32(mrb, out, current);
+    gb_bytes(mrb, out, d.sched.p, d.sched.len);
+    /* line numbers of the carried ireps (optional: left out when no carried
+       irep has them) */
     gbuf dbg; gb_init(&dbg);
     uint32_t ndbg = 0;
     for (uint32_t i = 1; i <= d.nirep; i++) ndbg += (uint32_t)w_debug_irep(&d, &dbg, i);
@@ -1088,7 +1419,7 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
       gb_bytes(mrb, out, dbg.p, dbg.len);
     }
     gb_free(mrb, &dbg);
-    /* the GC settings, when the program changed them (section 14) */
+    /* the GC settings, when the program changed them */
     if (memcmp(&gcs, &d.P->gc, sizeof(gcs)) != 0) {
       gb_bytes(mrb, out, "GCS0", 4);
       gb_u8(mrb, out, gcs.flags);
@@ -1106,10 +1437,11 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   mrb->gc.disabled = gc_was;
 
   gb_free(mrb, &d.syms); gb_free(mrb, &d.ireps); gb_free(mrb, &d.objs);
-  gb_free(mrb, &d.patches); gb_free(mrb, &d.vm);
+  gb_free(mrb, &d.patches); gb_free(mrb, &d.ctxs); gb_free(mrb, &d.sched);
   pm_free(mrb, &d.symid); pm_free(mrb, &d.irepid); pm_free(mrb, &d.objid);
-  pm_free(mrb, &d.body);
+  pm_free(mrb, &d.body); pm_free(mrb, &d.ctxid); pm_free(mrb, &d.taskid); pm_free(mrb, &d.queues);
   for (uint32_t i = 0; i < d.nobj; i++) mrb_free(mrb, d.olabel[i]);
   mrb_free(mrb, d.oq); mrb_free(mrb, d.olabel); mrb_free(mrb, d.iq);
+  mrb_free(mrb, d.cq); mrb_free(mrb, d.tq); mrb_free(mrb, d.qobj);
   return d.failed ? -1 : 0;
 }

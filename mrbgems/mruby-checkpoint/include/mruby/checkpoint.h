@@ -1,7 +1,7 @@
 /*
 ** mruby/checkpoint.h - carry a running VM state to another mrb_state
 **
-** The state is written as a logical graph (format v0, see doc/format_v0.md):
+** The state is written as a logical graph (format v1, see doc/format_v1.md):
 ** objects are numbered and refer to each other by number, symbols travel
 ** by name, ireps by content hash, and the objects that mrb_open() made are
 ** bound by name on the other side.
@@ -76,13 +76,19 @@ MRB_API void mrb_checkpoint_set_handler(mrb_state *mrb, mrb_checkpoint_handler f
 enum mrb_checkpoint_req {
   MRB_CHECKPOINT_REQ_OK = 0,
   MRB_CHECKPOINT_REQ_NOT_READY,   /* no baseline, or not initialized */
-  MRB_CHECKPOINT_REQ_FIBER,       /* running in a Fiber or Task */
-  MRB_CHECKPOINT_REQ_C_BOUNDARY,  /* inside a block called from C */
-  MRB_CHECKPOINT_REQ_TASKS,       /* Tasks exist */
+  MRB_CHECKPOINT_REQ_FIBER,       /* (not returned since P4: Fibers and Tasks are carried) */
+  MRB_CHECKPOINT_REQ_C_BOUNDARY,  /* inside a block called from C (or a Fiber resumed from C) */
+  MRB_CHECKPOINT_REQ_TASKS,       /* (not returned since P4) */
   MRB_CHECKPOINT_REQ_PENDING,     /* a checkpoint is already pending */
   MRB_CHECKPOINT_REQ_EXCEPTION,   /* (not returned since P3: the request waits until it is caught) */
 };
 MRB_API enum mrb_checkpoint_req mrb_checkpoint_request(mrb_state *mrb);
+/* The same, from a place where the VM stands at an instruction boundary with
+   every frame in memory (the per-instruction hook, code_fetch_hook): the
+   image is taken right here when this boundary is a safe point, else at the
+   first safe point after (an exception in flight). Nothing runs between the
+   request and the image, so the scheduler's state at the point is exact. */
+MRB_API enum mrb_checkpoint_req mrb_checkpoint_request_here(mrb_state *mrb);
 typedef void (*mrb_checkpoint_refusal_handler)(mrb_state *mrb, const char *reason, void *ud);
 MRB_API void mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handler fn, void *ud);
 
@@ -93,14 +99,33 @@ MRB_API void mrb_checkpoint_keep_dead_registers(mrb_state *mrb, mrb_bool keep);
 MRB_API uint32_t mrb_checkpoint_last_dead(mrb_state *mrb);
 
 /* Restore an image into mrb (which must have had mrb_checkpoint_baseline and must
-   not be running anything) and continue it to the end. Returns the value of
-   the top-level program; on a restore error raises Checkpoint::Error. */
+   not be running anything, nor have any Task) and continue it to the end.
+   Returns the value of the top-level program (nil when the host ran the
+   scheduler, see below); on a restore error raises Checkpoint::Error. */
 MRB_API mrb_value mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len);
 /* The two halves of mrb_checkpoint_resume: build the state (raises
    Checkpoint::Error on a restore error; no Ruby code of the program runs
-   except #hash / #eql? of restored Hash keys), then run it to the end. */
+   except #hash / #eql? of restored Hash keys), then run it to the end.
+   mrb_checkpoint_continue starts again what was running: the root context,
+   a Fiber, or a Task (the rest of its slice, then the scheduler: the loop of
+   Task.run or the step of Task.pass the program was in, or, for a host that
+   ran mrb_task_run from C, mrb_task_run itself, which returns when every
+   Task is done; continue then returns nil). */
 MRB_API void mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len);
 MRB_API mrb_value mrb_checkpoint_continue(mrb_state *mrb);
+
+/* The embedder's Task (the one it made with mrb_create_task to run the
+   program, as Family mruby runs an application): the image keeps which one
+   it is, so that the restoring side finds it again (its value, its end).
+   mrb_checkpoint_host_task returns it after mrb_checkpoint_restore, or nil. */
+/* The Task that was running goes on with a full timeslice (the default), or
+   with what was left of it in the image (keep = TRUE; an experiment: the
+   writer's ticks to the end of the slice, as if the run had not stopped).
+   Set on the restoring side. */
+MRB_API void mrb_checkpoint_keep_timeslice(mrb_state *mrb, mrb_bool keep);
+
+MRB_API void mrb_checkpoint_set_host_task(mrb_state *mrb, mrb_value task);
+MRB_API mrb_value mrb_checkpoint_host_task(mrb_state *mrb);
 
 /* Side table for C data (RData). There is no field in mrb_data_type for this:
    the table maps a data type pointer to a pair of callbacks and a name the

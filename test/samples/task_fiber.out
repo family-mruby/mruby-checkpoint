@@ -1,0 +1,7 @@
+task a: fiber 1
+task a: fiber 2
+task a: fiber 3
+task a: fiber 4
+task a: fiber 5
+task b woke
+[15, :b]

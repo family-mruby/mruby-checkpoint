@@ -1,8 +1,8 @@
-# Print a checkpoint image (format v0, with the P2 and P3 additions) in readable form.
+# Print a checkpoint image (format v1) in readable form.
 #
 #   ruby tools/checkpoint_inspect.rb IMAGE [--iseq]
 #
-# Written from doc/format_v0.md alone, as a second reader of the format.
+# Written from doc/format_v1.md alone, as a second reader of the format.
 
 class Reader
   def initialize(bytes) = (@b = bytes; @p = 0)
@@ -29,6 +29,7 @@ r = Reader.new(File.binread(path))
 
 abort 'not a checkpoint image' unless r.take(4) == 'MRCK'
 ver = r.u16
+abort "format v#{ver}: this reader reads v1" unless ver == 1
 impl = r.str
 rite = r.str
 ib, fb, utf8, pw = r.u8, r.u8, r.u8, r.u8
@@ -95,7 +96,8 @@ end
 kinds = { 2 => 'Object', 3 => 'String', 4 => 'Array', 5 => 'Hash', 6 => 'Range', 7 => 'Exception',
           8 => 'Class', 9 => 'Module', 10 => 'SClass', 11 => 'IClass', 12 => 'Proc', 13 => 'Env',
           14 => 'Data', 16 => 'Bigint', 17 => 'Struct', 18 => 'Set', 19 => 'Rational',
-          20 => 'Complex', 21 => 'Break', 23 => 'Random', 24 => 'Origin', 25 => 'String' }
+          20 => 'Complex', 21 => 'Break', 23 => 'Random', 24 => 'Origin', 25 => 'String',
+          26 => 'Task', 27 => 'Fiber' }
 nobj = r.u32
 puts "objects: #{nobj}"
 nobj.times do |i|
@@ -144,7 +146,8 @@ nobj.times do |i|
     when 13
       mid = sym.(r.u32); len = r.u8; bidx = r.u8; v = r.u8
       if r.u8 == 1
-        "mid=#{mid} len=#{len} bidx=#{bidx} vis=#{v} on stack at #{r.u32}"
+        cx = r.u32
+        "mid=#{mid} len=#{len} bidx=#{bidx} vis=#{v} on the stack of context #{cx} at #{r.u32}"
       else
         "mid=#{mid} len=#{len} bidx=#{bidx} vis=#{v} [#{Array.new(len) { value.() }.join(', ')}]"
       end
@@ -162,6 +165,8 @@ nobj.times do |i|
       sup = r.u32; mt = r.u8
       "super=##{sup} table=#{mt} methods: #{Array.new(r.u32) { meth.() }.join(' ')}"
     when 25 then "#{r.str.inspect} (binary)"
+    when 26 then "task=#{r.u32} #{ivars.()}"
+    when 27 then cx = r.u32; cx.zero? ? '(not initialized)' : "context #{cx}"
     else raise "bad kind #{k}"
     end
   puts "#{head} #{body}"
@@ -193,19 +198,48 @@ npatch.times do
   end
 end
 
-len = r.u32
-stack = Array.new(len) { value.() }
-puts "stack: #{len}"
-stack.each_slice(8).with_index { |s, i| puts "  [#{i * 8}] #{s.join(' ')}" }
-nf = r.u32
-puts "frames: #{nf}"
-nf.times do |k|
-  mid = sym.(r.u32); proc_ = r.u32; off = r.u32; pc = r.u32
-  n, nk, cci, v = r.u8, r.u8, r.u8, r.u8
-  blk = r.u32; uk = r.u8; u = r.u32
-  puts "  #{k}: #{mid} proc=##{proc_} R0=stack[#{off}] pc=#{pc} n=#{n} nk=#{nk} cci=#{cci} vis=#{v} " \
-       "blk=##{blk} #{%w(none env class)[uk]}=##{u}"
+fstates = %w(created running resumed suspended transferred terminated)
+nctx = r.u32
+puts "contexts: #{nctx}"
+nctx.times do |c|
+  st = r.u8; fl = r.u8; prev = r.u32; fib = r.u32
+  len = r.u32
+  stack = Array.new(len) { value.() }
+  puts "  context #{c + 1}: #{fstates[st] || st}#{fl & 1 == 1 ? ' vmexec' : ''} prev=#{prev} fiber=##{fib} stack=#{len}"
+  stack.each_slice(8).with_index { |s, i| puts "    [#{i * 8}] #{s.join(' ')}" }
+  nf = r.u32
+  nf.times do |k|
+    fk = r.u8
+    mid = sym.(r.u32); proc_ = r.u32
+    fname = fk == 1 ? " C #{r.str}" : ''
+    off = r.u32; pc = r.u32
+    n, nk, cci, v = r.u8, r.u8, r.u8, r.u8
+    blk = r.u32; uk = r.u8; u = r.u32
+    puts "    #{k}: #{mid}#{fname} proc=##{proc_} R0=stack[#{off}] pc=#{pc == 0xffffffff ? '-' : pc} n=#{n} nk=#{nk} " \
+         "cci=#{cci} vis=#{v} blk=##{blk} #{%w(none env class)[uk]}=##{u}"
+  end
 end
+puts "current context: #{r.u32}"
+i32 = -> { [r.u32].pack('N').unpack1('l>') }
+sfl = r.u8; unit = r.u16; tick = r.u32; hw = r.u8; wk = i32.()
+puts "scheduler: switch=#{sfl & 1} loop=#{(sfl >> 1) & 1} tick=#{tick} (#{unit} ms) next wakeup #{hw == 1 ? "in #{wk}" : 'none'}"
+tstat = { 0 => 'DORMANT', 2 => 'READY', 3 => 'RUNNING', 4 => 'WAITING', 8 => 'SUSPENDED' }
+ntask = r.u32
+ntask.times do |i|
+  obj = r.u32; cx = r.u32; st = r.u8; q = r.u8; pri = r.u8; reason = r.u8; ts = r.u8
+  name = value.(); res = value.()
+  wait = case reason
+         when 0 then ''
+         when 1 then " sleep, #{i32.()} ticks left"
+         when 4 then " join Task #{r.u32}"
+         when 8 then qo = r.u32; hd = r.u8; rem = i32.(); " queue ##{qo}#{hd == 1 ? ", #{rem} ticks left" : ''}"
+         else raise "bad reason #{reason}"
+         end
+  where = q == 255 ? 'main (Task.current at the root)' : "queue #{%w(dormant ready waiting suspended)[q]}"
+  puts "  Task #{i + 1}: ##{obj} context #{cx} #{tstat[st] || st} #{where} priority=#{pri} timeslice=#{ts} " \
+       "name=#{name} value=#{res}#{wait}"
+end
+puts "running Task: #{r.u32}, host Task: #{r.u32}"
 if r.peek(4) == 'DBG0'
   r.take(4)
   nd = r.u32

@@ -16,6 +16,20 @@
 **
 ** The call's value tells the two sides apart: the writing side gets :saved,
 ** the image holds :resumed in the same register.
+**
+** task.switching is the scheduler's flag too (a Task's timeslice is over,
+** it sleeps, a Task it woke goes first), and a plain bool: a request that
+** sets it cannot tell later whether the scheduler set it as well. So the
+** request notes how the scheduler stood (mark_switch), and at the safe point
+** the change says whether the scheduler asked for a switch meanwhile
+** (sched_switch): the running Task no longer runs, its timeslice is over,
+** a waiting Task woke, a Task of higher priority became ready. Then the flag
+** is left set (the VM returns to the scheduler right after the hook) and the
+** image says the slice ends there; otherwise it is cleared. The one switch
+** that leaves no trace is Task.pass called by the very instruction between
+** an external request and its safe point: that pass is lost (the Task runs
+** on until its timeslice is over). The test trigger asks at the boundary
+** where it stands (mrb_checkpoint_request_here), which has no such window.
 */
 
 #include <stdio.h>
@@ -29,8 +43,10 @@
 #include <mruby/throw.h>
 #include <mruby/presym.h>
 #include "checkpoint_internal.h"
+#include "task.h"
 
 extern void (*mrb_vm_safepoint_hook)(mrb_state *mrb);
+
 
 /* ---- per-state side table ---- */
 
@@ -73,6 +89,7 @@ checkpoint_delete(mrb_state *mrb)
       free(g->data);
       for (int k = 0; k < g->nfuncs; k++) free(g->fnames[k]);
       free(g->fnames); free(g->funcs);
+      free(g->snap_wait); free(g->snap_reason); free(g->snap_ready);
       free(g);
       states[i] = NULL;
     }
@@ -99,6 +116,7 @@ mrb_checkpoint_baseline(mrb_state *mrb)
   checkpoint_perm_free(mrb, g->perm);
   g->perm = NULL;
   checkpoint_bundled_register(mrb);
+  checkpoint_task_register(mrb);
   g->perm = checkpoint_perm_build(mrb, g);
 }
 
@@ -207,40 +225,101 @@ default_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path
   }
 }
 
-static int
-tasks_exist(mrb_state *mrb)
+/* ---- the scheduler's flag ---- */
+
+static void
+snap_free(checkpoint_state *g)
 {
-  for (int i = 0; i < 4; i++) {
-    if (mrb->task.queues[i]) return 1;
+  free(g->snap_wait); free(g->snap_reason); free(g->snap_ready);
+  g->snap_wait = NULL; g->snap_reason = NULL; g->snap_ready = NULL;
+  g->nsnap_wait = g->nsnap_ready = 0;
+  g->snap_task = NULL;
+}
+
+/* raise the request: the VM tests task.switching at every boundary */
+static void
+mark_switch(mrb_state *mrb, checkpoint_state *g)
+{
+  snap_free(g);
+  if (mrb->task.switching) {   /* a switch is asked for already */
+    g->own_switch = 0;
+    return;
   }
+  g->own_switch = 1;
+  mrb->task.switching = TRUE;
+  mrb_task *run = checkpoint_running_task(mrb);
+  if (!run) return;
+  g->snap_task = run;
+  int nw = 0, nr = 0;
+  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_WAITING]; t; t = t->next) nw++;
+  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; t; t = t->next) nr++;
+  g->snap_wait = (void**)malloc(sizeof(void*) * (nw + 1));
+  g->snap_reason = (uint8_t*)malloc(nw + 1);
+  g->snap_ready = (void**)malloc(sizeof(void*) * (nr + 1));
+  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_WAITING]; t; t = t->next) {
+    g->snap_reason[g->nsnap_wait] = t->reason;
+    g->snap_wait[g->nsnap_wait++] = t;
+  }
+  for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; t; t = t->next) g->snap_ready[g->nsnap_ready++] = t;
+}
+
+static int
+in_queue(mrb_state *mrb, int q, void *t)
+{
+  for (mrb_task *x = mrb->task.queues[q]; x; x = x->next) if ((void*)x == t) return 1;
   return 0;
 }
 
-/* an external request that cannot be served at this safe point */
-static void
-external_refused(mrb_state *mrb, checkpoint_state *g, const char *reason)
+/* at the safe point: did the scheduler ask for a switch (before the request,
+   or since)? */
+static int
+sched_switch(mrb_state *mrb, checkpoint_state *g)
 {
-  g->pending = 0;
-  /* the flag belongs to the task scheduler too: leave it alone when Tasks exist */
-  if (!tasks_exist(mrb)) mrb->task.switching = FALSE;
-  if (g->refusal) g->refusal(mrb, reason, g->refusal_ud);
+  int sw;
+  if (!mrb->task.switching) sw = 0;    /* the scheduler cleared it (not at a safe point here) */
+  else if (!g->own_switch) sw = 1;
+  else if (!g->snap_task) sw = 0;      /* no Task was running: nothing to switch from */
+  else {
+    mrb_task *run = (mrb_task*)g->snap_task;
+    sw = run->status != MRB_TASK_STATUS_RUNNING || run->c.status == MRB_TASK_STOPPED ||
+         run->timeslice == 0;
+    /* a waiting Task woke (a tick, a push, a close; a join only for a Task
+       of higher priority, as wake_up_join_waiters does) */
+    for (int i = 0; !sw && i < g->nsnap_wait; i++) {
+      mrb_task *t = (mrb_task*)g->snap_wait[i];
+      if (!in_queue(mrb, MRB_TASK_QUEUE_READY, t)) continue;
+      if (g->snap_reason[i] != MRB_TASK_REASON_JOIN || t->priority < run->priority) sw = 1;
+    }
+    /* a Task of higher priority than the running one became ready (made,
+       resumed) */
+    for (mrb_task *t = mrb->task.queues[MRB_TASK_QUEUE_READY]; !sw && t; t = t->next) {
+      if (t == run || t->priority >= run->priority) continue;
+      int was = 0;
+      for (int i = 0; i < g->nsnap_ready; i++) if (g->snap_ready[i] == (void*)t) { was = 1; break; }
+      for (int i = 0; !was && i < g->nsnap_wait; i++) if (g->snap_wait[i] == (void*)t) was = 1;
+      if (!was) sw = 1;
+    }
+  }
+  snap_free(g);
+  g->own_switch = 0;
+  return sw;
 }
 
+/* leave the flag as the scheduler would have it */
 static void
-external_safepoint(mrb_state *mrb, checkpoint_state *g)
+settle_switch(mrb_state *mrb, int sw)
 {
-  if (mrb->c != mrb->root_c) {
-    /* the instruction after the request entered a Fiber; going on with
-       switching set would make the Fiber's VM return to a scheduler */
-    external_refused(mrb, g, "running in a Fiber or Task; format v0 carries only the root context");
-    return;
-  }
-  if (tasks_exist(mrb)) {
-    external_refused(mrb, g, "Tasks exist; format v0 does not carry Tasks");
-    return;
-  }
+  mrb->task.switching = sw ? TRUE : FALSE;
+}
+
+/* write the image of an external request here; sw: the scheduler asked for
+   a switch at this point (the slice ends here). The flag is left to the
+   caller. */
+static void
+external_write(mrb_state *mrb, checkpoint_state *g, int sw)
+{
   g->pending = 0;
-  mrb->task.switching = FALSE;
+  g->dump_switch = sw;
 
   gbuf out;
   gb_init(&out);
@@ -267,6 +346,14 @@ external_safepoint(mrb_state *mrb, checkpoint_state *g)
 }
 
 static void
+external_safepoint(mrb_state *mrb, checkpoint_state *g)
+{
+  int sw = sched_switch(mrb, g);
+  settle_switch(mrb, sw);
+  external_write(mrb, g, sw);
+}
+
+static void
 checkpoint_safepoint(mrb_state *mrb)
 {
   checkpoint_state *g = checkpoint_get(mrb);
@@ -275,10 +362,10 @@ checkpoint_safepoint(mrb_state *mrb)
     external_safepoint(mrb, g);
     return;
   }
-  if (mrb->c != mrb->root_c) return;  /* not reached: requests are refused off the root context */
 
+  int sw = sched_switch(mrb, g);
   g->pending = 0;
-  mrb->task.switching = FALSE;
+  g->dump_switch = sw;
   char *path = g->pending_path;
   g->pending_path = NULL;
   enum mrb_checkpoint_kind kind = g->pending_kind;
@@ -286,10 +373,11 @@ checkpoint_safepoint(mrb_state *mrb)
   /* The call has returned: the caller is the current frame and the call's
      value (:saved) is in its register. The image gets :resumed there. */
   struct mrb_context *c = mrb->c;
-  if (c->ci - c->cibase != g->ret_ci || c->stbase + g->ret_slot >= c->stend ||
+  if (c != g->ret_ctx || c->ci - c->cibase != g->ret_ci || c->stbase + g->ret_slot >= c->stend ||
       !mrb_symbol_p(c->stbase[g->ret_slot]) ||
       mrb_symbol(c->stbase[g->ret_slot]) != MRB_SYM(saved)) {
     free(path);
+    settle_switch(mrb, sw);
     mrb_raise(mrb, error_class(mrb), "the call's value is not where the checkpoint expects it");
   }
   mrb_value *slot = &c->stbase[g->ret_slot];
@@ -300,6 +388,7 @@ checkpoint_safepoint(mrb_state *mrb)
   char err[512];
   int failed = checkpoint_dump(mrb, &out, err, sizeof(err));
   *slot = mrb_symbol_value(MRB_SYM(saved));
+  settle_switch(mrb, sw);
   if (failed) {
     gb_free(mrb, &out);
     free(path);
@@ -325,25 +414,37 @@ checkpoint_safepoint(mrb_state *mrb)
   free(path);
 }
 
-/* Name the C function between the root frame and the caller, if any:
-   a frame entered from C (cci > 0) sits on top of the C function's frame. */
+/* Name the C function between the base frame and the caller, if any: a
+   frame entered from C (cci > 0) sits on top of the C function's frame. The
+   contexts the current one was resumed from count too (their frames wait
+   below it), up to the root or a Task's (whose scheduler the reader starts
+   again); a Fiber resumed by C (mrb_fiber_resume) waits in that C call. */
 static int
 c_boundary(mrb_state *mrb, char *buf, size_t len)
 {
-  struct mrb_context *c = mrb->c;
-  /* c->ci is the frame of save / suspend itself, called from the VM */
-  for (mrb_callinfo *ci = c->ci; ci > c->cibase; ci--) {
-    if (ci->cci == 0) continue;
-    mrb_callinfo *cf = ci - 1;
-    if (cf > c->cibase && cf->mid) {
-      struct RClass *k = mrb_vm_ci_target_class(cf);
-      snprintf(buf, len, "%s#%s", k ? mrb_class_name(mrb, k) : "?",
-               mrb_sym_name(mrb, cf->mid));
+  for (struct mrb_context *c = mrb->c; c; c = c->prev) {
+    mrb_task *task = checkpoint_task_of_context(mrb, c);
+    if (c != mrb->root_c && !task && c->vmexec) {
+      snprintf(buf, len, "a C function that resumed a Fiber (mrb_fiber_resume)");
+      return 1;
     }
-    else {
-      snprintf(buf, len, "a C function");
+    if (c->cibase && c->ci) {
+      /* in the current context c->ci is the frame of save / suspend itself */
+      for (mrb_callinfo *ci = c->ci; ci > c->cibase; ci--) {
+        if (ci->cci == 0) continue;
+        mrb_callinfo *cf = ci - 1;
+        if (cf > c->cibase && cf->mid) {
+          struct RClass *k = mrb_vm_ci_target_class(cf);
+          snprintf(buf, len, "%s#%s", k ? mrb_class_name(mrb, k) : "?",
+                   mrb_sym_name(mrb, cf->mid));
+        }
+        else {
+          snprintf(buf, len, "a C function");
+        }
+        return 1;
+      }
     }
-    return 1;
+    if (c == mrb->root_c) break;
   }
   return 0;
 }
@@ -360,7 +461,6 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
   if (!g) mrb_raise(mrb, e, "checkpoint is not initialized");
   /* refusals that depend only on where the call is made come first, so that
      a reference run (IGNORE) behaves the same */
-  if (mrb->c != mrb->root_c) mrb_raisef(mrb, e, "%s from a Fiber or Task is not supported in format v0", what);
   char cfn[256];
   if (c_boundary(mrb, cfn, sizeof(cfn))) {
     mrb_raisef(mrb, e, "%s inside a block called from C (%s): the C frame cannot be carried", what, cfn);
@@ -370,9 +470,6 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
     return mrb_symbol_value(kind == MRB_CHECKPOINT_SAVE ? MRB_SYM(saved) : MRB_SYM(resumed));
   }
   if (!g->perm) mrb_raisef(mrb, e, "%s: no baseline: run the program through the checkpoint driver", what);
-  for (int i = 0; i < 4; i++) {
-    if (mrb->task.queues[i]) mrb_raisef(mrb, e, "%s: Tasks exist; format v0 does not carry Tasks", what);
-  }
   if (g->output) path = g->output;
   if (!path) mrb_raisef(mrb, e, "%s needs a path", what);
   if (g->pending) mrb_raisef(mrb, e, "%s: a checkpoint is already pending", what);
@@ -383,10 +480,11 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
   free(g->pending_path);
   g->pending_path = dupstr(path);
   g->pending_kind = kind;
+  g->ret_ctx = c;
   g->ret_ci = (c->ci - 1) - c->cibase;
   g->ret_slot = c->ci->stack - c->stbase;
   g->pending = 1;
-  mrb->task.switching = TRUE;   /* the VM tests this at every instruction boundary */
+  mark_switch(mrb, g);
   return mrb_symbol_value(MRB_SYM(saved));
 }
 
@@ -396,15 +494,42 @@ mrb_checkpoint_request(mrb_state *mrb)
   checkpoint_state *g = checkpoint_get(mrb);
   char cfn[256];
   if (!g || !g->perm) return MRB_CHECKPOINT_REQ_NOT_READY;
-  if (g->pending) return MRB_CHECKPOINT_REQ_PENDING;
-  if (mrb->c != mrb->root_c) return MRB_CHECKPOINT_REQ_FIBER;
+  if (g->pending) {
+    /* the scheduler cleared the flag before the safe point came (it starts
+       or ends a slice, the root sleeps): raise it again */
+    if (!mrb->task.switching) mark_switch(mrb, g);
+    return MRB_CHECKPOINT_REQ_PENDING;
+  }
   /* an exception (or a break through an ensure clause) in flight is not
      refused: the VM calls the hook only once it is caught */
   if (c_boundary(mrb, cfn, sizeof(cfn))) return MRB_CHECKPOINT_REQ_C_BOUNDARY;
-  if (tasks_exist(mrb)) return MRB_CHECKPOINT_REQ_TASKS;
   g->pending = 1;
   g->pending_kind = MRB_CHECKPOINT_EXTERNAL;
-  mrb->task.switching = TRUE;   /* the VM tests this at every instruction boundary */
+  mark_switch(mrb, g);
+  return MRB_CHECKPOINT_REQ_OK;
+}
+
+MRB_API enum mrb_checkpoint_req
+mrb_checkpoint_request_here(mrb_state *mrb)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  char cfn[256];
+  if (!g || !g->perm) return MRB_CHECKPOINT_REQ_NOT_READY;
+  if (g->pending) {
+    if (!mrb->task.switching) mark_switch(mrb, g);
+    return MRB_CHECKPOINT_REQ_PENDING;
+  }
+  if (c_boundary(mrb, cfn, sizeof(cfn))) return MRB_CHECKPOINT_REQ_C_BOUNDARY;
+  g->pending = 1;
+  g->pending_kind = MRB_CHECKPOINT_EXTERNAL;
+  if (mrb->exc || mrb->gc.iterating) {
+    /* an exception (or a break through an ensure clause) in flight, or a C
+       walk of the heap: the VM calls the hook at the first safe point */
+    mark_switch(mrb, g);
+    return MRB_CHECKPOINT_REQ_OK;
+  }
+  /* a safe point: the image is of this boundary, the flag stays as it is */
+  external_write(mrb, g, mrb->task.switching ? 1 : 0);
   return MRB_CHECKPOINT_REQ_OK;
 }
 
@@ -442,6 +567,18 @@ checkpoint_suspend(mrb_state *mrb, mrb_value self)
 {
   return request(mrb, MRB_CHECKPOINT_SUSPEND);
 }
+
+#ifdef CHECKPOINT_TEST_HELPERS
+/* test builds only: Task.pass and Checkpoint.save in one call, so that the
+   image is taken where the scheduler has asked for a switch (the slice ends
+   at that safe point, on both sides) */
+static mrb_value
+checkpoint_pass_and_save(mrb_state *mrb, mrb_value self)
+{
+  if (mrb->c != mrb->root_c) mrb->task.switching = TRUE;
+  return request(mrb, MRB_CHECKPOINT_SAVE);
+}
+#endif
 
 static mrb_value
 checkpoint_resumed_p(mrb_state *mrb, mrb_value self)
@@ -525,6 +662,9 @@ mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
   mrb_define_module_function(mrb, m, "save", checkpoint_save, MRB_ARGS_OPT(1));
   mrb_define_module_function(mrb, m, "suspend", checkpoint_suspend, MRB_ARGS_OPT(1));
   mrb_define_module_function(mrb, m, "resumed?", checkpoint_resumed_p, MRB_ARGS_NONE());
+#ifdef CHECKPOINT_TEST_HELPERS
+  mrb_define_module_function(mrb, m, "__pass_and_save", checkpoint_pass_and_save, MRB_ARGS_OPT(1));
+#endif
 
   struct RClass *box = mrb_define_class_under(mrb, m, "Box", mrb->object_class);
   MRB_SET_INSTANCE_TT(box, MRB_TT_CDATA);

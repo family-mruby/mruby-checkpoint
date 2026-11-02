@@ -1,4 +1,4 @@
-refused: C data of class File (type 'IO') has no entry in the checkpoint data table (stack slot 1)
-refused in fiber: Checkpoint.suspend from a Fiber or Task is not supported in format v0
+refused: C data of class File (type 'IO') has no entry in the checkpoint data table (stack slot 1 of context 1)
+refused in fiber: Checkpoint.suspend inside a block called from C (Array#sort!): the C frame cannot be carried
 fiber_done
 still running

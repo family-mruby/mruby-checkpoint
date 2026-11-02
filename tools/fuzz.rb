@@ -3,7 +3,8 @@
 #
 #   ruby tools/fuzz.rb [--seeds 1,2,3 | --seed-from N --runs K] [--points N]
 #                      [--xproc N] [--keep-dead] [--only PATTERN] [--jobs N]
-#                      [--json FILE] [--table FILE] [--quiet]
+#                      [--json FILE] [--table FILE] [--quiet] [--as-task] [--quantum N]
+#                      [--keep-timeslice]
 #
 # For every test file (vendor/mruby/test/t/*.rb, and test/*.rb of each gem in
 # the build that has one):
@@ -15,6 +16,11 @@
 #               closed; every --xproc-th image goes on in another process
 #               (32-bit and 64-bit builds in turn). The output and the exit
 #               status must equal the reference.
+# --as-task runs every program (and its reference) as a Task, the way Family
+# mruby starts an application; --quantum N ticks mruby-task's virtual clock
+# once every N instructions (timeslices end), in every run alike;
+# --keep-timeslice: a restored Task goes on with what was left of its
+# timeslice instead of a full one.
 # Outputs are compared after dropping assert.rb's "Time:" line (wall clock) and
 # masking mkstemp's random file names.
 #
@@ -58,6 +64,9 @@ until args.empty?
   when '--timeout' then opts[:timeout] = args.shift.to_i
   when '--quiet' then opts[:quiet] = true
   when '--isolate' then opts[:isolate] = true
+  when '--as-task' then opts[:as_task] = true
+  when '--quantum' then opts[:quantum] = args.shift.to_i
+  when '--keep-timeslice' then opts[:keep_timeslice] = true
   else abort "unknown option #{a}"
   end
 end
@@ -151,8 +160,12 @@ def category(line)
     r = f[4].to_s
     case r
     when /C data of class (\S+)/ then OS_DATA.include?($1) ? "OS resource (#{$1})" : "C data #{$1}"
-    when /type Fiber/ then 'a Fiber object'
-    when /type (\S+) \(class (\S+)\) is not in format v0/ then "type #{$1} (#{$2})"
+    when /type (\S+) \(class (\S+)\) is not in format v1/ then "type #{$1} (#{$2})"
+    when /resumed a Fiber \(mrb_fiber_resume\)/, /was entered from C/ then 'C frame (a Fiber resumed from C)'
+    when /waits in the C function (\S+)/ then "C frame (a context waits in #{$1})"
+    when /the scheduler runs from the C function (\S+)/ then "C frame (the scheduler run from #{$1})"
+    when /synchronous Task/ then 'C frame (a synchronous Task)'
+    when /stands outside its code/ then 'a frame past the end of its code (the VM ran past it)'
     when /permanent (\S+) \((\w+)\) was modified/ then "permanent #{$2} modified"
     when /object made by mrb_open has no name: (\S+) (of class )?(\S+)/ then "unnamed permanent #{$1} (reached only through ObjectSpace)"
     when /makes instances of type (\S+)/ then "class of #{$1} instances"
@@ -230,6 +243,9 @@ def run_file(gem, file, opts, excl)
           expected: [] }
   Dir.mktmpdir('ckfuzz') do |dir|
     common = ['--gem', gem, '--tmp', dir]
+    common << '--as-task' if opts[:as_task]
+    common += ['--quantum', opts[:quantum].to_s] if opts[:quantum].to_i > 0
+    common << '--keep-timeslice' if opts[:keep_timeslice]
     log = File.join(dir, 'ref.log')
     ref, err, st = run('64', ['--ref', *common, '--assert', ASSERT, file], log, opts[:timeout])
     _, ends, = parse_log(log)
@@ -261,6 +277,7 @@ def run_file(gem, file, opts, excl)
       run = { seed: seed, same: same, status: fst, points: points.values.sum,
               written: points['written'] }
       ex = !same && excluded_by(excl[name], ref, out)
+      ex = nil if ex && ex[:when] == 'as-task' && !opts[:as_task]
       if ex && ex[:when] == 'another process'
         # listed for other processes only: the same run kept in this process must not differ
         o2, _, s2 = run('64', [*common, '--seed', seed.to_s, '--mean', mean.to_s, '--xproc', '0',
