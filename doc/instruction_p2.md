@@ -12,7 +12,7 @@
 - SabiRuby のヒープは `Heap { objs: Vec<HeapObject> }`、参照は `ObjId(u32)`、値は
   `Value` enum (16 バイト)、格納場所は `Slot`。到達可能性 GC がある
   (`docs/design/gc.md`)。Fiber は `docs/design/fibers.md`。
-- 作業場所: SabiRuby の worktree `/home/kishima/fmrb/wt/sabiruby-checkpoint`
+- 作業場所: SabiRuby の worktree (`SABIRUBY_DIR` に渡すもの)
   (ブランチ `feature/checkpoint`、作者の手元の `main` から切った)。SabiRuby の
   本体の checkout (`~/book/kishima/sabiruby`) は触らない。
 
@@ -59,7 +59,7 @@
 ## 触ってよい範囲
 
 - このリポジトリ (`tmp/mruby-checkpoint`) と、SabiRuby の worktree
-  (`/home/kishima/fmrb/wt/sabiruby-checkpoint`) だけ。SabiRuby の本体の checkout と
+  (SabiRuby の worktree、`SABIRUBY_DIR` に渡すもの) だけ。SabiRuby の本体の checkout と
   `main` は触らない。`vendor/mruby` は触らない。
 - SabiRuby の Docker の参照 mruby (`kishima/mruby:4.1.0-rc2`) は使ってよい。
 

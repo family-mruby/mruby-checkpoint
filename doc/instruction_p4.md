@@ -51,7 +51,7 @@ Family mruby は、アプリの本体を最初から mruby の Task として走
      プログラムの本体を Task にして `mrb_task_run`) を足す。試験は両方の形で。
    - 時刻は試験で揺れないように、試験のビルドでは**仮想の時計** (tick を命令の数か
      スケジューラの回数で進める) を使えるようにする。普段のビルドは今の HAL のまま。
-3. **SabiRuby 側** (worktree `/home/kishima/fmrb/wt/sabiruby-checkpoint`、ブランチ
+3. **SabiRuby 側** (worktree、`SABIRUBY_DIR` に渡すもの、ブランチ
    `feature/checkpoint`、feature `checkpoint`): v1 の読み込み、Fiber と Task の
    復元 (片道)。SabiRuby の Task・Fiber の作りとの違いは表にして report に。
 4. **試験**:

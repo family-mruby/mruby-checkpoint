@@ -34,7 +34,7 @@ gem の試験) を、外からランダムな安全点で止めて書き出し�
    古いレジスタが指していて断った」場面が減るかを確かめる。
 6. **できれば SabiRuby も**: 試験一式の一部を、C で書いた像を SabiRuby で続ける形で
    回す (`SABIRUBY_DIR` があるとき)。数は少なくてよい。SabiRuby に手を入れる
-   必要があれば、worktree (`/home/kishima/fmrb/wt/sabiruby-checkpoint`、ブランチ
+   必要があれば、worktree (`SABIRUBY_DIR` に渡すもの、ブランチ
    `feature/checkpoint`) で feature `checkpoint` の下に。
 7. `rake test` に、短い版 (数十秒で終わる、種を固定) を足す。長い版は別の rake の
    タスク (`rake fuzz` など) にし、種・回数を引数で渡せるようにする。
