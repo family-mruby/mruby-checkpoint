@@ -1,4 +1,4 @@
-# Print a checkpoint image (format v0) in readable form.
+# Print a checkpoint image (format v0, with the P2 additions) in readable form.
 #
 #   ruby tools/checkpoint_inspect.rb IMAGE [--iseq]
 #
@@ -71,6 +71,8 @@ nirep.times do |i|
     puts "  @#{i + 1} permanent #{h.to_s(16)}"
     next
   end
+  raise "bad irep kind #{kind}" unless kind == 0 || kind == 2
+  tag = kind == 2 ? 'permanent, carried ' : ''
   nlocals, nregs, clen, ilen = r.u16, r.u16, r.u16, r.u32
   iseq = r.take(ilen + 13 * clen)
   pool = Array.new(r.u16) do
@@ -84,7 +86,7 @@ nirep.times do |i|
   isyms = Array.new(r.u16) { sym.(r.u32) }
   reps = Array.new(r.u16) { "@#{r.u32}" }
   lv = Array.new(r.u16) { sym.(r.u32) }
-  puts "  @#{i + 1} #{h.to_s(16)} locals=#{nlocals} regs=#{nregs} iseq=#{ilen}B catch=#{clen} " \
+  puts "  @#{i + 1} #{tag}#{h.to_s(16)} locals=#{nlocals} regs=#{nregs} iseq=#{ilen}B catch=#{clen} " \
        "pool=#{pool.inspect} syms=#{isyms.join(',')} reps=#{reps.join(',')} lv=#{lv.join(',')}"
   puts "     #{iseq.unpack1('H*')}" if show_iseq
 end
@@ -98,6 +100,10 @@ nobj.times do |i|
   k = r.u8
   if k == 1
     puts "  ##{i + 1} = #{r.str}"
+    next
+  end
+  if k == 15
+    puts "  ##{i + 1} = #{r.str} (runs irep @#{r.u32})"
     next
   end
   klass = r.u32

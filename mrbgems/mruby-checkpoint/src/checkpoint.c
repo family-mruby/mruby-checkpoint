@@ -100,6 +100,19 @@ mrb_checkpoint_baseline(mrb_state *mrb)
 }
 
 MRB_API void
+mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn, void *ud)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g || !g->perm) return;
+  uint32_t n = checkpoint_perm_count(g->perm);
+  for (uint32_t i = 0; i < n; i++) {
+    int is_func = 0;
+    const char *name = checkpoint_perm_name_at(g->perm, i, &is_func);
+    fn(name, is_func, ud);
+  }
+}
+
+MRB_API void
 mrb_checkpoint_set_mode(mrb_state *mrb, enum mrb_checkpoint_mode mode)
 {
   checkpoint_state *g = checkpoint_get(mrb);

@@ -13,6 +13,10 @@
 **   checkpoint resume [--inproc] [--out FILE] image
 **       Restores image in a new process and continues from the line after
 **       the save / suspend.
+**   checkpoint names
+**       Prints the names of the baseline (the permanent objects and C
+**       functions an image refers to by name), one per line, in the order
+**       they were given; C functions are prefixed by "F:" already.
 **
 ** Exit status: 0 normal end or suspend, 1 uncaught exception, 2 usage / I/O,
 ** 3 the image could not be restored.
@@ -28,12 +32,20 @@
 #include <mruby/variable.h>
 #include <mruby/checkpoint.h>
 
+static void
+print_name(const char *name, int is_func, void *ud)
+{
+  (void)is_func; (void)ud;
+  puts(name);
+}
+
 static int
 usage(void)
 {
   fprintf(stderr,
           "usage: checkpoint run [--ignore] [--inproc] [--out FILE] prog.rb\n"
-          "       checkpoint resume [--inproc] [--out FILE] image\n");
+          "       checkpoint resume [--inproc] [--out FILE] image\n"
+          "       checkpoint names\n");
   return 2;
 }
 
@@ -137,6 +149,13 @@ main(int argc, char **argv)
 
   if (argc < 2) return usage();
   const char *cmd = argv[1];
+  if (strcmp(cmd, "names") == 0) {
+    if (argc != 2) return usage();
+    mrb_state *mrb = open_state();
+    mrb_checkpoint_each_name(mrb, print_name, NULL);
+    mrb_close(mrb);
+    return 0;
+  }
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--ignore") == 0) ignore = 1;
     else if (strcmp(argv[i], "--inproc") == 0) inproc = 1;

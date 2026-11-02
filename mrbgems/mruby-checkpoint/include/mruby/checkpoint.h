@@ -44,6 +44,13 @@ typedef void (*mrb_checkpoint_handler)(mrb_state *mrb, const uint8_t *buf, size_
    and before loading the program, on both the writing and the reading side. */
 MRB_API void mrb_checkpoint_baseline(mrb_state *mrb);
 
+/* The names of the baseline (doc/format_v0.md section 8), in the order they
+   were given: fn is called once per name; is_func is 1 for a C function
+   (F:...), 0 for an object. A reader of another implementation builds its
+   table of names from this list. Call after mrb_checkpoint_baseline. */
+typedef void (*mrb_checkpoint_name_fn)(const char *name, int is_func, void *ud);
+MRB_API void mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn, void *ud);
+
 MRB_API void mrb_checkpoint_set_mode(mrb_state *mrb, enum mrb_checkpoint_mode mode);
 MRB_API void mrb_checkpoint_set_output(mrb_state *mrb, const char *path); /* overrides the path given to save / suspend */
 MRB_API void mrb_checkpoint_set_handler(mrb_state *mrb, mrb_checkpoint_handler fn, void *ud);

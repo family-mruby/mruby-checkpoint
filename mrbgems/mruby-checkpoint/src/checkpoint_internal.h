@@ -28,7 +28,11 @@ enum {
   GK_PERM = 1, GK_OBJECT = 2, GK_STRING = 3, GK_ARRAY = 4, GK_HASH = 5,
   GK_RANGE = 6, GK_EXCEPTION = 7, GK_CLASS = 8, GK_MODULE = 9,
   GK_SCLASS = 10, GK_ICLASS = 11, GK_PROC = 12, GK_ENV = 13, GK_DATA = 14,
+  GK_PERM_BODY = 15,  /* a permanent Proc a frame runs: its name and its irep (carried) */
 };
+
+/* irep record kinds */
+enum { GR_CARRIED = 0, GR_PERM = 1, GR_PERM_CARRIED = 2 };
 
 /* instance types of a class (what Class#allocate makes) */
 enum {
@@ -154,6 +158,8 @@ void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);
 const char *checkpoint_perm_name_of(checkpoint_perm *P, const void *obj);
 const char *checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f);
 const void *checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is_func);
+uint32_t checkpoint_perm_count(checkpoint_perm *P);
+const char *checkpoint_perm_name_at(checkpoint_perm *P, uint32_t i, int *is_func);
 int checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash);
 const mrb_irep *checkpoint_perm_irep_by_hash(checkpoint_perm *P, uint64_t hash);
 gsnap *checkpoint_perm_snap(checkpoint_perm *P, const void *obj);

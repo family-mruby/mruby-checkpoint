@@ -22,6 +22,20 @@
 #               reference
 # Every image must also read cleanly with tools/checkpoint_inspect.rb.
 #
+# SabiRuby (the Rust mruby VM, built with its feature `checkpoint`) resumes the images too,
+# one way (mruby -> SabiRuby). For each sample and each writer (64 and 32):
+#   A->sabiruby #k   the k-th image along the chain of suspends (the chain goes on in the
+#                    C mruby of the same width) resumed on SabiRuby: what the C processes
+#                    printed before it + SabiRuby's output must equal the reference.
+#                    SabiRuby writes no image: its save / suspend answer what the reference
+#                    run (--ignore) answers, so it runs on to the end.
+#   A save->sabiruby the image of a save sample resumed on SabiRuby: NAME.resumed.out.
+#   Annotation `sabiruby-refuse K "TEXT"`: SabiRuby must refuse the K-th image (exit
+#   status not 0, nothing on stdout) with a message that contains TEXT.
+# The SabiRuby binary is SABIRUBY_BIN, or SABIRUBY_DIR/target/release/sabiruby (build it
+# with `rake sabiruby`). Without one, or with one built without the feature, these checks
+# are skipped and the run says so.
+#
 # Annotations in the sample (lines "# checkpoint-test: ..."):
 #   suspend-after "LINE"  the first process's output must end with LINE
 #                         (the suspend happened right there)
@@ -189,6 +203,72 @@ samples.each do |path|
   end
 end
 
+def sabiruby_bin
+  bin = ENV['SABIRUBY_BIN'] || (ENV['SABIRUBY_DIR'] && File.join(ENV['SABIRUBY_DIR'], 'target/release/sabiruby'))
+  return [nil, 'set SABIRUBY_DIR (a SabiRuby checkout with the feature checkpoint) or SABIRUBY_BIN'] unless bin
+  bin = File.expand_path(bin)
+  return [nil, "#{bin} does not exist (rake sabiruby builds it)"] unless File.executable?(bin)
+  help, = Open3.capture2e(bin, '--help')
+  return [nil, "#{bin} was built without the feature checkpoint"] unless help.include?('--resume')
+  [bin, nil]
+end
+
+SABIRUBY, sabiruby_skip = sabiruby_bin
+$sabiruby_skipped = 0
+
+def sabiruby_resume(img, dir)
+  out, err, st = Open3.capture3(SABIRUBY, '--resume', img, chdir: dir)
+  [out, err, st.exitstatus]
+end
+
 puts
-puts "#{$pass} passed, #{$fail} failed"
+if SABIRUBY.nil?
+  puts "SKIP SabiRuby resume: #{sabiruby_skip}"
+else
+  puts "SabiRuby resume (#{SABIRUBY}):"
+  samples.each do |path|
+    name = File.basename(path, '.rb')
+    src = File.read(path)
+    ann = src.lines.grep(/^# checkpoint-test:/).map { |l| l.sub(/^# checkpoint-test:\s*/, '').strip }
+    next if ann.include?('refuse')
+    save_after = ann.any? { |a| a.start_with?('save-after') }
+    refused = ann.filter_map { |a| (m = a.match(/\Asabiruby-refuse (\d+) "(.*)"\z/)) && [m[1].to_i, m[2]] }.to_h
+    golden = File.read(path.sub(/\.rb\z/, '.out'))
+    puts "#{name}:"
+    Dir.mktmpdir('checkpoint-sabiruby') do |dir|
+      FileUtils.cp(path, dir)
+      file = File.basename(path)
+      img = File.join(dir, 'img.ckpt')
+      %w(64 32).each do |a|
+        FileUtils.rm_f(img)
+        prefix, = run(a, 'run', '--out', img, file, dir: dir)
+        if save_after
+          resumed = File.read(path.sub(/\.rb\z/, '.resumed.out'))
+          o, e, s = sabiruby_resume(img, dir)
+          check("#{a} save->sabiruby: output = #{name}.resumed.out", o == resumed && s == 0 && e.empty?, e + diff(resumed, o))
+          next
+        end
+        k = 0
+        while File.exist?(img) && k < 20
+          k += 1
+          FileUtils.mv(img, img + '.in')
+          o, e, s = sabiruby_resume(img + '.in', dir)
+          if (why = refused[k])
+            check("#{a}->sabiruby image #{k} refused: #{why}", s != 0 && o.empty? && e.include?(why), e)
+          else
+            joined = prefix + o
+            check("#{a}->sabiruby image #{k}", joined == golden && s == 0 && e.empty?, e + diff(golden, joined))
+          end
+          # the chain goes on in C mruby to the next image
+          o, = run(a, 'resume', '--out', img, img + '.in', dir: dir)
+          prefix += o
+        end
+        check("#{a}: at least one image", k > 0)
+      end
+    end
+  end
+end
+
+puts
+puts "#{$pass} passed, #{$fail} failed#{SABIRUBY ? '' : ' (SabiRuby resume skipped)'}"
 exit($fail == 0 ? 0 : 1)

@@ -32,6 +32,7 @@ typedef struct {
   gbuf syms, ireps, objs, patches, vm;
   uint32_t nsym, nirep, nobj, npatch;
   pmap symid, irepid, objid;
+  pmap body;        /* permanent Procs a frame runs: their irep is carried too */
   struct RBasic **oq; char **olabel; size_t oq_cap;
   const mrb_irep **iq; size_t iq_cap;
   int failed;
@@ -275,6 +276,14 @@ w_object(dumper *d, uint32_t id)
 
   const char *pname = checkpoint_perm_name_of(d->P, o);
   if (pname) {
+    if (pm_get(&d->body, o, NULL)) {
+      /* a frame runs this mrblib method: its irep goes along (GR_PERM_CARRIED),
+         so a reader whose mrblib differs can still run the frame */
+      gb_u8(mrb, b, GK_PERM_BODY);
+      gb_str(mrb, b, pname, strlen(pname));
+      gb_u32(mrb, b, irep_ref(d, ((struct RProc*)o)->body.irep));
+      return;
+    }
     gb_u8(mrb, b, GK_PERM);
     gb_str(mrb, b, pname, strlen(pname));
     return;
@@ -503,13 +512,19 @@ w_irep(dumper *d, uint32_t id)
   const mrb_irep *irep = d->iq[id - 1];
   uint64_t h;
 
+  /* A permanent irep (mrblib) is in the table only because live code needs it:
+     a frame runs it or a Proc made at run time holds it. Its hash binds it on a
+     reader with the same mrblib; its content goes along for a reader whose
+     mrblib differs (another build, another VM). Its children are reached
+     through the content and are carried the same way. */
   if (checkpoint_perm_irep(d->P, irep, &h)) {
-    gb_u8(mrb, b, 1);
+    gb_u8(mrb, b, GR_PERM_CARRIED);
     gb_u64(mrb, b, h);
-    return;
   }
-  gb_u8(mrb, b, 0);
-  gb_u64(mrb, b, checkpoint_irep_hash(mrb, irep));
+  else {
+    gb_u8(mrb, b, GR_CARRIED);
+    gb_u64(mrb, b, checkpoint_irep_hash(mrb, irep));
+  }
   gb_u16(mrb, b, irep->nlocals);
   gb_u16(mrb, b, irep->nregs);
   gb_u16(mrb, b, irep->clen);
@@ -717,6 +732,10 @@ w_vm(dumper *d)
            ci->mid ? mrb_sym_name(mrb, ci->mid) : "?");
       return;
     }
+    if (!MRB_PROC_ALIAS_P(p) && checkpoint_perm_name_of(d->P, p) &&
+        checkpoint_perm_irep(d->P, p->body.irep, NULL)) {
+      pm_put(mrb, &d->body, p, 1);
+    }
     gb_u32(mrb, b, sym_ref(d, ci->mid));
     snprintf(label, sizeof(label), "proc of frame %u", k);
     gb_u32(mrb, b, obj_ref(d, p, label));
@@ -805,6 +824,7 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   gb_free(mrb, &d.syms); gb_free(mrb, &d.ireps); gb_free(mrb, &d.objs);
   gb_free(mrb, &d.patches); gb_free(mrb, &d.vm);
   pm_free(mrb, &d.symid); pm_free(mrb, &d.irepid); pm_free(mrb, &d.objid);
+  pm_free(mrb, &d.body);
   for (uint32_t i = 0; i < d.nobj; i++) mrb_free(mrb, d.olabel[i]);
   mrb_free(mrb, d.oq); mrb_free(mrb, d.olabel); mrb_free(mrb, d.iq);
   return d.failed ? -1 : 0;

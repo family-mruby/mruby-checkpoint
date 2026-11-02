@@ -170,6 +170,32 @@ r_syms(reader *r)
   }
 }
 
+/* the content of a GR_PERM_CARRIED record whose hash this build has */
+static void
+skip_irep_content(reader *r)
+{
+  uint32_t len;
+  r_u16(r); r_u16(r);                      /* nlocals, nregs */
+  uint16_t clen = r_u16(r);
+  uint32_t ilen = r_u32(r);
+  size_t n = (size_t)ilen + sizeof(struct mrb_irep_catch_handler) * clen;
+  if (!need(r, n)) return;
+  r->p += n;
+  uint16_t plen = r_u16(r);
+  for (int k = 0; k < plen && !r->failed; k++) {
+    uint8_t t = r_u8(r);
+    if (t == 1 || t == 2) r_u64(r);
+    else if (t == 0 || t == 3) r_str(r, &len);
+    else rfail(r, "bad pool entry type %u", t);
+  }
+  uint16_t slen = r_u16(r);
+  for (int k = 0; k < slen; k++) r_u32(r);
+  uint16_t rlen = r_u16(r);
+  for (int k = 0; k < rlen; k++) r_u32(r);
+  uint16_t nlv = r_u16(r);
+  for (int k = 0; k < nlv; k++) r_u32(r);
+}
+
 static void
 r_ireps(reader *r)
 {
@@ -185,16 +211,25 @@ r_ireps(reader *r)
     uint8_t kind = r_u8(r);
     uint64_t hash = r_u64(r);
     hashes[i] = hash;
-    if (kind == 1) {
+    if (kind == GR_PERM || kind == GR_PERM_CARRIED) {
+      /* this build's own mrblib irep when the hash matches (the same build);
+         otherwise the carried content is built like a program's irep */
       const mrb_irep *pi = checkpoint_perm_irep_by_hash(r->P, hash);
-      if (!pi) {
+      if (pi) {
+        if (kind == GR_PERM_CARRIED) skip_irep_content(r);
+        r->ireps[i] = (mrb_irep*)pi;
+        r->irep_perm[i] = 1;
+        continue;
+      }
+      if (kind == GR_PERM) {
         rfail(r, "permanent irep %016llx not found in this build (a different mrblib?)",
               (unsigned long long)hash);
         break;
       }
-      r->ireps[i] = (mrb_irep*)pi;
-      r->irep_perm[i] = 1;
-      continue;
+    }
+    else if (kind != GR_CARRIED) {
+      rfail(r, "bad irep kind %u (@%u)", kind, i + 1);
+      break;
     }
     mrb_irep *irep = mrb_add_irep(mrb);
     r->ireps[i] = irep;
@@ -396,8 +431,11 @@ r_object(reader *r, uint32_t id)
   uint8_t kind = r_u8(r);
   struct RBasic *o = r->fill ? r->objs[id - 1] : NULL;
 
-  if (kind == GK_PERM) {
+  if (kind == GK_PERM || kind == GK_PERM_BODY) {
     uint32_t len; const uint8_t *name = r_str(r, &len);
+    /* GK_PERM_BODY also names the irep the frames run; this reader binds the
+       Proc by name and its frames use that Proc's own irep (the same build) */
+    if (kind == GK_PERM_BODY) r_u32(r);
     if (!r->fill) {
       int is_func = 0;
       const void *p = checkpoint_perm_lookup(r->P, (const char*)name, len, &is_func);
@@ -832,7 +870,7 @@ mrb_checkpoint_resume(mrb_state *mrb, const uint8_t *buf, size_t len)
       mrb_hash_set(mrb, mrb_obj_value(r.hents[i].h), r.hents[i].k, r.hents[i].v);
     }
     for (uint32_t i = 0; i < r.nobj; i++) {
-      if (r.okind[i] != GK_PERM && r.ofrozen[i]) r.objs[i]->frozen = 1;
+      if (r.okind[i] != GK_PERM && r.okind[i] != GK_PERM_BODY && r.ofrozen[i]) r.objs[i]->frozen = 1;
     }
   }
   if (!r.failed) r_vm(&r);

@@ -535,6 +535,20 @@ checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is
   return NULL;
 }
 
+uint32_t
+checkpoint_perm_count(checkpoint_perm *P)
+{
+  return P->n;
+}
+
+const char*
+checkpoint_perm_name_at(checkpoint_perm *P, uint32_t i, int *is_func)
+{
+  if (i >= P->n) return NULL;
+  if (is_func) *is_func = P->is_func[i];
+  return P->names[i];
+}
+
 int
 checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash)
 {

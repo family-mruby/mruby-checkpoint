@@ -6,6 +6,9 @@
 #                -- the same with the 64-bit driver built with AddressSanitizer
 #                   (stress: also MRB_GC_STRESS, a full GC at every allocation)
 #   rake bench   -- benchmark: unpatched / patched / patched + mruby-checkpoint
+#   rake sabiruby -- build the `sabiruby` command with its feature checkpoint in
+#                   SABIRUBY_DIR (a SabiRuby checkout); rake test then also resumes
+#                   every image on it (skipped, with a notice, without one)
 #
 # vendor/mruby (the submodule) is never modified. Its tree is copied into
 # build/src/<variant> and patches/*.patch are applied to the copy.
@@ -94,6 +97,12 @@ namespace :test do
       sh({ 'CHECKPOINT_BIN64' => bin }, 'ruby', File.join(ROOT, 'tools/run_tests.rb'))
     end
   end
+end
+
+desc 'build sabiruby (feature checkpoint) in SABIRUBY_DIR for the resume tests'
+task :sabiruby do
+  dir = ENV['SABIRUBY_DIR'] or abort 'set SABIRUBY_DIR to a SabiRuby checkout'
+  sh "cargo build --release -p sabiruby-cli --features checkpoint --manifest-path #{File.join(dir, 'Cargo.toml')}"
 end
 
 desc 'benchmark: unpatched vs patched vs patched + mruby-checkpoint (64-bit)'
