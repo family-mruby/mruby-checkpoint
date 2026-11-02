@@ -1,0 +1,44 @@
+--- a/src/vm.c
++++ b/src/vm.c
+@@ -1603,6 +1603,15 @@
+ #define CALL_CODE_HOOKS() do { insn = BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); } while (0)
+ 
+ #ifdef MRB_USE_TASK_SCHEDULER
++/* Safe point hook (mruby-ghost). Called from the task-switch check, only
++   while task.switching is pending and only where a task switch would be
++   allowed apart from the root-context rule: no exception in flight, no
++   ObjectSpace walk, no C call boundary on the call-info stack. At that
++   point every frame's pc and registers are in memory (ci->pc, ci->stack).
++   The hook may return (nothing to do), raise, or never return. NULL by
++   default, so normal execution pays nothing beyond the existing check. */
++void (*mrb_vm_safepoint_hook)(mrb_state *mrb) = NULL;
++
+ /* TRUE when the current context is executing across a C call boundary, i.e.
+    a C function on the stack re-entered the VM (mrb_funcall / mrb_yield /
+    mrb_vm_run). A task cannot be suspended at such a point: the C stack
+@@ -1663,12 +1672,19 @@
+    This macro must only be expanded where prev_jmp is in scope, i.e.
+    inside mrb_vm_exec (via NEXT / END_DISPATCH). */
+ #define RETURN_IF_TASK_STOPPED(mrb) do { \
+-  if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
+-       !(mrb)->exc && \
+-       !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
+-      (mrb)->c->status == MRB_TASK_STOPPED) { \
+-    (mrb)->jmp = prev_jmp; \
+-    return mrb_nil_value(); \
++  if ((mrb)->task.switching || (mrb)->c->status == MRB_TASK_STOPPED) { \
++    if ((mrb)->task.switching && mrb_vm_safepoint_hook && \
++        !(mrb)->exc && !(mrb)->gc.iterating && \
++        !task_across_c_boundary(mrb)) { \
++      mrb_vm_safepoint_hook(mrb); \
++    } \
++    if (((mrb)->task.switching && (mrb)->c != (mrb)->root_c && \
++         !(mrb)->exc && \
++         !(mrb)->gc.iterating && !task_across_c_boundary(mrb)) || \
++        (mrb)->c->status == MRB_TASK_STOPPED) { \
++      (mrb)->jmp = prev_jmp; \
++      return mrb_nil_value(); \
++    } \
+   } \
+ } while (0)
+ #define TASK_STOP(mrb) do { \
