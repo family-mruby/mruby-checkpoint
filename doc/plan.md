@@ -52,14 +52,22 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 
 | 段 | 内容 | 状態 |
 |---|---|---|
-| P1 | 形式 v0、同じプロセスの往復、64bit ⇔ 32bit (スコープ 1-3) | 指示済 |
+| P1 | 形式 v0、同じプロセスの往復、64bit ⇔ 32bit (スコープ 1-3) | 検収済 (2026-11-02) |
+| P1b | mruby-checkpoint への改名、`save` / `suspend`、C の境目の中は例外 | 指示済 |
 | P2 | mruby → SabiRuby の片道 (スコープ 4) | 未 |
 | P3 | 試験一式のランダムな安全点での往復 (スコープ 5) | 未 |
+
+## 決まったこと (2026-11-02)
+
+- SabiRuby 側の変更は、SabiRuby のリポジトリの中の `ghost` の feature (既定は off) として
+  ブランチで足す (feature 名は P2 で改めて決める)。計画は SabiRuby の `docs/plans/` に
+  作者向けの案として置く。
+- P2 では、止まっていたフレームが指す mrblib の irep だけ中身も運び、他の mrblib は
+  名前で引き当てる (SabiRuby の mrblib は 4.1.0-rc2 で作られ、ハッシュが合わない)。
 
 ## 未確定事項
 
 - `hop` を Ruby から呼ぶ形 (cfunc の呼び出し自体が C の境目になる)。P1 で案を出す。
 - 書き出す前のフル GC と、Env の切り離しの扱い。
-- SabiRuby 側の変更の置き場所 (SabiRuby のブランチか、ここの crate か)。
 - Family mruby の mruby には patch がある (`vm.c` の自前の時分割、mruby-task、
   アロケータ estalloc)。持ち込むときに差を見る。
