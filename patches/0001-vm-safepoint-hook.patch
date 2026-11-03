@@ -1,6 +1,6 @@
 --- a/src/vm.c
 +++ b/src/vm.c
-@@ -1622,6 +1622,36 @@
+@@ -1622,6 +1622,42 @@
    return FALSE;
  }
  
@@ -30,6 +30,12 @@
 +      if (!mrb->task.switching) return mrb->c->status == MRB_TASK_STOPPED;
 +    }
 +    if (mrb->c != mrb->root_c) return TRUE;
++    /* The root context has no task to leave: the scheduler clears the flag
++       before it runs a task (execute_task) anyway. Cleared here, so that a
++       flag a HAL raises while the root context runs (one that ends
++       timeslices on a cadence, running task or not) does not send every
++       following instruction down this slow path. */
++    mrb->task.switching = FALSE;
 +  }
 +  return mrb->c->status == MRB_TASK_STOPPED;
 +}
@@ -37,7 +43,7 @@
  /* Defer task switches while a C-level ObjectSpace walk holds gc.iterating
     true. The walk runs callbacks (which may call back into mrb_vm_exec via
     mrb_yield); returning early from an inner exec while the outer C
-@@ -1662,15 +1692,23 @@
+@@ -1662,15 +1698,23 @@
  
     This macro must only be expanded where prev_jmp is in scope, i.e.
     inside mrb_vm_exec (via NEXT / END_DISPATCH). */
@@ -67,7 +73,7 @@
  #define TASK_STOP(mrb) do { \
    if (mrb->c->status != MRB_TASK_STOPPED) \
      mrb->c->status = MRB_TASK_STOPPED; \
-@@ -3919,6 +3957,16 @@
+@@ -3919,6 +3963,16 @@
        return regs[irep->nlocals];
      }
    }

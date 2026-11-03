@@ -20,7 +20,7 @@ The gem `mrbgems/mruby-checkpoint` works with an mruby that has these patches ap
 
 | Patch | Touches | Purpose |
 |---|---|---|
-| `0001-vm-safepoint-hook.patch` | `src/vm.c` | A safe-point hook, called from the slow path of the per-instruction check (`RETURN_IF_TASK_STOPPED`). The VM reloads its frame afterwards, since the hook may move the call-info stack. |
+| `0001-vm-safepoint-hook.patch` | `src/vm.c` | A safe-point hook, called from the slow path of the per-instruction check (`RETURN_IF_TASK_STOPPED`). The VM reloads its frame afterwards, since the hook may move the call-info stack. A switch request raised while the root context runs (no task to leave) is dropped there, so it does not keep the following instructions on the slow path. |
 | `0002-task-switch-requests.patch` | `include/mruby.h`, mruby-task | The scheduler counts its switch requests, so an external checkpoint request never swallows one (e.g. a `Task.pass`). |
 | `0003-vm-return-target-class.patch` | `src/vm.c`, `include/mruby.h` | Removes a stale test in `OP_RETURN`. Merged upstream as mruby/mruby#7731; not needed with later mruby. |
 

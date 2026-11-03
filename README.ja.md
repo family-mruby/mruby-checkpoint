@@ -17,7 +17,7 @@ gem `mrbgems/mruby-checkpoint` は、mruby の本体に次の patch を当てた
 
 | patch | 変える所 | 何のため |
 |---|---|---|
-| `0001-vm-safepoint-hook.patch` | `src/vm.c` | セーフポイントの hook。命令の境目の判定 (`RETURN_IF_TASK_STOPPED`) の遅い側から呼び、hook が呼び出しの表を動かしたらフレームを取り直す |
+| `0001-vm-safepoint-hook.patch` | `src/vm.c` | セーフポイントの hook。命令の境目の判定 (`RETURN_IF_TASK_STOPPED`) の遅い側から呼び、hook が呼び出しの表を動かしたらフレームを取り直す。ルートのコンテキスト (抜ける Task が無い) で立った切り替えの要求はそこで下ろし、続く命令が遅い側を通り続けないようにする |
 | `0002-task-switch-requests.patch` | `include/mruby.h`、mruby-task | スケジューラが切り替えを要求した回数を数える (外からの停止と `Task.pass` が重なっても失わない) |
 | `0003-vm-return-target-class.patch` | `src/vm.c`、`include/mruby.h` | `OP_RETURN` の古い判定を消す。上流の mruby/mruby#7731 で取り込まれたので、それ以降の mruby では要らない |
 
