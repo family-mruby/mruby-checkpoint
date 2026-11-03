@@ -140,7 +140,7 @@ MRB_API mrb_value mrb_checkpoint_host_task(mrb_state *mrb);
 
 /* The embedder's allocator for the work areas of a dump and of a restore:
    the image being written, the number tables, the reader's tables, the
-   liveness pass. They live only while an image is written or read, and an
+   liveness pass, the copies of method and ivar tables the dump compares. They live only while an image is written or read, and an
    embedder that runs each program in a fixed pool (Family mruby) keeps them
    out of it, so that a program whose pool is nearly full can still be
    written. fn(ud, p, size) works like realloc: p NULL allocates, size 0

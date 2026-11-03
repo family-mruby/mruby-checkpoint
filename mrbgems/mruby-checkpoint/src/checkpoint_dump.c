@@ -209,7 +209,7 @@ w_ivars(dumper *d, gbuf *b, struct RBasic *o, uint32_t id)
     snprintf(label, sizeof(label), "ivar %s of #%u", mrb_sym_name(d->mrb, iv[i].sym), id);
     w_value(d, b, iv[i].val, label);
   }
-  mrb_free(d->mrb, iv);
+  checkpoint_collect_free(d->mrb, iv);
 }
 
 static uint8_t
@@ -341,7 +341,7 @@ w_object(dumper *d, uint32_t id)
     gb_str(mrb, b, pname, strlen(pname));
     return;
   }
-  if (pm_get(&d->P->heap, o, NULL)) {
+  if (checkpoint_perm_heap_p(d->P, o)) {
     if (o->tt == MRB_TT_CLASS || o->tt == MRB_TT_MODULE) {
       fail(d, "object made by mrb_open has no name: %s %s (%s)",
            type_name(o->tt), class_name(mrb, (struct RClass*)o), reach);
@@ -454,7 +454,7 @@ w_object(dumper *d, uint32_t id)
     gb_u32(mrb, b, (uint32_t)n);
     snprintf(label, sizeof(label), "#%u", id);
     for (int i = 0; i < n; i++) w_method(d, b, c, mt[i].sym, mt[i].flags, mt[i].ptr, label);
-    mrb_free(mrb, mt);
+    checkpoint_collect_free(mrb, mt);
     break;
   }
 
@@ -472,7 +472,7 @@ w_object(dumper *d, uint32_t id)
       gb_u32(mrb, b, (uint32_t)n);
       snprintf(label, sizeof(label), "#%u", id);
       for (int i = 0; i < n; i++) w_method(d, b, c, mt[i].sym, mt[i].flags, mt[i].ptr, label);
-      mrb_free(mrb, mt);
+      checkpoint_collect_free(mrb, mt);
       break;
     }
     HEADER(GK_ICLASS);  /* the class field is the included module */
@@ -847,10 +847,12 @@ w_patches(dumper *d)
       struct RClass *c = (struct RClass*)o;
       gmt_entry *mt; int n;
       checkpoint_collect_mt(mrb, c, &mt, &n);
+      const gsnap_mt *smt = P->mt + s->mt;
       for (int i = 0; i < n; i++) {
         int j;
-        for (j = 0; j < s->nmt; j++) if (s->mt[j].sym == mt[i].sym) break;
-        if (j < s->nmt && s->mt[j].flags == mt[i].flags && s->mt[j].ptr == mt[i].ptr) continue;
+        for (j = 0; j < s->nmt; j++) if (smt[j].sym == mt[i].sym) break;
+        if (j < s->nmt && smt[j].flags == mt[i].flags &&
+            checkpoint_perm_ref(P, smt[j].ref) == mt[i].ptr) continue;
         gb_u8(mrb, &d->patches, GP_METHOD_SET);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
         w_method(d, &d->patches, c, mt[i].sym, mt[i].flags, mt[i].ptr, name);
@@ -858,25 +860,25 @@ w_patches(dumper *d)
       }
       for (int j = 0; j < s->nmt; j++) {
         int i;
-        for (i = 0; i < n; i++) if (s->mt[j].sym == mt[i].sym) break;
+        for (i = 0; i < n; i++) if (smt[j].sym == mt[i].sym) break;
         if (i < n) continue;
         gb_u8(mrb, &d->patches, GP_METHOD_REMOVE);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
-        gb_u32(mrb, &d->patches, sym_ref(d, s->mt[j].sym));
+        gb_u32(mrb, &d->patches, sym_ref(d, smt[j].sym));
         d->npatch++;
       }
-      mrb_free(mrb, mt);
+      checkpoint_collect_free(mrb, mt);
     }
       /* fall through */
     case MRB_TT_ICLASS: {
       struct RClass *c = (struct RClass*)o;
-      if (c->super != s->super) {
+      if (c->super != s->u.super) {
         gb_u8(mrb, &d->patches, GP_SUPER_SET);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
         gb_u32(mrb, &d->patches, obj_ref(d, c->super, label));
         d->npatch++;
       }
-      if (o->tt != MRB_TT_ICLASS && (c->flags & MRB_FL_CLASS_IS_PREPENDED) != s->cflags) {
+      if (o->tt != MRB_TT_ICLASS && ((c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0) != s->cflags) {
         gb_u8(mrb, &d->patches, GP_CLASS_FLAGS);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
         gb_u8(mrb, &d->patches, (c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0);
@@ -888,12 +890,12 @@ w_patches(dumper *d)
     case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: {
       giv_entry *iv; int n;
       checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
-      diff_iv(d, o, s->iv, s->niv, iv, n, name);  /* refers to o only if something changed */
-      mrb_free(mrb, iv);
+      diff_iv(d, o, P->iv + s->iv, s->niv, iv, n, name);  /* refers to o only if something changed */
+      checkpoint_collect_free(mrb, iv);
       break;
     }
     case MRB_TT_ISTRUCT:
-      if (checkpoint_content_digest(mrb, o) != s->digest) {
+      if (checkpoint_content_digest(mrb, o) != s->u.digest) {
         if (!is_random(mrb, o)) {
           fail(d, "permanent %s (inline C struct of class %s) was modified", name, class_name(mrb, o->c));
           break;
@@ -908,7 +910,7 @@ w_patches(dumper *d)
       }
       break;
     case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_HASH:
-      if (checkpoint_content_digest(mrb, o) != s->digest) {
+      if (checkpoint_content_digest(mrb, o) != s->u.digest) {
         /* the whole contents again, as in the object record (and frozen) */
         mrb_value v = mrb_obj_value(o);
         gb_u8(mrb, &d->patches, GP_CONTENT_SET);
@@ -937,8 +939,8 @@ w_patches(dumper *d)
         /* a Hash's ivars (its default value) */
         giv_entry *iv; int n;
         checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
-        diff_iv(d, o, s->iv, s->niv, iv, n, name);
-        mrb_free(mrb, iv);
+        diff_iv(d, o, P->iv + s->iv, s->niv, iv, n, name);
+        checkpoint_collect_free(mrb, iv);
       }
       break;
     default:
@@ -969,7 +971,7 @@ w_patches(dumper *d)
     gb_u32(mrb, &d->patches, sym_ref(d, P->gv[j].sym));
     d->npatch++;
   }
-  mrb_free(mrb, gv);
+  checkpoint_collect_free(mrb, gv);
 }
 
 /* ---- the VM: execution contexts ---- */

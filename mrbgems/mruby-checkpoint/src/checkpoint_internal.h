@@ -164,13 +164,23 @@ typedef struct {
   mrb_value val;
 } giv_entry;
 
+/* a method of a permanent class as the baseline saw it: its Proc or C
+   function by name (index + 1 into the names; 0: undefined) */
+typedef struct {
+  mrb_sym sym;
+  uint32_t flags;
+  uint32_t ref;
+} gsnap_mt;
+
 typedef struct {
   struct RBasic *obj;     /* class, module, sclass, iclass or plain object */
-  struct RClass *super;   /* classes only */
-  uint32_t cflags;        /* classes only: MRB_FL_CLASS_IS_PREPENDED */
-  gmt_entry *mt; int nmt;
-  giv_entry *iv; int niv;
-  uint64_t digest;        /* string/array/hash contents */
+  union {
+    struct RClass *super; /* classes */
+    uint64_t digest;      /* string/array/hash/istruct contents */
+  } u;
+  uint32_t mt, iv;        /* the first of its entries in perm->mt / perm->iv */
+  uint16_t nmt, niv;
+  uint8_t cflags;         /* classes only: 1 if MRB_FL_CLASS_IS_PREPENDED */
 } gsnap;
 
 typedef struct {
@@ -188,21 +198,25 @@ typedef struct {
 
 void checkpoint_gc_settings(mrb_state *mrb, gc_settings *out);
 
+/* the baseline, in flat tables (checkpoint_perm.c, "building") */
 typedef struct checkpoint_perm {
-  /* named permanent things (objects and C functions) */
-  char **names;
-  const void **ptrs;
-  uint8_t *is_func;
-  uint32_t n, cap;
-  pmap obj2name;     /* object pointer -> name index + 1 */
-  pmap func2name;    /* C function pointer -> name index + 1 */
+  /* named permanent things (objects and C functions), in the order named */
+  char *names;            /* the names, NUL-terminated, one after another */
+  uint32_t *name_off;     /* where name i starts; name_off[n] is the end */
+  const void **ptrs;      /* the object or C function of name i */
+  uint8_t *is_func;       /* bit i: name i is a C function */
+  uint32_t n;
+  uint32_t *obj_idx; uint32_t nobj;     /* names of objects, sorted by pointer */
+  uint32_t *func_idx; uint32_t nfunc;   /* names of C functions, sorted by pointer */
 
-  pmap heap;         /* every heap object alive at baseline */
+  struct RArray *keep;    /* every heap object alive at baseline, sorted by address */
 
-  girep_perm *ireps; uint32_t nireps, capireps;
-  pmap irep2idx;     /* irep pointer -> index + 1 */
+  girep_perm *ireps; uint32_t nireps;   /* in the order found */
+  uint32_t *irep_idx;                   /* the same, sorted by irep pointer */
 
-  gsnap *snaps; uint32_t nsnaps, capsnaps;
+  gsnap *snaps; uint32_t nsnaps;
+  gsnap_mt *mt; uint32_t nmt;           /* the snapshots' methods */
+  giv_entry *iv; uint32_t niv;          /* the snapshots' ivars */
   giv_entry *gv; int ngv;
   gc_settings gc;    /* at the baseline */
 } checkpoint_perm;
@@ -287,6 +301,8 @@ checkpoint_perm *checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g);
 void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);
 const char *checkpoint_perm_name_of(checkpoint_perm *P, const void *obj);
 const char *checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f);
+int checkpoint_perm_heap_p(checkpoint_perm *P, const void *obj);   /* alive at baseline */
+const void *checkpoint_perm_ref(checkpoint_perm *P, uint32_t ref);   /* name index + 1 -> pointer */
 const void *checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is_func);
 uint32_t checkpoint_perm_count(checkpoint_perm *P);
 const char *checkpoint_perm_name_at(checkpoint_perm *P, uint32_t i, int *is_func);
@@ -296,10 +312,12 @@ gsnap *checkpoint_perm_snap(checkpoint_perm *P, const void *obj);
 uint64_t checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep);
 uint64_t checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj);
 
-/* snapshots of a class's method table and ivars (also used by the dumper) */
+/* snapshots of a class's method table and ivars (also used by the dumper);
+   work areas while a dump or the baseline runs */
 void checkpoint_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n);
 void checkpoint_collect_iv(mrb_state *mrb, mrb_value obj, giv_entry **out, int *n);
 void checkpoint_collect_gv(mrb_state *mrb, giv_entry **out, int *n);
+void checkpoint_collect_free(mrb_state *mrb, void *p);   /* what the three above gave */
 
 /* liveness: keep[s] = 1 for the stack slots whose values are still read */
 void checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint8_t *keep);
