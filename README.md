@@ -76,6 +76,10 @@ $ build/mruby/host32/bin/checkpoint resume counter.ckpt   # or: sabiruby --resum
 5
 ```
 
+The gem's init only installs the safe-point hook: a VM is set up for checkpoints (its side
+table, the `Checkpoint` module) by `mrb_checkpoint_open()` or by the first call that
+configures it, such as `mrb_checkpoint_baseline()`, so VMs that never use it cost nothing.
+
 Embedders can request an image from outside, without the program's help, with
 `mrb_checkpoint_request()` (written at the next safe point; see
 `include/mruby/checkpoint.h`). The host's own Task is recorded with

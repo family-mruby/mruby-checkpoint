@@ -421,7 +421,7 @@ mrb_checkpoint_continue(mrb_state *mrb)
 MRB_API void
 mrb_checkpoint_set_host_task(mrb_state *mrb, mrb_value task)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   const mrb_data_type *type = checkpoint_task_type(mrb);
   g->host_task = (mrb_type(task) == MRB_TT_CDATA && DATA_TYPE(task) == type) ? DATA_PTR(task) : NULL;

@@ -152,7 +152,7 @@ checkpoint_strdup(mrb_state *mrb, const char *s)
 MRB_API void
 mrb_checkpoint_baseline(mrb_state *mrb)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   checkpoint_perm_free(mrb, g->perm);
   g->perm = NULL;
@@ -177,7 +177,7 @@ mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn, void *ud)
 MRB_API void
 mrb_checkpoint_add_source(mrb_state *mrb, const char *filename, const char *src, size_t len)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g || !filename) return;
   char *text = (char*)mrb_malloc(mrb, len + 1);
   if (len) memcpy(text, src, len);
@@ -214,21 +214,21 @@ checkpoint_source_of(checkpoint_state *g, const char *name, size_t len)
 MRB_API void
 mrb_checkpoint_set_include_source(mrb_state *mrb, mrb_bool on)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (g) g->source_default = on ? 1 : 0;
 }
 
 MRB_API void
 mrb_checkpoint_set_mode(mrb_state *mrb, enum mrb_checkpoint_mode mode)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (g) g->mode = mode;
 }
 
 MRB_API void
 mrb_checkpoint_set_output(mrb_state *mrb, const char *path)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   mrb_free(mrb, g->output);
   g->output = checkpoint_strdup(mrb, path);
@@ -237,7 +237,7 @@ mrb_checkpoint_set_output(mrb_state *mrb, const char *path)
 MRB_API void
 mrb_checkpoint_set_handler(mrb_state *mrb, mrb_checkpoint_handler fn, void *ud)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   g->handler = fn;
   g->handler_ud = ud;
@@ -247,7 +247,7 @@ MRB_API void
 mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const char *name,
                         mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore restore)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   for (int i = 0; i < g->ndata; i++) if (g->data[i].type == type) return;
   g->data = (checkpoint_data_ent*)mrb_realloc(mrb, g->data, sizeof(checkpoint_data_ent) * (g->ndata + 1));
@@ -262,7 +262,7 @@ mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const ch
 MRB_API void
 mrb_checkpoint_register_func(mrb_state *mrb, const char *name, mrb_func_t func)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g || !func) return;
   g->fnames = (char**)mrb_realloc(mrb, g->fnames, sizeof(char*) * (g->nfuncs + 1));
   g->funcs = (mrb_func_t*)mrb_realloc(mrb, g->funcs, sizeof(mrb_func_t) * (g->nfuncs + 1));
@@ -278,7 +278,7 @@ MRB_API void
 mrb_checkpoint_register_data_obj(mrb_state *mrb, const mrb_data_type *type, const char *name,
                                  mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore_obj restore)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   mrb_checkpoint_register_data(mrb, type, name, dump, NULL);
   g->data[g->ndata - 1].restore_obj = restore;
@@ -563,7 +563,7 @@ mrb_checkpoint_request(mrb_state *mrb)
 MRB_API void
 mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handler fn, void *ud)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (!g) return;
   g->refusal = fn;
   g->refusal_ud = ud;
@@ -572,7 +572,7 @@ mrb_checkpoint_set_refusal_handler(mrb_state *mrb, mrb_checkpoint_refusal_handle
 MRB_API void
 mrb_checkpoint_keep_dead_registers(mrb_state *mrb, mrb_bool keep)
 {
-  checkpoint_state *g = checkpoint_get(mrb);
+  checkpoint_state *g = checkpoint_need(mrb);
   if (g) g->keep_dead = keep ? 1 : 0;
 }
 
@@ -693,13 +693,19 @@ box_restore(mrb_state *mrb, const uint8_t *bytes, size_t len)
   return b;
 }
 
-/* ---- gem ---- */
-
-void
-mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
+/* Sets the gem up for one mrb_state: its state, the Ruby API (Checkpoint,
+   Checkpoint::Error, Checkpoint::Box) and the gem's own C data type. Nothing
+   of it exists in a state until the embedder asks: mrb_checkpoint_open(), or
+   any call that configures the gem (the baseline, a handler, a registration).
+   A VM that never uses the gem pays nothing for it but the safe point hook's
+   test of npending at a task switch. */
+checkpoint_state*
+checkpoint_need(mrb_state *mrb)
 {
-  checkpoint_new(mrb);
-  mrb_vm_safepoint_hook = checkpoint_safepoint;
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (g) return g;
+  int ai = mrb_gc_arena_save(mrb);
+  g = checkpoint_new(mrb);
 
   struct RClass *m = mrb_define_module(mrb, "Checkpoint");
   mrb_define_class_under(mrb, m, "Error", mrb->eStandardError_class);
@@ -717,6 +723,25 @@ mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
   mrb_define_method(mrb, box, "value", box_value, MRB_ARGS_NONE());
   mrb_define_method(mrb, box, "value=", box_set_value, MRB_ARGS_REQ(1));
   mrb_checkpoint_register_data(mrb, &box_type, "Checkpoint::Box", box_dump, box_restore);
+  mrb_gc_arena_restore(mrb, ai);
+  return g;
+}
+
+MRB_API void
+mrb_checkpoint_open(mrb_state *mrb)
+{
+  checkpoint_need(mrb);
+}
+
+/* ---- gem ---- */
+
+void
+mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
+{
+  (void)mrb;
+  /* the same function for every state; the state itself comes later
+     (checkpoint_need) */
+  mrb_vm_safepoint_hook = checkpoint_safepoint;
 }
 
 void

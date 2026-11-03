@@ -92,6 +92,9 @@ ruby tools/checkpoint_inspect.rb diff a.ckpt b.ckpt [--json | --html out.html]  
 - 試験のビルド (`build/fuzz`) の mruby-task は仮想の時計 (`mrbgems/hal-task-virtual`) で動く:
   tick はスケジューラが空いたときと root が sleep したときに進む (`checkpoint-fuzz --quantum N`
   は N 命令ごとにも)。
+- gem の初期化はセーフポイントの hook を置くだけ。VM ごとの準備 (状態の表、`Checkpoint` モジュール) は
+  `mrb_checkpoint_open()` か、gem を設定する最初の呼び出し (`mrb_checkpoint_baseline()` など) で行う。
+  使わない VM は費用を払わない。
 - 埋め込む側は `mrb_checkpoint_request()` で、プログラムの協力なしに外から書き出しを要求できる
   (次のセーフポイントで書く。`include/mruby/checkpoint.h`)。間の命令がスケジューラに切り替えを要求したか
   は、mruby-task が要求を数える数で見分ける (`patches/0002-task-switch-requests.patch`)。埋め込む側の Task は

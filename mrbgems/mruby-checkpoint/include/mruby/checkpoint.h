@@ -40,9 +40,18 @@ typedef void (*mrb_checkpoint_handler)(mrb_state *mrb, const uint8_t *buf, size_
                                        const char *path, enum mrb_checkpoint_kind kind,
                                        void *ud);
 
+/* Set the gem up for this state: its side table, the Ruby API (Checkpoint,
+   Checkpoint::Error, Checkpoint::Box). The gem's init does none of it, so a
+   VM that never uses the gem costs nothing; the calls below that configure
+   the gem (the baseline, the setters, the registrations) do it as well.
+   Until then Checkpoint is not defined and the queries answer as for a state
+   with nothing to do. Idempotent. */
+MRB_API void mrb_checkpoint_open(mrb_state *mrb);
+
 /* Record what mrb_open() (and the driver) made: the permanent objects and
    their names, and a snapshot of the permanent classes. Call after mrb_open
-   and before loading the program, on both the writing and the reading side. */
+   and before loading the program, on both the writing and the reading side.
+   Sets the gem up first (mrb_checkpoint_open). */
 MRB_API void mrb_checkpoint_baseline(mrb_state *mrb);
 
 /* The names of the baseline (doc/format_v0.md section 8), in the order they

@@ -247,7 +247,8 @@ typedef struct checkpoint_state {
   int dump_source;            /* the image being written carries SRC0 */
 } checkpoint_state;
 
-checkpoint_state *checkpoint_get(mrb_state *mrb);
+checkpoint_state *checkpoint_get(mrb_state *mrb);    /* NULL until the gem is set up for mrb */
+checkpoint_state *checkpoint_need(mrb_state *mrb);   /* sets it up when it is not */
 /* the registered source of a file, or NULL */
 const struct checkpoint_source *checkpoint_source_of(checkpoint_state *g, const char *name, size_t len);
 char *checkpoint_strdup(mrb_state *mrb, const char *s);   /* mrb_malloc'ed */
