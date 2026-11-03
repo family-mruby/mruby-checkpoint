@@ -233,9 +233,17 @@ typedef struct checkpoint_state {
     int switch_pending;           /* the scheduler had asked for a switch there */
     int loop_running;             /* the scheduler's loop was running */
   } plan;
+  /* P6: the program's source text by file name, for display only (SRC0) */
+  struct checkpoint_source { char *name; char *text; size_t len; } *src;
+  int nsrc;
+  int source_default;         /* mrb_checkpoint_set_include_source */
+  int pending_source;         /* the source: of the save / suspend that waits */
+  int dump_source;            /* the image being written carries SRC0 */
 } checkpoint_state;
 
 checkpoint_state *checkpoint_get(mrb_state *mrb);
+/* the registered source of a file, or NULL */
+const struct checkpoint_source *checkpoint_source_of(checkpoint_state *g, const char *name, size_t len);
 
 checkpoint_perm *checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g);
 void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);

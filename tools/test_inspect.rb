@@ -14,6 +14,13 @@
 #             context, and the contexts that waited); test/inspect/unstarted.rb:
 #             frames that have not started show where they will start, and
 #             each context says what it is doing
+# 2b. source the program's source in the image (SRC0, --with-source and
+#             source:): without it nothing changes; with it the JSON has the
+#             file's text, every frame marks its own line (= its backtrace
+#             line), --stack prints it; frames that have not started and
+#             mrblib's show none; the C readers resume the image as one
+#             without and carry the source on when asked; SabiRuby resumes it
+#             (with SABIRUBY_DIR / SABIRUBY_BIN)
 # 3. diff     test/inspect/diff.rb, diff_task.rb: two saves of one program
 #             differ in what the program changed between them, and only that
 # 4. broken   images cut at every byte or with a byte changed: the reader
@@ -22,7 +29,8 @@
 # 5. html     the page of an image and of a diff: one file that loads
 #             nothing from outside, whose embedded JSON reads back as the
 #             doc; with a headless Chromium (CHECKPOINT_CHROME, or the one
-#             of Playwright's cache), every view draws without a script error
+#             of Playwright's cache), every view draws without a script error,
+#             and the stack view of an image with the source marks the line
 #
 # Exit status 1 when a check fails.
 
@@ -222,6 +230,133 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
     want = [as_task ? 'no_frames' : 'scheduler', 'current', 'task', 'not_started']
     check("#{shape}: what each context is doing #{want.inspect}", acts == want, acts.inspect)
     check("#{shape}: no frame has a lost line (unknown:0)", doc['contexts'].all? { |c| c['frames'].none? { |f| f['location'] == '(unknown):0' } })
+  end
+end
+
+part_done
+
+# ---- 2b. the program's source in the image (SRC0) ----
+
+# the lines --stack prints under each frame: [[frame location, the marked
+# line number, its text], ...] for the frames that show source
+def stack_marks(text)
+  out = []
+  loc = nil
+  text.each_line do |l|
+    if l.start_with?('  ') && !l.start_with?('      ') then loc = l.strip.sub(/\s+\[.*\z/, '')
+    elsif (m = l.match(/\A      > +(\d+) \| ?(.*)\n\z/)) then out << [loc, m[1].to_i, m[2]]
+    end
+  end
+  out
+end
+
+def sabiruby
+  bin = ENV['SABIRUBY_BIN'] || (ENV['SABIRUBY_DIR'] && File.join(ENV['SABIRUBY_DIR'], 'target/release/sabiruby'))
+  bin && File.executable?(bin) && Open3.capture2e(bin, '--help')[0].include?('--resume') ? File.expand_path(bin) : nil
+end
+
+puts 'sources (SRC0):'
+Dir.mktmpdir('checkpoint-inspect') do |dir|
+  FileUtils.cp(File.join(ROOT, 'test/inspect/stack.rb'), dir)
+  src = File.read(File.join(dir, 'stack.rb'))
+  src_lines = src.lines.map(&:chomp)
+  %w(64 32).product([false, true]).each do |arch, as_task|
+    shape = "#{arch}#{as_task ? ' as a Task' : ''}"
+    docs = {}
+    [false, true].each do |with|
+      Dir[File.join(dir, '*.ckpt')].each { |f| File.delete(f) }
+      _, err, st = run(VIRTUAL[arch], 'run', *(as_task ? ['--as-task'] : []), *(with ? ['--with-source'] : []), 'stack.rb', dir: dir)
+      check("#{shape}#{with ? ' --with-source' : ''}: runs", st == 0 && err.empty?, err)
+      docs[with] = %w(deep each fiber task).to_h { |n| [n, CheckpointImage.read_file(File.join(dir, "#{n}.ckpt"))] }
+    end
+    docs[false].each do |n, doc|
+      check("#{shape} #{n}: without --with-source no source", doc['sources'] == {} && doc['sections'].none? { |x| x['tag'] == 'SRC0' })
+      check("#{shape} #{n}: and --stack shows no lines", stack_marks(CheckpointText.stack(doc)).empty?)
+    end
+    docs[true].each do |n, doc|
+      plain = docs[false][n]
+      check("#{shape} #{n}: the source is the file", doc['sources'] == { 'stack.rb' => src }, doc['sources'].keys.inspect)
+      sec = doc['sections'].find { |x| x['tag'] == 'SRC0' }
+      check("#{shape} #{n}: SRC0 lists it with its size", sec && sec['files'] == [{ 'file' => 'stack.rb', 'bytes' => src.bytesize }], sec.inspect)
+      check("#{shape} #{n}: JSON shape", (e = CheckpointSchema.check(doc)).empty?, e.join("\n"))
+      check("#{shape} #{n}: no warnings", doc['warnings'].empty?, doc['warnings'].join("\n"))
+      check("#{shape} #{n}: the image is larger by SRC0 only", File.size(File.join(dir, "#{n}.ckpt")) == plain['source']['bytes'] + sec['length'] + 8)
+      check("#{shape} #{n}: everything else reads the same", doc.reject { |k, _| %w(sources sections source).include?(k) } == plain.reject { |k, _| %w(sources sections source).include?(k) })
+      check("#{shape} #{n}: the diff with the image without source is empty", CheckpointDiff.diff(plain, doc)['same'])
+      # every frame with a line in stack.rb shows it, marked, and the mark is
+      # the line of its backtrace entry
+      cur = doc['contexts'][doc['current_context'] - 1]
+      shown = doc['contexts'].flat_map { |c| c['frames'] }.select { |f| f['file'] == 'stack.rb' && !f['not_started'] && f['kind'] == 'ruby' }
+      ok = shown.all? do |f|
+        ex = CheckpointImage.source_excerpt(doc, f)
+        mark = ex && ex.find { |x| x[2] }
+        mark && mark[0] == f['line'] && mark[1] == src_lines[f['line'] - 1] &&
+          (f['location'].nil? || f['location'].split(':')[1].to_i == mark[0])
+      end
+      check("#{shape} #{n}: each frame marks its own line (#{shown.size} frames)", ok && !shown.empty?)
+      marks = stack_marks(CheckpointText.stack(doc))
+      want = cur['backtrace'].select { |l| l.start_with?('stack.rb:') }
+      got = marks.map { |loc, k, _| [loc, k] }.select { |loc, _| want.include?(loc) }.first(want.size)
+      check("#{shape} #{n}: --stack marks the backtrace's lines", got.map(&:first) == want && got.all? { |loc, k| loc.split(':')[1].to_i == k },
+            "backtrace: #{want.inspect}\nmarked:    #{marks.inspect}")
+      check("#{shape} #{n}: --stack shows the text of those lines", marks.all? { |_, k, t| t == src_lines[k - 1] }, marks.inspect)
+    end
+  end
+  # a frame that has not started shows no lines
+  FileUtils.cp(File.join(ROOT, 'test/inspect/unstarted.rb'), dir)
+  run(VIRTUAL['64'], 'run', '--with-source', 'unstarted.rb', dir: dir)
+  doc = CheckpointImage.read_file(File.join(dir, 'unstarted.ckpt'))
+  ns = doc['contexts'].flat_map { |c| c['frames'] }.select { |f| f['not_started'] }
+  check('unstarted.rb: frames that have not started show no lines', !ns.empty? && ns.all? { |f| CheckpointImage.source_excerpt(doc, f).nil? } &&
+        doc['sources'].key?('unstarted.rb'))
+  # mrblib's frames (Array#each) have lines but no source (the last run's image)
+  doc = CheckpointImage.read_file(File.join(dir, 'each.ckpt'))
+  lib = doc['contexts'].flat_map { |c| c['frames'] }.select { |f| f['file'] && f['file'] != 'stack.rb' }
+  check('each.ckpt: the frame of mrblib (Array#each) has a line and shows no source', !lib.empty? &&
+        lib.all? { |f| f['line'] && CheckpointImage.source_excerpt(doc, f).nil? }, lib.map { |f| f['location'] }.inspect)
+end
+
+# the C reader resumes an image with SRC0 as one without; it registers the
+# source again, so the image the resumed side writes carries it when asked
+# (resume --with-source) and not otherwise; SabiRuby resumes it the same
+Dir.mktmpdir('checkpoint-inspect') do |dir|
+  FileUtils.cp(File.join(ROOT, 'test/samples/counter.rb'), dir)
+  src = File.read(File.join(dir, 'counter.rb'))
+  plain = File.join(dir, 'plain.ckpt')
+  with = File.join(dir, 'with.ckpt')
+  run(NORMAL['64'], 'run', '--out', plain, 'counter.rb', dir: dir)
+  run(NORMAL['64'], 'run', '--with-source', '--out', with, 'counter.rb', dir: dir)
+  check('counter.rb --with-source: the image carries SRC0', CheckpointImage.read_file(with)['sources'] == { 'counter.rb' => src })
+  nxt = File.join(dir, 'next.ckpt')
+  %w(64 32).each do |arch|
+    want, = run(NORMAL[arch], 'resume', '--out', nxt, plain, dir: dir)
+    got, err, st = run(NORMAL[arch], 'resume', '--out', nxt, with, dir: dir)
+    check("#{arch}: C mruby resumes an image with SRC0 as one without", st == 0 && got == want && !want.empty?, err)
+    check("#{arch}: the next image does not carry it unless asked", CheckpointImage.read_file(nxt)['sources'] == {})
+    got, err, st = run(NORMAL[arch], 'resume', '--with-source', '--out', nxt, with, dir: dir)
+    check("#{arch}: resume --with-source: the next image carries the source the restore registered",
+          st == 0 && got == want && CheckpointImage.read_file(nxt)['sources'] == { 'counter.rb' => src }, err)
+    got, err, st = run(NORMAL[arch], 'resume', '--with-source', '--out', nxt, plain, dir: dir)
+    check("#{arch}: resume --with-source of an image without it: nothing to carry",
+          st == 0 && got == want && CheckpointImage.read_file(nxt)['sources'] == {}, err)
+  end
+  # source: in the program overrides the driver's default
+  File.write(File.join(dir, 'kw.rb'), <<~RUBY)
+    Checkpoint.save("a.ckpt")
+    Checkpoint.save("b.ckpt", source: true)
+    Checkpoint.save("c.ckpt", source: false)
+  RUBY
+  [[[], [false, true, false]], [['--with-source'], [true, true, false]]].each do |flags, want|
+    run(NORMAL['64'], 'run', *flags, 'kw.rb', dir: dir)
+    got = %w(a b c).map { |n| !CheckpointImage.read_file(File.join(dir, "#{n}.ckpt"))['sources'].empty? }
+    check("source: overrides the driver's default (#{flags.empty? ? 'off' : 'on'}): #{want.inspect}", got == want, got.inspect)
+  end
+  if (sb = sabiruby)
+    want, = Open3.capture3(sb, '--resume', plain, chdir: dir)
+    got, err, st = Open3.capture3(sb, '--resume', with, chdir: dir)
+    check('SabiRuby resumes an image with SRC0 as one without', st.success? && got == want && !want.empty?, err)
+  else
+    puts '  SKIP SabiRuby (set SABIRUBY_DIR or SABIRUBY_BIN)'
   end
 end
 
@@ -468,6 +603,19 @@ Dir.mktmpdir('checkpoint-inspect') do |dir|
         check("#{k} #{v}: draws in a headless browser", ok, dom[/id="js-error">[^<]*/] || dom[-400..])
       end
     end
+    # an image with the source: the stack view shows the stopped line, marked
+    FileUtils.cp(File.join(ROOT, 'test/samples/counter.rb'), dir)
+    s = File.join(dir, 'src.ckpt')
+    run(NORMAL['64'], 'run', '--with-source', '--out', s, 'counter.rb', dir: dir)
+    _, err, st = run('ruby', CLI, s, '--html', File.join(dir, 'src.html'), dir: dir)
+    check('--html of an image with the source', st == 0, err)
+    dom, = Open3.capture2e(c, '--no-sandbox', '--headless', '--disable-gpu', '--dump-dom', "file://#{File.join(dir, 'src.html')}#view=stack")
+    here = dom.scan(%r{<div class="sl here">(.*?)</div>}).flatten
+    check('src stack: one marked line, the line of the suspend', here.size == 1 && here[0].include?('<span class="ln">7</span>') &&
+          here[0].include?('Checkpoint.suspend("counter.ckpt")'), here.inspect)
+    check('src stack: the lines around it', dom.scan('class="sl"').size == 4, dom.scan(/class="sl[^"]*"/).inspect)
+    dom, = Open3.capture2e(c, '--no-sandbox', '--headless', '--disable-gpu', '--dump-dom', "file://#{File.join(dir, 'src.html')}#view=image")
+    check('src image: SRC0 is listed', dom.include?('SRC0') && dom.include?("counter.rb #{File.size(File.join(dir, 'counter.rb'))} バイト"), dom[-400..])
   else
     puts '  SKIP the headless browser check (no CHECKPOINT_CHROME and no Playwright Chromium)'
   end

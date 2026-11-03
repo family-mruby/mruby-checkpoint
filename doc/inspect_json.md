@@ -1,6 +1,6 @@
 # イメージを読んだ JSON (inspect JSON) 版 1
 
-> 状態: P5 で実装済 | 更新: 2026-11-03 | リーダーは `tools/lib/checkpoint_image.rb` ただ 1 つ。形の検査は `tools/lib/checkpoint_schema.rb`
+> 状態: P5 で実装済、P6 で `sources` を足した | 更新: 2026-11-03 | リーダーは `tools/lib/checkpoint_image.rb` ただ 1 つ。形の検査は `tools/lib/checkpoint_schema.rb`
 
 checkpoint のイメージ (`doc/format_v1.md`) を、形式を知らなくても読める JSON にしたもの。CLI
 (`tools/checkpoint_inspect.rb`)・1 ファイルの HTML・2 つのイメージの差はすべてこの JSON から作る。
@@ -76,6 +76,7 @@ HTML (`--html`) には、命令列を除いた JSON (`--no-code` と同じ) が
 | `current_context` | 書き出したとき実行中だったコンテキストの番号 |
 | `scheduler` | スケジューラと Task の表 (§7.3) |
 | `sections` | 任意のセクション (§7.4) |
+| `sources` | イメージに入っているプログラムのソース (表示用、形式 §13 の `SRC0`): `{ファイル名: テキスト}`。入っていなければ `{}`。ファイル名はフレームの `file` と同じ文字列。テキストは UTF-8 として正しくないバイトを `\xHH` と書いたもの。P6 で足した (版は 1 のまま) |
 | `roots` | ルートの一覧 (§8)。導出フィールド |
 | `warnings` | 注意の文の配列 (知らないセクション、irep のハッシュが合わない、ルートから届かないオブジェクトなど)。正常なイメージでは空 |
 | `error` | 壊れたイメージのときだけ `{offset, where, message}` (§10)。ふだんは `null` |
@@ -235,6 +236,8 @@ Task (`tasks[]`):
 各要素は `tag`、`offset` (イメージの中のバイト位置)、`length` (中身の長さ。形式 §13) を持つ。
 
 - `DBG0`: `ireps: [{irep, files: [{file, start, end, lines: [[pc, 行], ...]}]}]` (行が変わる位置)。
+- `SRC0`: `files: [{file, bytes}]` (ファイル名とソースの大きさ)。テキストは全体の `sources` にある。`DBG0` が名前を
+  出さないファイルのソースがあれば `warnings` に出る。
 - `GCS0`: `disabled`・`generational`・`step_per_allocation`・`scheduler_steps`・`interval_ratio`・
   `step_ratio`・`step_limit`・`malloc_threshold`・`debt_limit` (64 bit の値は 10 進の文字列)。
 - 知らないセクション: `unknown: true`、`head_hex` (先頭 64 バイト)、`tail_hex` (64 バイトを超えるとき最後の
@@ -318,6 +321,7 @@ task "c1"/3:pop.self.@items
 - Task は名前で、名前の無い Task は本体の場所で対応させる。同じ場所から作った名前の無い Task が
   複数あると、表の順 (`#2`) で対応させるので、キューの順が変わると取り違えうる。
 - 時刻・object_id のように往復で正当に変わるものは、イメージには出ない (イメージに object_id は無い)。
+- 任意のセクション (`sections`) と `sources` は比べない。ソースを入れたイメージと入れないイメージの差は空になる。
 
 ## 10. 壊れたイメージ
 
@@ -337,6 +341,7 @@ task "c1"/3:pop.self.@items
 |---|---|
 | コールスタック | `contexts[]` を `current` を先に。コンテキストがしていることは `activity` (Task なら Task の `state`)。未開始のフレームは `not_started`、`placeholder` のフレームは畳む。各コンテキストの `frames` を逆順 (上から)。行は `location` (null なら `file:line`)、変数は `locals`・`self`・`captured`、C の関数で待っているフレームは `kind == "cfunc"` と `cfunc` |
 | オブジェクトのつながり | 起点は `roots[]` (`refs` と `temps`) かオブジェクト。辺は `objects[].refs`、箱の文字は `label`、permanent (`kind` が `permanent`・`permanent_proc`) は名前だけのもの。中身のフィールドは §6.2 |
+| フレームのソース | `sources[frame.file]` があれば、`line` の前後 (CLI と HTML は 2 行ずつ) を出し、`line` の行に印を付ける。行は `\n` で分けて 1 から数え、行末の `\r` は外す。未開始のフレーム (`not_started`)・C の関数のフレーム・ソースの無いファイル (mrblib など) には出さない。`tools/lib/checkpoint_image.rb` の `source_excerpt` と HTML の `sourceLines` が例 |
 | 2 つのイメージの差 | §9 の JSON。オブジェクトへは `a`・`b` の番号で飛ぶ |
 | Task と Fiber | `scheduler.tasks[]` を `queue` ごとに `queue_index` の順に並べる。待ちは `wait`、実行中だったものは `running`。コンテキストのチェーンは `contexts[].prev` |
 

@@ -1,7 +1,7 @@
 /*
 ** checkpoint - run a Ruby program that may save or suspend, or resume an image
 **
-**   checkpoint run [--ignore] [--inproc] [--as-task] [--out FILE] prog.rb
+**   checkpoint run [--ignore] [--inproc] [--as-task] [--with-source] [--out FILE] prog.rb
 **       Runs prog.rb. Checkpoint.save(path) writes the state to path (or
 **       FILE) and goes on; Checkpoint.suspend(path) writes it and ends the
 **       process (status 0).
@@ -15,7 +15,11 @@
 **                 file) and the scheduler runs (mrb_task_run) until every
 **                 Task is done. An exception the program does not rescue
 **                 becomes the Task's value; it is printed as the error.
-**   checkpoint resume [--inproc] [--out FILE] image
+**       --with-source  images carry the program's source (section SRC0, for
+**                 display) unless save / suspend say source: false. Without
+**                 it, only a call with source: true writes it. The driver
+**                 registers prog.rb's text either way.
+**   checkpoint resume [--inproc] [--with-source] [--out FILE] image
 **       Restores image in a new process and continues from the line after
 **       the save / suspend.
 **   checkpoint names
@@ -79,8 +83,8 @@ static int
 usage(void)
 {
   fprintf(stderr,
-          "usage: checkpoint run [--ignore] [--inproc] [--as-task] [--out FILE] prog.rb\n"
-          "       checkpoint resume [--inproc] [--out FILE] image\n"
+          "usage: checkpoint run [--ignore] [--inproc] [--as-task] [--with-source] [--out FILE] prog.rb\n"
+          "       checkpoint resume [--inproc] [--with-source] [--out FILE] image\n"
           "       checkpoint names\n");
   return 2;
 }
@@ -111,6 +115,7 @@ resume_body(mrb_state *mrb, void *ud)
 
 static const char *out_override = NULL;
 static int inproc = 0;
+static int with_source = 0;
 static void inproc_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path,
                            enum mrb_checkpoint_kind kind, void *ud);
 
@@ -122,6 +127,7 @@ open_state(void)
   if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); exit(2); }
   mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
   mrb_checkpoint_baseline(mrb);
+  if (with_source) mrb_checkpoint_set_include_source(mrb, TRUE);
   return mrb;
 }
 
@@ -213,6 +219,7 @@ main(int argc, char **argv)
     if (strcmp(argv[i], "--ignore") == 0) ignore = 1;
     else if (strcmp(argv[i], "--as-task") == 0) as_task = 1;
     else if (strcmp(argv[i], "--inproc") == 0) inproc = 1;
+    else if (strcmp(argv[i], "--with-source") == 0) with_source = 1;
     else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_override = argv[++i];
     else if (argv[i][0] == '-') return usage();
     else if (!file) file = argv[i];
@@ -237,6 +244,13 @@ main(int argc, char **argv)
   if (ignore) mrb_checkpoint_set_mode(mrb, MRB_CHECKPOINT_MODE_IGNORE);
   if (out_override) mrb_checkpoint_set_output(mrb, out_override);
   if (inproc) mrb_checkpoint_set_handler(mrb, inproc_handler, NULL);
+  {
+    /* the text of the program, under the name the compiler gives its code */
+    size_t slen;
+    uint8_t *text = read_file(file, &slen);
+    if (text) mrb_checkpoint_add_source(mrb, file, (const char*)text, slen);
+    free(text);
+  }
 
   mrb_ccontext *c = mrb_ccontext_new(mrb);
   mrb_ccontext_filename(mrb, c, file);

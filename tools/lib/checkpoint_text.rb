@@ -78,6 +78,8 @@ module CheckpointText
         sec['ireps'].each do |e|
           o << "  @#{e['irep']} #{e['files'].map { |f| "#{f['file']}[#{f['start']}...#{f['end']}] #{f['lines'].size} changes" }.join(', ')}\n"
         end
+      when 'SRC0'
+        o << "sources: #{sec['files'].map { |f| "#{f['file']} (#{f['bytes']} bytes)" }.join(', ')}\n"
       when 'GCS0'
         o << "GC settings: #{sec.reject { |k, _| %w(tag offset).include?(k) }.map { |k, x| "#{k}=#{x}" }.join(' ')}\n"
       else
@@ -230,6 +232,9 @@ module CheckpointText
         note += '   [not started: starts here]' if f['not_started']
         note += '   [not in a backtrace]' if f['location'].nil? && f['kind'] == 'ruby'
         o << "  #{loc}#{note}\n"
+        (CheckpointImage.source_excerpt(doc, f) || []).each do |k, line, here|
+          o << "      #{here ? '>' : ' '} #{k.to_s.rjust(4)} | #{line}\n".rstrip << "\n"
+        end
         if f['self_register']
           o << "      self = #{v(doc, f['self'])} (from the first resume; until then R0 holds #{v(doc, f['self_register'])})\n"
         elsif f['method'] && !(f['self'].is_a?(Hash) && f['self']['ref'] && doc['objects'][f['self']['ref'] - 1]['name'] == 'T')

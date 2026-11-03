@@ -7,7 +7,7 @@
 #
 # Types: Integer, String, Float, :bool, :value (a value, doc/inspect_json.md),
 # :int (a JSON number, or {"int": "digits"} beyond 2^53), :float ({"float": x}),
-# [:opt, T] (T or null), [:array, T], [:tuple, T1, T2, ...], [:enum, a, ...],
+# [:opt, T] (T or null), [:array, T], [:map, T] (an object whose values are T), [:tuple, T1, T2, ...], [:enum, a, ...],
 # { 'key' => T, 'key?' => T (may be absent) }: no other keys are allowed.
 
 module CheckpointSchema
@@ -97,6 +97,8 @@ module CheckpointSchema
               # DBG0
               'ireps?' => ARR.({ 'irep' => Integer, 'files' => ARR.({ 'file' => String, 'start' => Integer, 'end' => Integer,
                                                                         'lines' => ARR.([:tuple, Integer, Integer]) }) }),
+              # SRC0 (the texts are in the top-level sources)
+              'files?' => ARR.({ 'file' => String, 'bytes' => Integer }),
               # GCS0
               'disabled?' => :bool, 'generational?' => :bool, 'step_per_allocation?' => :bool, 'scheduler_steps?' => :bool,
               'interval_ratio?' => Integer, 'step_ratio?' => Integer, 'step_limit?' => String, 'malloc_threshold?' => String,
@@ -111,6 +113,7 @@ module CheckpointSchema
                   'integer_bits' => Integer, 'float_bits' => Integer, 'utf8' => :bool, 'pointer_bits' => Integer },
     'symbols' => ARR.(String), 'ireps' => ARR.(IREP), 'objects' => ARR.(:object), 'changes' => ARR.(CHANGE),
     'contexts' => ARR.(CONTEXT), 'current_context' => Integer, 'scheduler' => SCHED, 'sections' => ARR.(SECTION),
+    'sources' => [:map, String],
     'warnings' => ARR.(String), 'error' => [:opt, { 'offset' => [:opt, Integer], 'where' => String, 'message' => String }],
     'roots' => ARR.(ROOT), 'omitted?' => ARR.(String),
   }
@@ -176,6 +179,9 @@ module CheckpointSchema
       when :array
         return errs << "#{at}: not an array" unless x.is_a?(Array)
         x.each_with_index { |e, i| walk(e, t[1], "#{at}[#{i}]", errs) }
+      when :map
+        return errs << "#{at}: not an object" unless x.is_a?(Hash)
+        x.each { |k, e| walk(e, t[1], "#{at}[#{k.inspect}]", errs) }
       when :tuple
         return errs << "#{at}: not a #{t.size - 1}-tuple" unless x.is_a?(Array) && x.size == t.size - 1
         t[1..].each_with_index { |c, i| walk(x[i], c, "#{at}[#{i}]", errs) }

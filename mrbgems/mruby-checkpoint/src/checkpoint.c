@@ -14,6 +14,11 @@
 ** register. Inside a block called from C (Array#sort!, Array.new { }, ...)
 ** the request is refused on the spot with Checkpoint::Error.
 **
+** save(path, source: true) also puts the program's source into the image
+** (section SRC0, for display only; mrb_checkpoint_add_source registers it,
+** mrb_checkpoint_set_include_source sets the default for calls without
+** source:).
+**
 ** The call's value tells the two sides apart: the writing side gets :saved,
 ** the image holds :resumed in the same register.
 **
@@ -87,6 +92,8 @@ checkpoint_delete(mrb_state *mrb)
       free(g->data);
       for (int k = 0; k < g->nfuncs; k++) free(g->fnames[k]);
       free(g->fnames); free(g->funcs);
+      for (int k = 0; k < g->nsrc; k++) { free(g->src[k].name); free(g->src[k].text); }
+      free(g->src);
       free(g);
       states[i] = NULL;
     }
@@ -128,6 +135,51 @@ mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn, void *ud)
     const char *name = checkpoint_perm_name_at(g->perm, i, &is_func);
     fn(name, is_func, ud);
   }
+}
+
+MRB_API void
+mrb_checkpoint_add_source(mrb_state *mrb, const char *filename, const char *src, size_t len)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g || !filename) return;
+  size_t nlen = strlen(filename);
+  char *text = (char*)malloc(len + 1);
+  if (!text) return;
+  if (len) memcpy(text, src, len);
+  text[len] = 0;
+  for (int i = 0; i < g->nsrc; i++) {
+    if (strcmp(g->src[i].name, filename) == 0) {
+      free(g->src[i].text);
+      g->src[i].text = text;
+      g->src[i].len = len;
+      return;
+    }
+  }
+  struct checkpoint_source *a = (struct checkpoint_source*)realloc(g->src, sizeof(*a) * (g->nsrc + 1));
+  char *name = (char*)malloc(nlen + 1);
+  if (!a || !name) { free(text); free(name); if (a) g->src = a; return; }
+  memcpy(name, filename, nlen + 1);
+  g->src = a;
+  g->src[g->nsrc].name = name;
+  g->src[g->nsrc].text = text;
+  g->src[g->nsrc].len = len;
+  g->nsrc++;
+}
+
+const struct checkpoint_source*
+checkpoint_source_of(checkpoint_state *g, const char *name, size_t len)
+{
+  for (int i = 0; i < g->nsrc; i++) {
+    if (strlen(g->src[i].name) == len && memcmp(g->src[i].name, name, len) == 0) return &g->src[i];
+  }
+  return NULL;
+}
+
+MRB_API void
+mrb_checkpoint_set_include_source(mrb_state *mrb, mrb_bool on)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (g) g->source_default = on ? 1 : 0;
 }
 
 MRB_API void
@@ -261,6 +313,7 @@ external_write(mrb_state *mrb, checkpoint_state *g, int sw)
 {
   g->pending = 0;
   g->dump_switch = sw;
+  g->dump_source = g->source_default;
 
   gbuf out;
   gb_init(&out);
@@ -307,6 +360,7 @@ checkpoint_safepoint(mrb_state *mrb)
   int sw = sched_switch(mrb, g);
   g->pending = 0;
   g->dump_switch = sw;
+  g->dump_source = g->pending_source;
   char *path = g->pending_path;
   g->pending_path = NULL;
   enum mrb_checkpoint_kind kind = g->pending_kind;
@@ -395,7 +449,11 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
 {
   const char *what = kind == MRB_CHECKPOINT_SAVE ? "Checkpoint.save" : "Checkpoint.suspend";
   const char *path = NULL;
-  mrb_get_args(mrb, "|z!", &path);
+  /* source: true / false: the image carries the program's source (SRC0) */
+  mrb_sym kw_names[] = { MRB_SYM(source) };
+  mrb_value kw_values[1];
+  mrb_kwargs kw = { 1, 0, kw_names, kw_values, NULL };
+  mrb_get_args(mrb, "|z!:", &path, &kw);
   checkpoint_state *g = checkpoint_get(mrb);
   struct RClass *e = error_class(mrb);
 
@@ -421,6 +479,7 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
   free(g->pending_path);
   g->pending_path = dupstr(path);
   g->pending_kind = kind;
+  g->pending_source = mrb_undef_p(kw_values[0]) ? g->source_default : mrb_test(kw_values[0]);
   g->ret_ctx = c;
   g->ret_ci = (c->ci - 1) - c->cibase;
   g->ret_slot = c->ci->stack - c->stbase;
@@ -593,8 +652,8 @@ mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
 
   struct RClass *m = mrb_define_module(mrb, "Checkpoint");
   mrb_define_class_under(mrb, m, "Error", mrb->eStandardError_class);
-  mrb_define_module_function(mrb, m, "save", checkpoint_save, MRB_ARGS_OPT(1));
-  mrb_define_module_function(mrb, m, "suspend", checkpoint_suspend, MRB_ARGS_OPT(1));
+  mrb_define_module_function(mrb, m, "save", checkpoint_save, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(1, 0));
+  mrb_define_module_function(mrb, m, "suspend", checkpoint_suspend, MRB_ARGS_OPT(1) | MRB_ARGS_KEY(1, 0));
   mrb_define_module_function(mrb, m, "resumed?", checkpoint_resumed_p, MRB_ARGS_NONE());
 #ifdef CHECKPOINT_TEST_HELPERS
   mrb_define_module_function(mrb, m, "__pass_and_save", checkpoint_pass_and_save, MRB_ARGS_OPT(1));

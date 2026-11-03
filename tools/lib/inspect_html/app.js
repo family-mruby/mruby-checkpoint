@@ -281,7 +281,8 @@ window.addEventListener('error', function (e) {
   function viewStack(m) {
     var d = doc();
     add(m, h('p', { cls: 'muted' }, 'コンテキスト (プログラムの本体・Task・Fiber) ごとのコールスタック。上が新しいフレームで、バックトレースと同じ並び。' +
-      '「C の関数」はコンテキストの切り替えを待っているフレーム。値の青い字はオブジェクトの図へ飛ぶ。'));
+      '「C の関数」はコンテキストの切り替えを待っているフレーム。値の青い字はオブジェクトの図へ飛ぶ。' +
+      (Object.keys(d.sources || {}).length ? 'イメージにはソースが入っているので (表示用)、各フレームの行の前後も出す。▶ がそのフレームの止まった行。' : '')));
     var order = d.contexts.slice().sort(function (a, b) { return (b.current ? 1 : 0) - (a.current ? 1 : 0) || a.id - b.id; });
     order.forEach(function (c) {
       var card = h('div', { cls: 'card' + (c.current ? ' cur' : '') }, ctxTitle(d, c));
@@ -289,6 +290,34 @@ window.addEventListener('error', function (e) {
       c.frames.slice().reverse().forEach(function (f) { add(card, frameBox(d, c, f)); });
       add(m, card);
     });
+  }
+
+  // the lines of the source around a frame's line, when the image carries
+  // the source of its file (SRC0): [[number, text, the frame's line?], ...]
+  // or null. The same rule as CheckpointImage.source_excerpt.
+  var SOURCE_AROUND = 2;
+  function sourceLines(d, f) {
+    if (f.kind !== 'ruby' || f.not_started || !f.file || !f.line || !d.sources) return null;
+    var src = d.sources[f.file];
+    if (typeof src !== 'string') return null;
+    var lines = src.split('\n');
+    if (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (f.line < 1 || f.line > lines.length) return null;
+    var out = [];
+    for (var k = Math.max(1, f.line - SOURCE_AROUND); k <= Math.min(lines.length, f.line + SOURCE_AROUND); k++) {
+      out.push([k, lines[k - 1].replace(/\r$/, ''), k === f.line]);
+    }
+    return out;
+  }
+  function sourceBox(d, f) {
+    var ls = sourceLines(d, f);
+    if (!ls) return null;
+    var box = h('div', { cls: 'src mono', title: f.file });
+    ls.forEach(function (x) {
+      add(box, h('div', { cls: 'sl' + (x[2] ? ' here' : '') },
+        h('span', { cls: 'ln', text: String(x[0]) }), h('span', { cls: 'mk', text: x[2] ? '▶' : '' }), h('span', { cls: 'tx', text: x[1] })));
+    });
+    return box;
   }
 
   function frameBox(d, c, f) {
@@ -318,7 +347,7 @@ window.addEventListener('error', function (e) {
         vars.forEach(function (x, i) { add(t, row(i ? '' : '外の変数 (' + where + ')', h('span', null, x.name + ' = ', value(d, x.value)))); });
       }
     });
-    var det = h('details', { cls: 'frame' }, head, t.childNodes.length ? t : h('div', { cls: 'empty', text: 'ローカル変数なし' }));
+    var det = h('details', { cls: 'frame' }, head, sourceBox(d, f), t.childNodes.length ? t : h('div', { cls: 'empty', text: 'ローカル変数なし' }));
     det.open = true;
     return det;
   }
@@ -792,7 +821,7 @@ window.addEventListener('error', function (e) {
     add(m, h('h2', { text: '任意のセクション' }));
     if (!d.sections.length) add(m, h('div', { cls: 'empty', text: 'なし' }));
     d.sections.forEach(function (sec) {
-      var text = sec.tag === 'DBG0' ? sec.ireps.length + ' 個の irep の行番号' : (sec.unknown ? '知らないセクション (読み飛ばした): ' + sec.length + ' バイト ' + sec.head_hex :
+      var text = sec.tag === 'DBG0' ? sec.ireps.length + ' 個の irep の行番号' : sec.tag === 'SRC0' ? 'ソース (表示用): ' + sec.files.map(function (f) { return f.file + ' ' + f.bytes + ' バイト'; }).join(', ') : (sec.unknown ? '知らないセクション (読み飛ばした): ' + sec.length + ' バイト ' + sec.head_hex :
         (sec.tag === 'GCS0' ? 'GC の設定: ' + Object.keys(sec).filter(function (k) { return k !== 'tag' && k !== 'offset' && k !== 'length'; }).map(function (k) { return k + '=' + sec[k]; }).join(' ') : JSON.stringify(sec)));
       add(m, h('div', { cls: 'mono', text: sec.tag + ' (' + sec.offset + ' バイト目): ' + text }));
     });

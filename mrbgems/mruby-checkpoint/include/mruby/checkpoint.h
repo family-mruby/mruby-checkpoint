@@ -58,6 +58,20 @@ MRB_API void mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn,
    both sides. */
 MRB_API void mrb_checkpoint_register_func(mrb_state *mrb, const char *name, mrb_func_t func);
 
+/* The program's source text, for display only (an inspector shows the lines
+   around each frame; nothing runs it). The host registers each file it
+   compiles under the file name it gives the compiler (mrb_ccontext_filename),
+   which is the name in the line numbers. A file registered again is
+   replaced. Registering keeps a copy and writes nothing by itself: an image
+   carries the sources (section SRC0) only when asked, and then only of the
+   files that the line numbers of its carried code name. A restore registers
+   the sources the image carries, so that a later image can carry them on. */
+MRB_API void mrb_checkpoint_add_source(mrb_state *mrb, const char *filename, const char *src, size_t len);
+/* Whether an image carries the sources when the call does not say
+   (Checkpoint.save / suspend without source:, and mrb_checkpoint_request).
+   FALSE by default. */
+MRB_API void mrb_checkpoint_set_include_source(mrb_state *mrb, mrb_bool on);
+
 MRB_API void mrb_checkpoint_set_mode(mrb_state *mrb, enum mrb_checkpoint_mode mode);
 MRB_API void mrb_checkpoint_set_output(mrb_state *mrb, const char *path); /* overrides the path given to save / suspend */
 MRB_API void mrb_checkpoint_set_handler(mrb_state *mrb, mrb_checkpoint_handler fn, void *ud);

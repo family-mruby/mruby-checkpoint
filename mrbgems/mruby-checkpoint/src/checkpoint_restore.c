@@ -1458,6 +1458,26 @@ r_debug(reader *r)
   }
 }
 
+/* the program's source (section 13), for display only: registered again,
+   as the host registers what it compiles, so that a later image of this
+   state can carry it on */
+static void
+r_sources(reader *r)
+{
+  uint32_t n = r_u32(r);
+  for (uint32_t i = 0; i < n && !r->failed; i++) {
+    uint32_t flen, slen;
+    const uint8_t *fn = r_str(r, &flen);
+    const uint8_t *src = r_str(r, &slen);
+    if (r->failed) return;
+    char *name = (char*)mrb_malloc(r->mrb, flen + 1);
+    memcpy(name, fn, flen);
+    name[flen] = 0;
+    mrb_checkpoint_add_source(r->mrb, name, (const char*)src, slen);
+    mrb_free(r->mrb, name);
+  }
+}
+
 static void
 reader_free(reader *r)
 {
@@ -1582,6 +1602,9 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     r.end = body_end;
     if (memcmp(tag, "DBG0", 4) == 0) {
       r_debug(&r);
+    }
+    else if (memcmp(tag, "SRC0", 4) == 0) {
+      r_sources(&r);
     }
     else if (memcmp(tag, "GCS0", 4) == 0) {
       has_gcs = 1;

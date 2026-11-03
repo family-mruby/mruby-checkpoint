@@ -60,8 +60,12 @@ rake fuzz:sabiruby[seed,points]   # その一部を SabiRuby で続ける
     コンテキスト (Fiber、または Task とスケジューラ) から。
   - `checkpoint run --as-task prog.rb` は、Family mruby のアプリと同じ起動の形 (プログラムの
     本体を Task にして `mrb_task_run`) で動かす。
+  - `Checkpoint.save("x.ckpt", source: true)` (`suspend` も同じ) は、プログラムのソースもイメージに
+    入れる (任意のセクション `SRC0`。表示用で、実行には使わない。インスペクタが各フレームの行の前後を出す)。
+    `checkpoint run --with-source` は、`source:` を書かない呼び出しの既定を「入れる」にする。既定は入れない。
+    埋め込む側は、コンパイルするファイルのソースを `mrb_checkpoint_add_source()` で登録する。
 - 形式は `doc/format_v1.md` (v0 は `doc/format_v0.md`、経過として残す)、報告は `doc/report/`
-  (`p1.md`・`p1b.md`・`p2.md`・`p3.md`・`p4.md`・`p4b.md`・`p5.md`)。
+  (`p1.md`・`p1b.md`・`p2.md`・`p3.md`・`p4.md`・`p4b.md`・`p5.md`・`p6.md`)。
 
 ## イメージを見る
 
@@ -79,6 +83,7 @@ ruby tools/checkpoint_inspect.rb diff a.ckpt b.ckpt [--json | --html out.html]  
 ```
 
 - `--stack` の行は、その点で例外を上げたときの mruby のバックトレースと同じ (`rake test` で確かめる)。
+  イメージにソースが入っていれば、各フレームの行の前後も出す (止まった行に印。HTML でも同じ)。
 - 差はオブジェクトの番号でなく、ルート (グローバル変数・定数・フレーム・Task) からのパスで対応を取る。限界は
   `doc/inspect_json.md` §9。
 - HTML は `#view=stack|tasks|objects|diff|image` で開く表示を選べる (`&focus=番号` で

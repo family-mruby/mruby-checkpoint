@@ -49,6 +49,8 @@ typedef struct {
   pmap taskid;
   pmap queues;      /* Task::Queue struct -> index + 1 in qobj (only when a Task waits on one) */
   struct RBasic **qobj; uint32_t nqobj, qobj_cap;
+  /* the file names the line numbers (DBG0) name, in their order (for SRC0) */
+  mrb_sym *dfiles; uint32_t ndfiles;
   int failed;
   char *err; size_t errlen;
 } dumper;
@@ -1315,6 +1317,12 @@ w_debug_irep(dumper *d, gbuf *b, uint32_t id)
     mrb_int flen;
     const char *fn = mrb_sym_name_len(mrb, f->filename_sym, &flen);
     gb_str(mrb, b, fn, (size_t)flen);
+    uint32_t k = 0;
+    while (k < d->ndfiles && d->dfiles[k] != f->filename_sym) k++;
+    if (k == d->ndfiles) {
+      d->dfiles = (mrb_sym*)mrb_realloc(mrb, d->dfiles, sizeof(mrb_sym) * (d->ndfiles + 1));
+      d->dfiles[d->ndfiles++] = f->filename_sym;
+    }
     gb_u32(mrb, b, f->start_pos);
     gb_u32(mrb, b, end);
     /* count, then the entries */
@@ -1425,6 +1433,29 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
       gb_bytes(mrb, out, dbg.p, dbg.len);
     }
     gb_free(mrb, &dbg);
+    /* the program's source, for display (optional, asked for by source: or
+       mrb_checkpoint_set_include_source): the registered files that the
+       line numbers above name */
+    if (d.G->dump_source) {
+      gbuf src; gb_init(&src);
+      uint32_t nsrc = 0;
+      for (uint32_t i = 0; i < d.ndfiles; i++) {
+        mrb_int flen;
+        const char *fn = mrb_sym_name_len(mrb, d.dfiles[i], &flen);
+        const struct checkpoint_source *cs = checkpoint_source_of(d.G, fn, (size_t)flen);
+        if (!cs) continue;
+        gb_str(mrb, &src, fn, (size_t)flen);
+        gb_str(mrb, &src, cs->text, cs->len);
+        nsrc++;
+      }
+      if (nsrc > 0) {
+        gb_bytes(mrb, out, "SRC0", 4);
+        gb_u32(mrb, out, (uint32_t)(4 + src.len));
+        gb_u32(mrb, out, nsrc);
+        gb_bytes(mrb, out, src.p, src.len);
+      }
+      gb_free(mrb, &src);
+    }
     /* the GC settings, when the program changed them */
     if (memcmp(&gcs, &d.P->gc, sizeof(gcs)) != 0) {
       gb_bytes(mrb, out, "GCS0", 4);
@@ -1450,5 +1481,6 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   for (uint32_t i = 0; i < d.nobj; i++) mrb_free(mrb, d.olabel[i]);
   mrb_free(mrb, d.oq); mrb_free(mrb, d.olabel); mrb_free(mrb, d.iq);
   mrb_free(mrb, d.cq); mrb_free(mrb, d.tq); mrb_free(mrb, d.qobj);
+  mrb_free(mrb, d.dfiles);
   return d.failed ? -1 : 0;
 }

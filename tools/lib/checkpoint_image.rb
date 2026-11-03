@@ -80,6 +80,23 @@ module CheckpointImage
 
   # ---- small helpers shared with the diff and the HTML ----
 
+  # The lines of the source around a frame's line, when the image carries
+  # the source of its file (SRC0): [[number, text, the frame's line?], ...],
+  # or nil (no source, a frame that has not started, a C function's frame).
+  # The HTML (inspect_html/app.js, sourceLines) does the same.
+  SOURCE_AROUND = 2
+  def self.source_excerpt(doc, f, around = SOURCE_AROUND)
+    return nil if f['kind'] != 'ruby' || f['not_started'] || !f['file'] || !f['line']
+    src = (doc['sources'] || {})[f['file']] or return nil
+    lines = src.split("\n", -1)
+    lines.pop if lines.last == ''
+    n = f['line']
+    return nil unless n.between?(1, lines.size)
+    lo = [n - around, 1].max
+    hi = [n + around, lines.size].min
+    (lo..hi).map { |k| [k, lines[k - 1].chomp("\r"), k == n] }
+  end
+
   SAFE_INT = 2**53 - 1
 
   def self.json_int(v) = v.abs <= SAFE_INT ? v : { 'int' => v.to_s }
@@ -152,7 +169,7 @@ module CheckpointImage
         'source' => { 'file' => name, 'bytes' => @r.size },
         'header' => nil, 'symbols' => [], 'ireps' => [], 'objects' => [], 'changes' => [],
         'contexts' => [], 'current_context' => nil, 'scheduler' => nil, 'sections' => [],
-        'warnings' => [], 'error' => nil,
+        'sources' => {}, 'warnings' => [], 'error' => nil,
       }
       @later = []   # refs into tables read further on: [table, n, offset, where]
     end
@@ -743,6 +760,7 @@ module CheckpointImage
         sec =
           case tag
           when 'DBG0' then dbg0(at)
+          when 'SRC0' then src0(at)
           when 'GCS0'
             fl = r.u8
             {
@@ -784,6 +802,26 @@ module CheckpointImage
         { 'irep' => id, 'files' => files }
       end
       { 'tag' => 'DBG0', 'offset' => at, 'ireps' => list }
+    end
+
+    # the program's source by file name (for display): the texts go to the
+    # top-level "sources", the section keeps the names and sizes
+    def src0(at)
+      r = @r
+      r.where = 'sections > SRC0'
+      n = count('files')
+      named = @doc['sections'].select { |s| s['tag'] == 'DBG0' }.flat_map { |s| s['ireps'].flat_map { |e| e['files'].map { |f| f['file'] } } }
+      files = Array.new(n) do |i|
+        r.where = "sections > SRC0 > #{i + 1}"
+        name = r.text
+        fat = r.pos
+        body = r.str
+        r.fail!("the source of #{name} is there twice", fat) if @doc['sources'].key?(name)
+        @doc['sources'][name] = CheckpointImage.text(body)
+        @doc['warnings'] << "SRC0: the source of #{name}, a file no line table names" unless named.include?(name)
+        { 'file' => name, 'bytes' => body.bytesize }
+      end
+      { 'tag' => 'SRC0', 'offset' => at, 'files' => files }
     end
   end
 end

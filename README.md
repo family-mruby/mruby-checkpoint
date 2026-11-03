@@ -50,6 +50,11 @@ Run a program through the driver, `build/mruby/host/bin/checkpoint run prog.rb`.
   restored side continues the context that was running (a Fiber, or a Task and the scheduler).
 - `checkpoint run --as-task prog.rb` starts the program the way Family mruby starts an
   app (its body as a Task, then `mrb_task_run`).
+- `Checkpoint.save("x.ckpt", source: true)` (and `suspend`) also puts the program's source
+  into the image, as an optional section (`SRC0`) for display only: the inspector shows the
+  lines around each frame. `checkpoint run --with-source` makes that the default for calls
+  without `source:`; otherwise images carry no source. Embedders register the source of
+  each file they compile with `mrb_checkpoint_add_source()`.
 
 ```ruby
 # counter.rb
@@ -108,6 +113,8 @@ ruby tools/checkpoint_inspect.rb diff a.ckpt b.ckpt [--json | --html out.html]  
 ```
 
 - Each `--stack` line matches mruby's own backtrace at that point (checked by `rake test`).
+  When the image carries the source, each frame also shows the lines around its line, the
+  stopped one marked (in the HTML too).
 - The diff matches objects by their path from the roots (globals, constants, frames,
   Tasks), not by object number; the limits are in `doc/inspect_json.md` §9.
 - In the HTML, `#view=stack|tasks|objects|diff|image` selects the view
