@@ -102,35 +102,61 @@ checkpoint_collect_gv(mrb_state *mrb, giv_entry **out, int *n)
   checkpoint_collect_iv(mrb, mrb_obj_value(&tmp), out, n);
 }
 
-/* ---- sorting by symbol name ---- */
+/* ---- sorting by symbol name ----
 
-static mrb_state *sort_mrb;
+   qsort() has no argument for the comparison's context, and the names belong
+   to one mrb_state: a merge sort that carries it (no static, so that several
+   states can build their baselines at once, on several threads). Stable. */
+
+typedef int (*sym_cmp_fn)(mrb_state *mrb, const void *a, const void *b);
 
 /* mrb_sym_name() may return a shared buffer for short symbols, so copy */
 static int
-sym_cmp(mrb_sym a, mrb_sym b)
+sym_cmp(mrb_state *mrb, mrb_sym a, mrb_sym b)
 {
   char x[256];
   mrb_int la, lb;
-  const char *sa = mrb_sym_name_len(sort_mrb, a, &la);
+  const char *sa = mrb_sym_name_len(mrb, a, &la);
   if (la > 255) la = 255;
   memcpy(x, sa, la); x[la] = 0;
-  const char *sb = mrb_sym_name_len(sort_mrb, b, &lb);
+  const char *sb = mrb_sym_name_len(mrb, b, &lb);
   int r = strncmp(x, sb, la < lb ? la : lb);
   if (r) return r;
   return la < lb ? -1 : la > lb ? 1 : 0;
 }
 
-static int
-cmp_mt(const void *a, const void *b)
+static void
+sort_by_name(mrb_state *mrb, void *base, size_t n, size_t size, sym_cmp_fn cmp)
 {
-  return sym_cmp(((const gmt_entry*)a)->sym, ((const gmt_entry*)b)->sym);
+  if (n < 2) return;
+  uint8_t *a = (uint8_t*)base;
+  uint8_t *tmp = (uint8_t*)mrb_malloc(mrb, n * size);
+  for (size_t w = 1; w < n; w *= 2) {
+    for (size_t lo = 0; lo < n - w; lo += 2 * w) {
+      size_t mid = lo + w, hi = lo + 2 * w < n ? lo + 2 * w : n;
+      size_t i = lo, j = mid, k = 0;
+      while (i < mid && j < hi) {
+        if (cmp(mrb, a + j * size, a + i * size) < 0) { memcpy(tmp + k++ * size, a + j++ * size, size); }
+        else { memcpy(tmp + k++ * size, a + i++ * size, size); }
+      }
+      while (i < mid) memcpy(tmp + k++ * size, a + i++ * size, size);
+      while (j < hi) memcpy(tmp + k++ * size, a + j++ * size, size);
+      memcpy(a + lo * size, tmp, k * size);
+    }
+  }
+  mrb_free(mrb, tmp);
 }
 
 static int
-cmp_iv(const void *a, const void *b)
+cmp_mt(mrb_state *mrb, const void *a, const void *b)
 {
-  return sym_cmp(((const giv_entry*)a)->sym, ((const giv_entry*)b)->sym);
+  return sym_cmp(mrb, ((const gmt_entry*)a)->sym, ((const gmt_entry*)b)->sym);
+}
+
+static int
+cmp_iv(mrb_state *mrb, const void *a, const void *b)
+{
+  return sym_cmp(mrb, ((const giv_entry*)a)->sym, ((const giv_entry*)b)->sym);
 }
 
 /* ---- digests ---- */
@@ -368,8 +394,7 @@ visit_class(mrb_state *mrb, checkpoint_perm *P, struct RClass *c, const char *pa
   if (s->nmt > 0) {
     gmt_entry *mt = (gmt_entry*)mrb_malloc(mrb, sizeof(gmt_entry) * s->nmt);
     memcpy(mt, s->mt, sizeof(gmt_entry) * s->nmt);
-    sort_mrb = mrb;
-    qsort(mt, s->nmt, sizeof(gmt_entry), cmp_mt);
+    sort_by_name(mrb, mt, s->nmt, sizeof(gmt_entry), cmp_mt);
     for (int i = 0; i < s->nmt; i++) {
       const char *mname = mrb_sym_name(mrb, mt[i].sym);
       if (mt[i].ptr == NULL) continue; /* undef */
@@ -438,8 +463,7 @@ visit_class(mrb_state *mrb, checkpoint_perm *P, struct RClass *c, const char *pa
   if (niv > 0) {
     giv_entry *iv = (giv_entry*)mrb_malloc(mrb, sizeof(giv_entry) * niv);
     memcpy(iv, s->iv, sizeof(giv_entry) * niv);
-    sort_mrb = mrb;
-    qsort(iv, niv, sizeof(giv_entry), cmp_iv);
+    sort_by_name(mrb, iv, niv, sizeof(giv_entry), cmp_iv);
     /* plain values first, so a class reached by two constants is named
        by the first one in a stable order */
     for (int i = 0; i < niv; i++) {
@@ -494,28 +518,36 @@ checkpoint_gc_settings(mrb_state *mrb, gc_settings *g)
 /* C functions the bundled gems put into classes they make at run time
    (Struct.new, Data.define): static there, so a class is made for the
    purpose before the baseline and the C functions of its methods and of
-   its singleton class's methods are named after the maker. */
+   its singleton class's methods are named after the maker. The list is the
+   state's (checkpoint_state.made), found at its first baseline. */
 #define MAX_MADE_FUNCS 64
-static struct { char name[96]; mrb_func_t f; } made_funcs[MAX_MADE_FUNCS];
-static int nmade_funcs = -1;
+
+typedef struct {
+  checkpoint_state *g;
+  const char *prefix;
+} made_ctx;
 
 static int
 made_cb(mrb_state *mrb, mrb_sym sym, mrb_method_t m, void *ud)
 {
-  const char *prefix = (const char*)ud;
+  made_ctx *x = (made_ctx*)ud;
+  checkpoint_state *g = x->g;
   mrb_func_t f = NULL;
   if (MRB_METHOD_FUNC_P(m)) f = MRB_METHOD_FUNC(m);
   else if (MRB_METHOD_PROC(m) && MRB_PROC_CFUNC_P(MRB_METHOD_PROC(m))) f = MRB_METHOD_PROC(m)->body.func;
-  if (!f || nmade_funcs >= MAX_MADE_FUNCS) return 0;
-  for (int i = 0; i < nmade_funcs; i++) if (made_funcs[i].f == f) return 0;
-  snprintf(made_funcs[nmade_funcs].name, sizeof(made_funcs[0].name), "F:%s#%s", prefix, mrb_sym_name(mrb, sym));
-  made_funcs[nmade_funcs].f = f;
-  nmade_funcs++;
+  if (!f || g->nmade >= MAX_MADE_FUNCS) return 0;
+  for (int i = 0; i < g->nmade; i++) if (g->made[i].f == f) return 0;
+  char name[128];
+  snprintf(name, sizeof(name), "F:%s#%s", x->prefix, mrb_sym_name(mrb, sym));
+  g->made = (struct checkpoint_made_func*)mrb_realloc(mrb, g->made, sizeof(g->made[0]) * (g->nmade + 1));
+  g->made[g->nmade].name = checkpoint_strdup(mrb, name);
+  g->made[g->nmade].f = f;
+  g->nmade++;
   return 0;
 }
 
 static void
-made_class(mrb_state *mrb, const char *maker, const char *meth, const char *label)
+made_class(mrb_state *mrb, checkpoint_state *g, const char *maker, const char *meth, const char *label)
 {
   if (!mrb_class_defined(mrb, maker)) return;
   /* enough members to see every kind of accessor (mruby-data has direct
@@ -528,31 +560,33 @@ made_class(mrb_state *mrb, const char *maker, const char *meth, const char *labe
   mrb_value k = mrb_funcall_argv(mrb, mrb_obj_value(mrb_class_get(mrb, maker)), mrb_intern_cstr(mrb, meth), 6, a);
   if (!mrb_class_p(k)) return;
   char buf[64];
-  mrb_mt_foreach(mrb, mrb_class_ptr(k), made_cb, (void*)label);
+  made_ctx x = { g, label };
+  mrb_mt_foreach(mrb, mrb_class_ptr(k), made_cb, &x);
   snprintf(buf, sizeof(buf), "S:%s", label);
   struct RClass *sc = mrb_class_ptr(k)->c;
-  if (sc && sc->tt == MRB_TT_SCLASS) mrb_mt_foreach(mrb, sc, made_cb, buf);
+  x.prefix = buf;
+  if (sc && sc->tt == MRB_TT_SCLASS) mrb_mt_foreach(mrb, sc, made_cb, &x);
 }
 
 static mrb_value
 find_closures(mrb_state *mrb, void *ud)
 {
-  (void)ud;
-  made_class(mrb, "Struct", "new", "Struct.new");
-  made_class(mrb, "Data", "define", "Data.define");
+  checkpoint_state *g = (checkpoint_state*)ud;
+  made_class(mrb, g, "Struct", "new", "Struct.new");
+  made_class(mrb, g, "Data", "define", "Data.define");
   return mrb_nil_value();
 }
 
 checkpoint_perm*
 checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g)
 {
-  if (nmade_funcs < 0) {
-    /* once per process: the same build makes the same functions. The made
-       classes are garbage before the heap is taken below */
+  if (g && !g->made_found) {
+    /* once per state: the made classes are garbage before the heap is
+       taken below */
     mrb_bool err;
-    nmade_funcs = 0;
+    g->made_found = 1;
     int ai = mrb_gc_arena_save(mrb);
-    mrb_protect_error(mrb, find_closures, NULL, &err);
+    mrb_protect_error(mrb, find_closures, g, &err);
     mrb_gc_arena_restore(mrb, ai);
     mrb->exc = NULL;
     mrb_full_gc(mrb);
@@ -602,8 +636,7 @@ checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g)
   if (P->ngv > 0) {
     giv_entry *gv = (giv_entry*)mrb_malloc(mrb, sizeof(giv_entry) * P->ngv);
     memcpy(gv, P->gv, sizeof(giv_entry) * P->ngv);
-    sort_mrb = mrb;
-    qsort(gv, P->ngv, sizeof(giv_entry), cmp_iv);
+    sort_by_name(mrb, gv, P->ngv, sizeof(giv_entry), cmp_iv);
     for (int i = 0; i < P->ngv; i++) {
       mrb_value v = gv[i].val;
       if (mrb_immediate_p(v)) continue;
@@ -620,9 +653,9 @@ checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g)
     mrb_free(mrb, gv);
   }
 
-  for (int i = 0; i < nmade_funcs; i++) {
-    if (!pm_get(&P->func2name, (const void*)made_funcs[i].f, NULL)) {
-      add_name(mrb, P, made_funcs[i].name, (const void*)made_funcs[i].f, 1);
+  for (int i = 0; g && i < g->nmade; i++) {
+    if (!pm_get(&P->func2name, (const void*)g->made[i].f, NULL)) {
+      add_name(mrb, P, g->made[i].name, (const void*)g->made[i].f, 1);
     }
   }
   /* the embedder's (mrb_checkpoint_register_func) */

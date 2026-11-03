@@ -32,7 +32,11 @@
 ** flag was set already or the count has moved (sched_switch). Then the flag
 ** is left set (the VM returns to the scheduler right after the hook) and the
 ** image says the slice ends there; otherwise it is cleared, as it would be
-** without the request.
+** without the request, unless the count moves meanwhile (a timeslice that
+** ends on another thread, settle_switch).
+**
+** The state of each mrb_state is its own (checkpoint_get) and comes from its
+** allocator: several VMs can carry the gem in one process.
 */
 
 #include <stdio.h>
@@ -51,61 +55,94 @@
 extern void (*mrb_vm_safepoint_hook)(mrb_state *mrb);
 
 
-/* ---- per-state side table ---- */
+/* ---- per-state side table ----
 
-#define CHECKPOINT_MAX_STATES 8
-static checkpoint_state *states[CHECKPOINT_MAX_STATES];
+   Each mrb_state has its own checkpoint_state, allocated from that state's
+   allocator (mrb_malloc), so that any number of VMs can coexist in one
+   process, on several threads (Family mruby runs every application in its
+   own VM, each with its own memory pool). Nothing of it is static (a count
+   of the requests pending in all states is, below). The
+   pointer lives in a global variable of the state, under a name Ruby code
+   cannot spell; it holds a C pointer, which is an immediate value: it is
+   neither a permanent object nor something an image carries. */
+
+#define STATE_GV "_checkpoint_state_"
+
+/* How many states of the process have a request pending. The VM calls the
+   safe point hook at every task switch of every state; looking the state up
+   there (a symbol and a global variable) costs hundreds of instructions, so
+   the hook looks only while some state has a request. The one static of the
+   gem, and only a count: any number of states may come and go. */
+static uint32_t npending;
+
+static void
+set_pending(checkpoint_state *g, int on)
+{
+  on = on ? 1 : 0;
+  if (g->pending == on) return;
+  g->pending = on;
+#if defined(__GNUC__) || defined(__clang__)
+  __atomic_add_fetch(&npending, on ? 1u : (uint32_t)-1, __ATOMIC_SEQ_CST);
+#else
+  npending += on ? 1u : (uint32_t)-1;
+#endif
+}
+
+static int
+any_pending(void)
+{
+#if defined(__GNUC__) || defined(__clang__)
+  /* a state's own request is made on its own thread before it raises the
+     flag, so that thread sees its own count */
+  return __atomic_load_n(&npending, __ATOMIC_RELAXED) != 0;
+#else
+  return npending != 0;
+#endif
+}
 
 checkpoint_state*
 checkpoint_get(mrb_state *mrb)
 {
-  for (int i = 0; i < CHECKPOINT_MAX_STATES; i++) {
-    if (states[i] && states[i]->mrb == mrb) return states[i];
-  }
-  return NULL;
+  mrb_value v = mrb_gv_get(mrb, mrb_intern_lit(mrb, STATE_GV));
+  return mrb_cptr_p(v) ? (checkpoint_state*)mrb_cptr(v) : NULL;
 }
 
 static checkpoint_state*
 checkpoint_new(mrb_state *mrb)
 {
-  for (int i = 0; i < CHECKPOINT_MAX_STATES; i++) {
-    if (!states[i]) {
-      checkpoint_state *g = (checkpoint_state*)calloc(1, sizeof(checkpoint_state));
-      g->mrb = mrb;
-      states[i] = g;
-      return g;
-    }
-  }
-  return NULL;
+  checkpoint_state *g = (checkpoint_state*)mrb_calloc(mrb, 1, sizeof(checkpoint_state));
+  g->mrb = mrb;
+  mrb_gv_set(mrb, mrb_intern_lit(mrb, STATE_GV), mrb_cptr_value(mrb, g));
+  return g;
 }
 
 static void
 checkpoint_delete(mrb_state *mrb)
 {
-  for (int i = 0; i < CHECKPOINT_MAX_STATES; i++) {
-    if (states[i] && states[i]->mrb == mrb) {
-      checkpoint_state *g = states[i];
-      checkpoint_perm_free(mrb, g->perm);
-      free(g->pending_path);
-      free(g->output);
-      for (int k = 0; k < g->ndata; k++) free(g->data[k].name);
-      free(g->data);
-      for (int k = 0; k < g->nfuncs; k++) free(g->fnames[k]);
-      free(g->fnames); free(g->funcs);
-      for (int k = 0; k < g->nsrc; k++) { free(g->src[k].name); free(g->src[k].text); }
-      free(g->src);
-      free(g);
-      states[i] = NULL;
-    }
-  }
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g) return;
+  set_pending(g, 0);
+  mrb_gv_remove(mrb, mrb_intern_lit(mrb, STATE_GV));
+  checkpoint_perm_free(mrb, g->perm);
+  mrb_free(mrb, g->pending_path);
+  mrb_free(mrb, g->output);
+  for (int k = 0; k < g->ndata; k++) mrb_free(mrb, g->data[k].name);
+  mrb_free(mrb, g->data);
+  for (int k = 0; k < g->nfuncs; k++) mrb_free(mrb, g->fnames[k]);
+  mrb_free(mrb, g->fnames); mrb_free(mrb, g->funcs);
+  for (int k = 0; k < g->nmade; k++) mrb_free(mrb, g->made[k].name);
+  mrb_free(mrb, g->made);
+  for (int k = 0; k < g->nsrc; k++) { mrb_free(mrb, g->src[k].name); mrb_free(mrb, g->src[k].text); }
+  mrb_free(mrb, g->src);
+  mrb_free(mrb, g);
 }
 
-static char*
-dupstr(const char *s)
+char*
+checkpoint_strdup(mrb_state *mrb, const char *s)
 {
   if (!s) return NULL;
   size_t n = strlen(s);
-  char *d = (char*)malloc(n + 1);
+  char *d = (char*)mrb_malloc(mrb, n + 1);
   memcpy(d, s, n + 1);
   return d;
 }
@@ -142,24 +179,23 @@ mrb_checkpoint_add_source(mrb_state *mrb, const char *filename, const char *src,
 {
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g || !filename) return;
-  size_t nlen = strlen(filename);
-  char *text = (char*)malloc(len + 1);
-  if (!text) return;
+  char *text = (char*)mrb_malloc(mrb, len + 1);
   if (len) memcpy(text, src, len);
   text[len] = 0;
   for (int i = 0; i < g->nsrc; i++) {
     if (strcmp(g->src[i].name, filename) == 0) {
-      free(g->src[i].text);
+      mrb_free(mrb, g->src[i].text);
       g->src[i].text = text;
       g->src[i].len = len;
       return;
     }
   }
-  struct checkpoint_source *a = (struct checkpoint_source*)realloc(g->src, sizeof(*a) * (g->nsrc + 1));
-  char *name = (char*)malloc(nlen + 1);
-  if (!a || !name) { free(text); free(name); if (a) g->src = a; return; }
-  memcpy(name, filename, nlen + 1);
+  struct checkpoint_source *a = (struct checkpoint_source*)mrb_realloc_simple(mrb, g->src, sizeof(*a) * (g->nsrc + 1));
+  if (!a) { mrb_free(mrb, text); return; }
   g->src = a;
+  char *name = (char*)mrb_malloc_simple(mrb, strlen(filename) + 1);
+  if (!name) { mrb_free(mrb, text); return; }
+  memcpy(name, filename, strlen(filename) + 1);
   g->src[g->nsrc].name = name;
   g->src[g->nsrc].text = text;
   g->src[g->nsrc].len = len;
@@ -194,8 +230,8 @@ mrb_checkpoint_set_output(mrb_state *mrb, const char *path)
 {
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g) return;
-  free(g->output);
-  g->output = dupstr(path);
+  mrb_free(mrb, g->output);
+  g->output = checkpoint_strdup(mrb, path);
 }
 
 MRB_API void
@@ -214,9 +250,9 @@ mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const ch
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g) return;
   for (int i = 0; i < g->ndata; i++) if (g->data[i].type == type) return;
-  g->data = (checkpoint_data_ent*)realloc(g->data, sizeof(checkpoint_data_ent) * (g->ndata + 1));
+  g->data = (checkpoint_data_ent*)mrb_realloc(mrb, g->data, sizeof(checkpoint_data_ent) * (g->ndata + 1));
   g->data[g->ndata].type = type;
-  g->data[g->ndata].name = dupstr(name);
+  g->data[g->ndata].name = checkpoint_strdup(mrb, name);
   g->data[g->ndata].dump = dump;
   g->data[g->ndata].restore = restore;
   g->data[g->ndata].restore_obj = NULL;
@@ -228,10 +264,10 @@ mrb_checkpoint_register_func(mrb_state *mrb, const char *name, mrb_func_t func)
 {
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g || !func) return;
-  g->fnames = (char**)realloc(g->fnames, sizeof(char*) * (g->nfuncs + 1));
-  g->funcs = (mrb_func_t*)realloc(g->funcs, sizeof(mrb_func_t) * (g->nfuncs + 1));
+  g->fnames = (char**)mrb_realloc(mrb, g->fnames, sizeof(char*) * (g->nfuncs + 1));
+  g->funcs = (mrb_func_t*)mrb_realloc(mrb, g->funcs, sizeof(mrb_func_t) * (g->nfuncs + 1));
   size_t n = strlen(name);
-  g->fnames[g->nfuncs] = (char*)malloc(n + 3);
+  g->fnames[g->nfuncs] = (char*)mrb_malloc(mrb, n + 3);
   memcpy(g->fnames[g->nfuncs], "F:", 2);
   memcpy(g->fnames[g->nfuncs] + 2, name, n + 1);
   g->funcs[g->nfuncs] = func;
@@ -282,7 +318,7 @@ static void
 mark_switch(mrb_state *mrb, checkpoint_state *g)
 {
   g->sched_asked = mrb->task.switching ? 1 : 0;
-  g->sched_requests = mrb->task.switch_requests;
+  g->sched_mark = mrb->task.switch_requests;
   mrb->task.switching = TRUE;
 }
 
@@ -292,17 +328,30 @@ static int
 sched_switch(mrb_state *mrb, checkpoint_state *g)
 {
   int sw;
+  g->sched_requests = mrb->task.switch_requests;   /* what settle_switch compares with */
   if (!mrb->task.switching) sw = 0;    /* the scheduler cleared it (not at a safe point here) */
-  else sw = g->sched_asked || mrb->task.switch_requests != g->sched_requests;
+  else sw = g->sched_asked || g->sched_requests != g->sched_mark;
   g->sched_asked = 0;
   return sw;
 }
 
-/* leave the flag as the scheduler would have it */
+/* leave the flag as the scheduler would have it. The scheduler's timeslice
+   may end on another thread meanwhile (a tick task that raises the flag
+   without the VM, as Family mruby's FreeRTOS port does; it moves the count
+   first): a count that moved since sched_switch is a request the cleared
+   flag must not hide. */
 static void
-settle_switch(mrb_state *mrb, int sw)
+settle_switch(mrb_state *mrb, checkpoint_state *g, int sw)
 {
-  mrb->task.switching = sw ? TRUE : FALSE;
+  if (sw) {
+    mrb->task.switching = TRUE;
+    return;
+  }
+  mrb->task.switching = FALSE;
+#if defined(__GNUC__) || defined(__clang__)
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* the store above before the load below */
+#endif
+  if (mrb->task.switch_requests != g->sched_requests) mrb->task.switching = TRUE;
 }
 
 /* write the image of an external request here; sw: the scheduler asked for
@@ -311,7 +360,7 @@ settle_switch(mrb_state *mrb, int sw)
 static void
 external_write(mrb_state *mrb, checkpoint_state *g, int sw)
 {
-  g->pending = 0;
+  set_pending(g, 0);
   g->dump_switch = sw;
   g->dump_source = g->source_default;
 
@@ -343,13 +392,14 @@ static void
 external_safepoint(mrb_state *mrb, checkpoint_state *g)
 {
   int sw = sched_switch(mrb, g);
-  settle_switch(mrb, sw);
+  settle_switch(mrb, g, sw);
   external_write(mrb, g, sw);
 }
 
 static void
 checkpoint_safepoint(mrb_state *mrb)
 {
+  if (!any_pending()) return;
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g || !g->pending) return;
   if (g->pending_kind == MRB_CHECKPOINT_EXTERNAL) {
@@ -358,7 +408,7 @@ checkpoint_safepoint(mrb_state *mrb)
   }
 
   int sw = sched_switch(mrb, g);
-  g->pending = 0;
+  set_pending(g, 0);
   g->dump_switch = sw;
   g->dump_source = g->pending_source;
   char *path = g->pending_path;
@@ -371,8 +421,8 @@ checkpoint_safepoint(mrb_state *mrb)
   if (c != g->ret_ctx || c->ci - c->cibase != g->ret_ci || c->stbase + g->ret_slot >= c->stend ||
       !mrb_symbol_p(c->stbase[g->ret_slot]) ||
       mrb_symbol(c->stbase[g->ret_slot]) != MRB_SYM(saved)) {
-    free(path);
-    settle_switch(mrb, sw);
+    mrb_free(mrb, path);
+    settle_switch(mrb, g, sw);
     mrb_raise(mrb, error_class(mrb), "the call's value is not where the checkpoint expects it");
   }
   mrb_value *slot = &c->stbase[g->ret_slot];
@@ -383,10 +433,10 @@ checkpoint_safepoint(mrb_state *mrb)
   char err[512];
   int failed = checkpoint_dump(mrb, &out, err, sizeof(err));
   *slot = mrb_symbol_value(MRB_SYM(saved));
-  settle_switch(mrb, sw);
+  settle_switch(mrb, g, sw);
   if (failed) {
     gb_free(mrb, &out);
-    free(path);
+    mrb_free(mrb, path);
     mrb_raise(mrb, error_class(mrb), err);
   }
   struct mrb_jmpbuf *prev_jmp = mrb->jmp;
@@ -400,13 +450,13 @@ checkpoint_safepoint(mrb_state *mrb)
   MRB_CATCH(&c_jmp) {
     mrb->jmp = prev_jmp;
     gb_free(mrb, &out);
-    free(path);
+    mrb_free(mrb, path);
     MRB_THROW(prev_jmp);
   }
   MRB_END_EXC(&c_jmp);
   /* SAVE, or a handler that returns from SUSPEND: the program goes on here */
   gb_free(mrb, &out);
-  free(path);
+  mrb_free(mrb, path);
 }
 
 /* Name the C function between the base frame and the caller, if any: a
@@ -476,14 +526,15 @@ request(mrb_state *mrb, enum mrb_checkpoint_kind kind)
   /* where the value of this call lands: the caller's register R[a], which
      is the base of this cfunc's frame */
   struct mrb_context *c = mrb->c;
-  free(g->pending_path);
-  g->pending_path = dupstr(path);
+  mrb_free(mrb, g->pending_path);
+  g->pending_path = NULL;
+  g->pending_path = checkpoint_strdup(mrb, path);
   g->pending_kind = kind;
   g->pending_source = mrb_undef_p(kw_values[0]) ? g->source_default : mrb_test(kw_values[0]);
   g->ret_ctx = c;
   g->ret_ci = (c->ci - 1) - c->cibase;
   g->ret_slot = c->ci->stack - c->stbase;
-  g->pending = 1;
+  set_pending(g, 1);
   mark_switch(mrb, g);
   return mrb_symbol_value(MRB_SYM(saved));
 }
@@ -503,7 +554,7 @@ mrb_checkpoint_request(mrb_state *mrb)
   /* an exception (or a break through an ensure clause) in flight is not
      refused: the VM calls the hook only once it is caught */
   if (c_boundary(mrb, cfn, sizeof(cfn))) return MRB_CHECKPOINT_REQ_C_BOUNDARY;
-  g->pending = 1;
+  set_pending(g, 1);
   g->pending_kind = MRB_CHECKPOINT_EXTERNAL;
   mark_switch(mrb, g);
   return MRB_CHECKPOINT_REQ_OK;

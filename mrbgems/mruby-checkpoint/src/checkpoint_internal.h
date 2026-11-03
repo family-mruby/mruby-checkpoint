@@ -215,6 +215,11 @@ typedef struct checkpoint_state {
   void *refusal_ud;
   int keep_dead;              /* write dead registers too (no liveness pass) */
   char **fnames; mrb_func_t *funcs; int nfuncs;   /* mrb_checkpoint_register_func */
+  /* the C functions of the classes the bundled gems make at run time
+     (Struct.new, Data.define), found once per state (checkpoint_perm.c) */
+  struct checkpoint_made_func { char *name; mrb_func_t f; } *made;
+  int nmade;
+  int made_found;
   uint32_t last_dead;         /* non-nil registers the last image wrote as nil */
   /* v1: Tasks and Fibers */
   struct mrb_context *ret_ctx;  /* the context of the save / suspend call */
@@ -224,7 +229,8 @@ typedef struct checkpoint_state {
   /* the scheduler's record when the request was raised (see mark_switch in
      checkpoint.c) */
   int sched_asked;            /* task.switching was set already */
-  uint32_t sched_requests;    /* mrb->task.switch_requests then */
+  uint32_t sched_mark;        /* mrb->task.switch_requests then */
+  uint32_t sched_requests;    /* ... and at the safe point (sched_switch) */
   /* what mrb_checkpoint_continue starts again (set by the restore) */
   struct checkpoint_resume_plan {
     int set;
@@ -244,6 +250,7 @@ typedef struct checkpoint_state {
 checkpoint_state *checkpoint_get(mrb_state *mrb);
 /* the registered source of a file, or NULL */
 const struct checkpoint_source *checkpoint_source_of(checkpoint_state *g, const char *name, size_t len);
+char *checkpoint_strdup(mrb_state *mrb, const char *s);   /* mrb_malloc'ed */
 
 checkpoint_perm *checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g);
 void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);
