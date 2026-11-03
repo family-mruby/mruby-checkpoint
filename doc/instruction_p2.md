@@ -76,7 +76,7 @@
 - コミット: このリポジトリは `main`、SabiRuby は `feature/checkpoint` (英文、
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>)。どちらも push しない。
   SabiRuby は公開のリポジトリなので、文書に手元の絶対パス・ユーザ名・Family mruby の
-  発表の話を書かない (技術の話だけ)。
+  技術の話だけを書く。
 - SabiRuby のコミットの書き方・文書の書き方は、その README の Rules と既存の
   docs に合わせる。
 - `target/` は大きいので、終わったら worktree の `target/` を `cargo clean` で消す。

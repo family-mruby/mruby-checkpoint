@@ -55,8 +55,8 @@ gem の試験) を、外からランダムなセーフポイントで止めて�
 
 - コミット: このリポジトリは `main`、SabiRuby は `feature/checkpoint` (英文、
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>)。push しない。
-- SabiRuby は公開のリポジトリなので、文書・コミットに手元の絶対パス・ユーザ名・発表の
-  話を書かない。終わったら worktree の `target/` を `cargo clean` で消す。
+- SabiRuby は公開のリポジトリなので、文書・コミットに手元の絶対パス・ユーザ名・
+  このリポジトリと関係のない話を書かない。終わったら worktree の `target/` を `cargo clean` で消す。
 - 普段のビルドの `vm.c` の patch を変えたら、valgrind の命令数で前後を比べる
   (時間では判定しない。docker のイメージ `ghost-valgrind` が手元にある)。
 - report は `doc/report/p3.md`: 外からの停止の方式、生きているレジスタの計算、
