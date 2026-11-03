@@ -1,18 +1,24 @@
 --- a/include/mruby.h
 +++ b/include/mruby.h
-@@ -296,6 +296,9 @@
+@@ -296,6 +296,15 @@
    uint8_t irq_nesting;              /* Depth counter for scheduler-IRQ exclusion */
    mrb_bool loop_running;            /* Active mrb_task_run loop flag */
    mrb_bool exception_as_result;     /* Return unhandled task exceptions as values */
 +  volatile uint32_t switch_requests; /* Count of the scheduler's switch requests
-+                                        (it changes whenever the scheduler sets
-+                                        switching; only a change means anything) */
++                                        made on the VM's own thread (it changes
++                                        whenever the scheduler sets switching;
++                                        only a change means anything) */
++  volatile uint32_t switch_requests_async; /* The same, made by a tick on another
++                                        thread (a HAL whose timer is a thread of
++                                        its own). One writer each, so neither
++                                        needs an atomic increment; the count is
++                                        the sum (task_switch_requests) */
  } mrb_task_state;
  #endif
  
 --- a/mrbgems/mruby-task/include/task.h
 +++ b/mrbgems/mruby-task/include/task.h
-@@ -164,6 +164,17 @@
+@@ -164,6 +164,23 @@
  #define wakeup_tick_ (mrb->task.wakeup_tick)
  #define switching_   (mrb->task.switching)
  
@@ -26,6 +32,12 @@
 +  (mrb)->task.switch_requests++; \
 +  (mrb)->task.switching = TRUE; \
 +} while (0)
++
++/* The scheduler's switch count: the requests made on the VM's thread and
++ * those of a tick on another thread (which moves switch_requests_async
++ * before it sets switching). It only ever moves on. */
++#define task_switch_requests(mrb) \
++  ((uint32_t)((mrb)->task.switch_requests + (mrb)->task.switch_requests_async))
 +
  /* Recover the mrb_task that owns the current mruby context */
  #define MRB2TASK(mrb) ((mrb_task *)((uint8_t *)(mrb)->c - offsetof(mrb_task, c)))

@@ -25,7 +25,7 @@
 ** task.switching is the scheduler's flag too (a Task's timeslice is over,
 ** it sleeps or passes, a Task it woke goes first): a request that sets it
 ** would hide whether the scheduler set it as well. mruby-task counts its own
-** requests (mrb->task.switch_requests, patches/0002-task-switch-requests.patch;
+** requests (task_switch_requests(), patches/0002-task-switch-requests.patch;
 ** every place that sets the flag for the scheduler moves the count). The
 ** request notes the count and whether the flag was set already (mark_switch);
 ** at the safe point the scheduler has asked for a switch exactly when the
@@ -318,7 +318,7 @@ static void
 mark_switch(mrb_state *mrb, checkpoint_state *g)
 {
   g->sched_asked = mrb->task.switching ? 1 : 0;
-  g->sched_mark = mrb->task.switch_requests;
+  g->sched_mark = task_switch_requests(mrb);
   mrb->task.switching = TRUE;
 }
 
@@ -328,7 +328,7 @@ static int
 sched_switch(mrb_state *mrb, checkpoint_state *g)
 {
   int sw;
-  g->sched_requests = mrb->task.switch_requests;   /* what settle_switch compares with */
+  g->sched_requests = task_switch_requests(mrb);   /* what settle_switch compares with */
   if (!mrb->task.switching) sw = 0;    /* the scheduler cleared it (not at a safe point here) */
   else sw = g->sched_asked || g->sched_requests != g->sched_mark;
   g->sched_asked = 0;
@@ -337,9 +337,9 @@ sched_switch(mrb_state *mrb, checkpoint_state *g)
 
 /* leave the flag as the scheduler would have it. The scheduler's timeslice
    may end on another thread meanwhile (a tick task that raises the flag
-   without the VM, as Family mruby's FreeRTOS port does; it moves the count
-   first): a count that moved since sched_switch is a request the cleared
-   flag must not hide. */
+   without the VM, as Family mruby's FreeRTOS port does; it moves
+   switch_requests_async first): a count that moved since sched_switch is a
+   request the cleared flag must not hide. */
 static void
 settle_switch(mrb_state *mrb, checkpoint_state *g, int sw)
 {
@@ -351,7 +351,7 @@ settle_switch(mrb_state *mrb, checkpoint_state *g, int sw)
 #if defined(__GNUC__) || defined(__clang__)
   __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* the store above before the load below */
 #endif
-  if (mrb->task.switch_requests != g->sched_requests) mrb->task.switching = TRUE;
+  if (task_switch_requests(mrb) != g->sched_requests) mrb->task.switching = TRUE;
 }
 
 /* write the image of an external request here; sw: the scheduler asked for

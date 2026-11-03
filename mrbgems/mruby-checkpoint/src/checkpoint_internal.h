@@ -229,7 +229,7 @@ typedef struct checkpoint_state {
   /* the scheduler's record when the request was raised (see mark_switch in
      checkpoint.c) */
   int sched_asked;            /* task.switching was set already */
-  uint32_t sched_mark;        /* mrb->task.switch_requests then */
+  uint32_t sched_mark;        /* task_switch_requests() then */
   uint32_t sched_requests;    /* ... and at the safe point (sched_switch) */
   /* what mrb_checkpoint_continue starts again (set by the restore) */
   struct checkpoint_resume_plan {
