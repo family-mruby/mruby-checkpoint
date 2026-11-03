@@ -206,7 +206,7 @@ static void
 r_syms(reader *r)
 {
   r->nsym = r_u32(r);
-  r->syms = (mrb_sym*)mrb_calloc(r->mrb, r->nsym + 1, sizeof(mrb_sym));
+  r->syms = (mrb_sym*)ck_calloc(r->G, r->nsym + 1, sizeof(mrb_sym));
   for (uint32_t i = 0; i < r->nsym && !r->failed; i++) {
     uint32_t len;
     const uint8_t *s = r_str(r, &len);
@@ -245,11 +245,11 @@ r_ireps(reader *r)
 {
   mrb_state *mrb = r->mrb;
   r->nirep = r_u32(r);
-  r->ireps = (mrb_irep**)mrb_calloc(mrb, r->nirep + 1, sizeof(mrb_irep*));
-  r->irep_perm = (uint8_t*)mrb_calloc(mrb, r->nirep + 1, 1);
-  r->irep_parents = (uint32_t*)mrb_calloc(mrb, r->nirep + 1, sizeof(uint32_t));
-  uint32_t **children = (uint32_t**)mrb_calloc(mrb, r->nirep + 1, sizeof(uint32_t*));
-  uint64_t *hashes = (uint64_t*)mrb_calloc(mrb, r->nirep + 1, sizeof(uint64_t));
+  r->ireps = (mrb_irep**)ck_calloc(r->G, r->nirep + 1, sizeof(mrb_irep*));
+  r->irep_perm = (uint8_t*)ck_calloc(r->G, r->nirep + 1, 1);
+  r->irep_parents = (uint32_t*)ck_calloc(r->G, r->nirep + 1, sizeof(uint32_t));
+  uint32_t **children = (uint32_t**)ck_calloc(r->G, r->nirep + 1, sizeof(uint32_t*));
+  uint64_t *hashes = (uint64_t*)ck_calloc(r->G, r->nirep + 1, sizeof(uint64_t));
 
   for (uint32_t i = 0; i < r->nirep && !r->failed; i++) {
     uint8_t kind = r_u8(r);
@@ -338,7 +338,7 @@ r_ireps(reader *r)
 
     uint16_t rlen = r_u16(r);
     irep->rlen = rlen;
-    children[i] = (uint32_t*)mrb_calloc(mrb, rlen ? rlen : 1, sizeof(uint32_t));
+    children[i] = (uint32_t*)ck_calloc(r->G, rlen ? rlen : 1, sizeof(uint32_t));
     for (int k = 0; k < rlen; k++) children[i][k] = r_u32(r);
 
     uint16_t nlv = r_u16(r);
@@ -377,9 +377,9 @@ r_ireps(reader *r)
     }
   }
 
-  for (uint32_t i = 0; i < r->nirep; i++) mrb_free(mrb, children[i]);
-  mrb_free(mrb, children);
-  mrb_free(mrb, hashes);
+  for (uint32_t i = 0; i < r->nirep; i++) ck_free(r->G, children[i]);
+  ck_free(r->G, children);
+  ck_free(r->G, hashes);
 }
 
 static checkpoint_data_ent*
@@ -498,7 +498,7 @@ add_frozen_later(reader *r, struct RBasic *o)
 {
   if (r->nfl == r->capfl) {
     r->capfl = r->capfl ? r->capfl * 2 : 8;
-    r->fl = (struct RBasic**)mrb_realloc(r->mrb, r->fl, sizeof(void*) * r->capfl);
+    r->fl = (struct RBasic**)ck_realloc(r->G, r->fl, sizeof(void*) * r->capfl);
   }
   r->fl[r->nfl++] = o;
 }
@@ -508,7 +508,7 @@ add_prepended(reader *r, struct RClass *c)
 {
   if (r->npre == r->cappre) {
     r->cappre = r->cappre ? r->cappre * 2 : 8;
-    r->pre = (struct RClass**)mrb_realloc(r->mrb, r->pre, sizeof(void*) * r->cappre);
+    r->pre = (struct RClass**)ck_realloc(r->G, r->pre, sizeof(void*) * r->cappre);
   }
   r->pre[r->npre++] = c;
 }
@@ -578,7 +578,7 @@ r_object(reader *r, uint32_t id)
       if (r->fill) {
         if (r->nhent == r->caphent) {
           r->caphent = r->caphent ? r->caphent * 2 : 64;
-          r->hents = (hent*)mrb_realloc(mrb, r->hents, sizeof(hent) * r->caphent);
+          r->hents = (hent*)ck_realloc(r->G, r->hents, sizeof(hent) * r->caphent);
         }
         r->hents[r->nhent].h = o; r->hents[r->nhent].k = k; r->hents[r->nhent].v = v;
         r->hents[r->nhent].set = 0;
@@ -671,7 +671,7 @@ r_object(reader *r, uint32_t id)
       ((struct RClass*)o)->super = (struct RClass*)super;
       if (r->nicl == r->capicl) {
         r->capicl = r->capicl ? r->capicl * 2 : 16;
-        r->icl = (struct RClass**)mrb_realloc(mrb, r->icl, sizeof(void*) * r->capicl);
+        r->icl = (struct RClass**)ck_realloc(r->G, r->icl, sizeof(void*) * r->capicl);
       }
       r->icl[r->nicl++] = (struct RClass*)o;
     }
@@ -756,7 +756,7 @@ r_object(reader *r, uint32_t id)
         e->stack = NULL;
         if (r->nsenv == r->capsenv) {
           r->capsenv = r->capsenv ? r->capsenv * 2 : 16;
-          r->senvs = (senv*)mrb_realloc(mrb, r->senvs, sizeof(senv) * r->capsenv);
+          r->senvs = (senv*)ck_realloc(r->G, r->senvs, sizeof(senv) * r->capsenv);
         }
         r->senvs[r->nsenv].e = e; r->senvs[r->nsenv].ctx = cx; r->senvs[r->nsenv].off = off; r->nsenv++;
       }
@@ -832,7 +832,7 @@ r_object(reader *r, uint32_t id)
       if (r->fill) {
         if (r->nhent == r->caphent) {
           r->caphent = r->caphent ? r->caphent * 2 : 64;
-          r->hents = (hent*)mrb_realloc(mrb, r->hents, sizeof(hent) * r->caphent);
+          r->hents = (hent*)ck_realloc(r->G, r->hents, sizeof(hent) * r->caphent);
         }
         r->hents[r->nhent].h = o; r->hents[r->nhent].k = v; r->hents[r->nhent].v = mrb_nil_value();
         r->hents[r->nhent].set = 1;
@@ -893,7 +893,7 @@ r_object(reader *r, uint32_t id)
     else if (cx) {
       if (r->nsfib == r->capsfib) {
         r->capsfib = r->capsfib ? r->capsfib * 2 : 8;
-        r->sfibs = (sfib*)mrb_realloc(mrb, r->sfibs, sizeof(sfib) * r->capsfib);
+        r->sfibs = (sfib*)ck_realloc(r->G, r->sfibs, sizeof(sfib) * r->capsfib);
       }
       r->sfibs[r->nsfib].f = (struct RFiber*)o; r->sfibs[r->nsfib].ctx = cx; r->nsfib++;
     }
@@ -933,7 +933,7 @@ r_object(reader *r, uint32_t id)
     if (r->fill && de->restore_obj) {
       if (r->ndfix == r->capdfix) {
         r->capdfix = r->capdfix ? r->capdfix * 2 : 16;
-        r->dfix = (dfix*)mrb_realloc(mrb, r->dfix, sizeof(dfix) * r->capdfix);
+        r->dfix = (dfix*)ck_realloc(r->G, r->dfix, sizeof(dfix) * r->capdfix);
       }
       r->dfix[r->ndfix].o = o; r->dfix[r->ndfix].de = de;
       r->dfix[r->ndfix].blob = blob; r->dfix[r->ndfix].len = blen;
@@ -952,10 +952,10 @@ static void
 r_objects(reader *r)
 {
   r->nobj = r_u32(r);
-  r->objs = (struct RBasic**)mrb_calloc(r->mrb, r->nobj + 1, sizeof(void*));
-  r->okind = (uint8_t*)mrb_calloc(r->mrb, r->nobj + 1, 1);
-  r->ofrozen = (uint8_t*)mrb_calloc(r->mrb, r->nobj + 1, 1);
-  r->task_of_obj = (uint32_t*)mrb_calloc(r->mrb, r->nobj + 1, sizeof(uint32_t));
+  r->objs = (struct RBasic**)ck_calloc(r->G, r->nobj + 1, sizeof(void*));
+  r->okind = (uint8_t*)ck_calloc(r->G, r->nobj + 1, 1);
+  r->ofrozen = (uint8_t*)ck_calloc(r->G, r->nobj + 1, 1);
+  r->task_of_obj = (uint32_t*)ck_calloc(r->G, r->nobj + 1, sizeof(uint32_t));
   const uint8_t *start = r->p;
   r->fill = 0;
   for (uint32_t i = 1; i <= r->nobj && !r->failed; i++) r_object(r, i);
@@ -1038,7 +1038,7 @@ r_patches(reader *r)
           mrb_value val = r_value(r);
           if (r->nhent == r->caphent) {
             r->caphent = r->caphent ? r->caphent * 2 : 64;
-            r->hents = (hent*)mrb_realloc(mrb, r->hents, sizeof(hent) * r->caphent);
+            r->hents = (hent*)ck_realloc(r->G, r->hents, sizeof(hent) * r->caphent);
           }
           r->hents[r->nhent].h = o; r->hents[r->nhent].k = k; r->hents[r->nhent].v = val;
           r->hents[r->nhent].set = 0;
@@ -1127,11 +1127,10 @@ r_frame(reader *r, rctx *x, uint32_t cid, uint32_t k)
 static void
 r_contexts(reader *r)
 {
-  mrb_state *mrb = r->mrb;
   r->nctx = r_u32(r);
   if (r->failed) return;
   if (r->nctx == 0) { rfail(r, "no contexts"); return; }
-  r->ctxs = (rctx*)mrb_calloc(mrb, r->nctx, sizeof(rctx));
+  r->ctxs = (rctx*)ck_calloc(r->G, r->nctx, sizeof(rctx));
   for (uint32_t i = 0; i < r->nctx && !r->failed; i++) {
     rctx *x = &r->ctxs[i];
     x->status = r_u8(r);
@@ -1143,14 +1142,14 @@ r_contexts(reader *r)
     x->nvals = r_u32(r);
     if (r->failed) return;
     if (x->nvals > (size_t)(r->end - r->p)) { rfail(r, "truncated image"); return; }
-    x->vals = (mrb_value*)mrb_calloc(mrb, x->nvals + 1, sizeof(mrb_value));
+    x->vals = (mrb_value*)ck_calloc(r->G, x->nvals + 1, sizeof(mrb_value));
     for (uint32_t k = 0; k < x->nvals && !r->failed; k++) x->vals[k] = r_value(r);
     x->nframes = r_u32(r);
     if (r->failed) return;
     if (x->nframes > (size_t)(r->end - r->p)) { rfail(r, "truncated image"); return; }
     if (x->nframes == 0 && x->nvals > 0) { rfail(r, "a stack without frames in context %u", i + 1); return; }
-    x->frames = (mrb_callinfo*)mrb_calloc(mrb, x->nframes + 1, sizeof(mrb_callinfo));
-    x->offs = (uint32_t*)mrb_calloc(mrb, x->nframes + 1, sizeof(uint32_t));
+    x->frames = (mrb_callinfo*)ck_calloc(r->G, x->nframes + 1, sizeof(mrb_callinfo));
+    x->offs = (uint32_t*)ck_calloc(r->G, x->nframes + 1, sizeof(uint32_t));
     for (uint32_t k = 0; k < x->nframes && !r->failed; k++) r_frame(r, x, i + 1, k);
   }
   if (!r->failed && r->ctxs[0].nframes == 0 && r->ctxs[0].status != MRB_FIBER_CREATED &&
@@ -1169,7 +1168,6 @@ static void
 r_sched(reader *r, int *switch_pending, int *loop_running, uint16_t *unit, uint32_t *tick,
         uint8_t *has_wakeup, int32_t *wakeup, uint32_t *running, uint32_t *host)
 {
-  mrb_state *mrb = r->mrb;
   uint8_t fl = r_u8(r);
   *switch_pending = fl & 1;
   *loop_running = (fl & 2) != 0;
@@ -1180,7 +1178,7 @@ r_sched(reader *r, int *switch_pending, int *loop_running, uint16_t *unit, uint3
   r->ntask = r_u32(r);
   if (r->failed) return;
   if (r->ntask > (size_t)(r->end - r->p)) { rfail(r, "truncated image"); return; }
-  r->tasks = (rtask*)mrb_calloc(mrb, r->ntask + 1, sizeof(rtask));
+  r->tasks = (rtask*)ck_calloc(r->G, r->ntask + 1, sizeof(rtask));
   int nmain = 0;
   for (uint32_t i = 0; i < r->ntask && !r->failed; i++) {
     rtask *t = &r->tasks[i];
@@ -1264,7 +1262,7 @@ r_vm(reader *r)
   if (r->failed) return;
 
   /* which context is whose: the root, the Tasks', the others (Fibers') */
-  uint8_t *owner = (uint8_t*)mrb_calloc(mrb, r->nctx + 1, 1);
+  uint8_t *owner = (uint8_t*)ck_calloc(r->G, r->nctx + 1, 1);
   owner[0] = 1;
   for (uint32_t i = 0; i < r->ntask && !r->failed; i++) {
     if (r->tasks[i].queue == 255) continue;
@@ -1285,7 +1283,7 @@ r_vm(reader *r)
     uint32_t cx = r->senvs[i].ctx;
     if (cx == 0 || cx > r->nctx || r->senvs[i].off >= r->ctxs[cx - 1].nvals) rfail(r, "env stack position out of range");
   }
-  if (r->failed) { mrb_free(mrb, owner); return; }
+  if (r->failed) { ck_free(r->G, owner); return; }
 
   /* the Tasks' structs (mruby-task's mrb_task) */
   for (uint32_t i = 0; i < r->ntask; i++) {
@@ -1368,7 +1366,7 @@ r_vm(reader *r)
     r->senvs[i].e->cxt = c;
     r->senvs[i].e->stack = c->stbase + r->senvs[i].off;
   }
-  mrb_free(mrb, owner);
+  ck_free(r->G, owner);
 
   /* the clock goes on from the writer's: the program may hold ticks (a
      Task::Queue#pop deadline, Task.tick); what a wait has left is the same */
@@ -1432,7 +1430,7 @@ r_debug(reader *r)
     uint16_t *lines = NULL;
     mrb_irep_debug_info *di = NULL;
     if (use) {
-      lines = (uint16_t*)mrb_calloc(mrb, irep->ilen + 1, sizeof(uint16_t));
+      lines = (uint16_t*)ck_calloc(r->G, irep->ilen + 1, sizeof(uint16_t));
       di = mrb_debug_info_alloc(mrb, irep);
     }
     for (uint16_t k = 0; k < nf && !r->failed; k++) {
@@ -1454,7 +1452,7 @@ r_debug(reader *r)
         if (start < end) mrb_debug_info_append_file(mrb, di, name, lines, start, end);
       }
     }
-    mrb_free(mrb, lines);
+    ck_free(r->G, lines);
   }
 }
 
@@ -1470,34 +1468,33 @@ r_sources(reader *r)
     const uint8_t *fn = r_str(r, &flen);
     const uint8_t *src = r_str(r, &slen);
     if (r->failed) return;
-    char *name = (char*)mrb_malloc(r->mrb, flen + 1);
+    char *name = (char*)ck_malloc(r->G, flen + 1);
     memcpy(name, fn, flen);
     name[flen] = 0;
     mrb_checkpoint_add_source(r->mrb, name, (const char*)src, slen);
-    mrb_free(r->mrb, name);
+    ck_free(r->G, name);
   }
 }
 
 static void
 reader_free(reader *r)
 {
-  mrb_state *mrb = r->mrb;
-  mrb_free(mrb, r->syms);
-  mrb_free(mrb, r->ireps); mrb_free(mrb, r->irep_perm); mrb_free(mrb, r->irep_parents);
-  mrb_free(mrb, r->objs); mrb_free(mrb, r->okind); mrb_free(mrb, r->ofrozen);
-  mrb_free(mrb, r->hents); mrb_free(mrb, r->senvs); mrb_free(mrb, r->icl);
-  mrb_free(mrb, r->dfix);
-  mrb_free(mrb, r->pre);
-  mrb_free(mrb, r->fl);
-  mrb_free(mrb, r->sfibs);
-  mrb_free(mrb, r->task_of_obj);
+  ck_free(r->G, r->syms);
+  ck_free(r->G, r->ireps); ck_free(r->G, r->irep_perm); ck_free(r->G, r->irep_parents);
+  ck_free(r->G, r->objs); ck_free(r->G, r->okind); ck_free(r->G, r->ofrozen);
+  ck_free(r->G, r->hents); ck_free(r->G, r->senvs); ck_free(r->G, r->icl);
+  ck_free(r->G, r->dfix);
+  ck_free(r->G, r->pre);
+  ck_free(r->G, r->fl);
+  ck_free(r->G, r->sfibs);
+  ck_free(r->G, r->task_of_obj);
   for (uint32_t i = 0; r->ctxs && i < r->nctx; i++) {
-    mrb_free(mrb, r->ctxs[i].vals);
-    mrb_free(mrb, r->ctxs[i].frames);
-    mrb_free(mrb, r->ctxs[i].offs);
+    ck_free(r->G, r->ctxs[i].vals);
+    ck_free(r->G, r->ctxs[i].frames);
+    ck_free(r->G, r->ctxs[i].offs);
   }
-  mrb_free(mrb, r->ctxs);
-  mrb_free(mrb, r->tasks);
+  ck_free(r->G, r->ctxs);
+  ck_free(r->G, r->tasks);
 }
 
 MRB_API void
@@ -1539,6 +1536,9 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
   mrb_bool gc_was = mrb->gc.disabled;
   mrb->gc.disabled = TRUE;
   int ai = mrb_gc_arena_save(mrb);
+  /* the reader's tables are work areas (mrb_checkpoint_set_allocator); not a
+     count, so that a restore that raised does not leave it set */
+  r.G->work = 1;
 
   r_syms(&r);
   if (!r.failed) r_ireps(&r);
@@ -1584,6 +1584,8 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
      one must fill its length exactly. The end mark END0 has no length. */
   int has_gcs = 0, has_end = 0;
   gc_settings gcs;
+  const uint8_t *emb = NULL;   /* the embedder's section: in the caller's buffer */
+  uint32_t emb_len = 0;
   while (!r.failed && r.end - r.p >= 4) {
     if (memcmp(r.p, "END0", 4) == 0) {
       r.p += 4;
@@ -1605,6 +1607,12 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     }
     else if (memcmp(tag, "SRC0", 4) == 0) {
       r_sources(&r);
+    }
+    else if (memcmp(tag, "EMB0", 4) == 0) {
+      /* handed to the embedder once the restore has succeeded */
+      emb = r.p;
+      emb_len = len;
+      r.p = body_end;
     }
     else if (memcmp(tag, "GCS0", 4) == 0) {
       has_gcs = 1;
@@ -1708,9 +1716,11 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     char msg[600];
     snprintf(msg, sizeof(msg), "restore failed: %s", r.err);
     reader_free(&r);
+    r.G->work = 0;
     mrb_raise(mrb, eCheckpoint, msg);
   }
   reader_free(&r);
+  r.G->work = 0;
 
   mrb_full_gc(mrb);
   r.G->resumed = 1;
@@ -1734,6 +1744,8 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     mrb->gc.sched_driven = (gcs.flags & 8) != 0;
     mrb->gc.disabled = (gcs.flags & 1) != 0;
   }
+  /* the embedder's section last: the state is whole now */
+  if (emb && r.G->emb_restore) r.G->emb_restore(mrb, emb, emb_len, r.G->emb_ud);
 }
 
 MRB_API mrb_value

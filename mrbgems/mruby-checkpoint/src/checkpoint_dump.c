@@ -112,7 +112,7 @@ irep_ref(dumper *d, const mrb_irep *irep)
   id = ++d->nirep;
   if (id > d->iq_cap) {
     d->iq_cap = d->iq_cap ? d->iq_cap * 2 : 64;
-    d->iq = (const mrb_irep**)mrb_realloc(d->mrb, d->iq, sizeof(void*) * d->iq_cap);
+    d->iq = (const mrb_irep**)ck_realloc(d->G, d->iq, sizeof(void*) * d->iq_cap);
   }
   d->iq[id - 1] = irep;
   pm_put(d->mrb, &d->irepid, irep, id);
@@ -128,12 +128,12 @@ obj_ref(dumper *d, const void *p, const char *label)
   id = ++d->nobj;
   if (id > d->oq_cap) {
     d->oq_cap = d->oq_cap ? d->oq_cap * 2 : 256;
-    d->oq = (struct RBasic**)mrb_realloc(d->mrb, d->oq, sizeof(void*) * d->oq_cap);
-    d->olabel = (char**)mrb_realloc(d->mrb, d->olabel, sizeof(char*) * d->oq_cap);
+    d->oq = (struct RBasic**)ck_realloc(d->G, d->oq, sizeof(void*) * d->oq_cap);
+    d->olabel = (char**)ck_realloc(d->G, d->olabel, sizeof(char*) * d->oq_cap);
   }
   d->oq[id - 1] = (struct RBasic*)p;
   size_t n = strlen(label);
-  d->olabel[id - 1] = (char*)mrb_malloc(d->mrb, n + 1);
+  d->olabel[id - 1] = (char*)ck_malloc(d->G, n + 1);
   memcpy(d->olabel[id - 1], label, n + 1);
   pm_put(d->mrb, &d->objid, p, id);
   return id;
@@ -148,7 +148,7 @@ ctx_ref(dumper *d, struct mrb_context *c)
   id = ++d->nctx;
   if (id > d->cq_cap) {
     d->cq_cap = d->cq_cap ? d->cq_cap * 2 : 16;
-    d->cq = (struct mrb_context**)mrb_realloc(d->mrb, d->cq, sizeof(void*) * d->cq_cap);
+    d->cq = (struct mrb_context**)ck_realloc(d->G, d->cq, sizeof(void*) * d->cq_cap);
   }
   d->cq[id - 1] = c;
   pm_put(d->mrb, &d->ctxid, c, id);
@@ -1047,7 +1047,7 @@ w_context(dumper *d, uint32_t id)
   size_t live = (size_t)(top->stack - c->stbase) + (size_t)mrb_ci_nregs(top);
   if (c->stbase + live > c->stend) live = (size_t)(c->stend - c->stbase);
   /* dead registers (never read again from where the frames stand) go as nil */
-  uint8_t *keep = (uint8_t*)mrb_malloc(mrb, live + 1);
+  uint8_t *keep = (uint8_t*)ck_malloc(d->G, live + 1);
   if (d->G->keep_dead) memset(keep, 1, live);
   else checkpoint_live_slots(mrb, c, live, keep);
   gb_u32(mrb, b, (uint32_t)live);
@@ -1060,7 +1060,7 @@ w_context(dumper *d, uint32_t id)
     snprintf(label, sizeof(label), "stack slot %d of context %u", (int)i, id);
     w_value(d, b, c->stbase[i], label);
   }
-  mrb_free(mrb, keep);
+  ck_free(d->G, keep);
 
   uint32_t nframes = (uint32_t)(top - c->cibase) + 1;
   gb_u32(mrb, b, nframes);
@@ -1142,7 +1142,7 @@ queue_obj_cb(mrb_state *mrb, struct RBasic *obj, void *ud)
         !pm_get(&d->queues, rd->data, NULL)) {
       if (d->nqobj == d->qobj_cap) {
         d->qobj_cap = d->qobj_cap ? d->qobj_cap * 2 : 8;
-        d->qobj = (struct RBasic**)mrb_realloc(mrb, d->qobj, sizeof(void*) * d->qobj_cap);
+        d->qobj = (struct RBasic**)ck_realloc(d->G, d->qobj, sizeof(void*) * d->qobj_cap);
       }
       d->qobj[d->nqobj++] = obj;
       pm_put(mrb, &d->queues, rd->data, d->nqobj);
@@ -1320,7 +1320,7 @@ w_debug_irep(dumper *d, gbuf *b, uint32_t id)
     uint32_t k = 0;
     while (k < d->ndfiles && d->dfiles[k] != f->filename_sym) k++;
     if (k == d->ndfiles) {
-      d->dfiles = (mrb_sym*)mrb_realloc(mrb, d->dfiles, sizeof(mrb_sym) * (d->ndfiles + 1));
+      d->dfiles = (mrb_sym*)ck_realloc(d->G, d->dfiles, sizeof(mrb_sym) * (d->ndfiles + 1));
       d->dfiles[d->ndfiles++] = f->filename_sym;
     }
     gb_u32(mrb, b, f->start_pos);
@@ -1362,6 +1362,8 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     return -1;
   }
 
+  /* the tables below are work areas (mrb_checkpoint_set_allocator) */
+  d.G->work = 1;   /* not a count: a dump that raised must not leave it set */
   gc_settings gcs;
   checkpoint_gc_settings(mrb, &gcs);   /* before the dump turns the GC off */
   mrb_bool gc_was = mrb->gc.disabled;
@@ -1373,13 +1375,13 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
      at the root: no context, in no queue) */
   for (int q = 0; q < MRB_NUM_TASK_QUEUE; q++) {
     for (mrb_task *t = mrb->task.queues[q]; t; t = t->next) {
-      d.tq = (mrb_task**)mrb_realloc(mrb, d.tq, sizeof(void*) * (d.ntask + 1));
+      d.tq = (mrb_task**)ck_realloc(d.G, d.tq, sizeof(void*) * (d.ntask + 1));
       d.tq[d.ntask++] = t;
       pm_put(mrb, &d.taskid, t, d.ntask);
     }
   }
   if (mrb->task.main_task) {
-    d.tq = (mrb_task**)mrb_realloc(mrb, d.tq, sizeof(void*) * (d.ntask + 1));
+    d.tq = (mrb_task**)ck_realloc(d.G, d.tq, sizeof(void*) * (d.ntask + 1));
     d.tq[d.ntask++] = mrb->task.main_task;
     pm_put(mrb, &d.taskid, mrb->task.main_task, d.ntask);
   }
@@ -1467,6 +1469,21 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
       gb_u64(mrb, out, gcs.malloc_threshold);
       gb_u64(mrb, out, (uint64_t)gcs.debt_limit);
     }
+    /* the embedder's own section (mrb_checkpoint_set_embedder), last: what
+       lives outside the VM (its clock, its scheduler's counts) as it is now */
+    if (d.G->emb_dump) {
+      gbuf emb; gb_init(&emb);
+      if (d.G->emb_dump(mrb, &emb, d.G->emb_ud) != 0) {
+        snprintf(err, errlen, "the embedder refused the image (its section EMB0 could not be written)");
+        d.failed = 1;
+      }
+      else {
+        gb_bytes(mrb, out, "EMB0", 4);
+        gb_u32(mrb, out, (uint32_t)emb.len);
+        gb_bytes(mrb, out, emb.p, emb.len);
+      }
+      gb_free(mrb, &emb);
+    }
     /* the end: a cut image is refused, also one cut between sections */
     gb_bytes(mrb, out, "END0", 4);
   }
@@ -1478,9 +1495,10 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   gb_free(mrb, &d.patches); gb_free(mrb, &d.ctxs); gb_free(mrb, &d.sched);
   pm_free(mrb, &d.symid); pm_free(mrb, &d.irepid); pm_free(mrb, &d.objid);
   pm_free(mrb, &d.body); pm_free(mrb, &d.ctxid); pm_free(mrb, &d.taskid); pm_free(mrb, &d.queues);
-  for (uint32_t i = 0; i < d.nobj; i++) mrb_free(mrb, d.olabel[i]);
-  mrb_free(mrb, d.oq); mrb_free(mrb, d.olabel); mrb_free(mrb, d.iq);
-  mrb_free(mrb, d.cq); mrb_free(mrb, d.tq); mrb_free(mrb, d.qobj);
-  mrb_free(mrb, d.dfiles);
+  for (uint32_t i = 0; i < d.nobj; i++) ck_free(d.G, d.olabel[i]);
+  ck_free(d.G, d.oq); ck_free(d.G, d.olabel); ck_free(d.G, d.iq);
+  ck_free(d.G, d.cq); ck_free(d.G, d.tq); ck_free(d.G, d.qobj);
+  ck_free(d.G, d.dfiles);
+  d.G->work = 0;
   return d.failed ? -1 : 0;
 }

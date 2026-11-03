@@ -99,3 +99,7 @@ ruby tools/checkpoint_inspect.rb diff a.ckpt b.ckpt [--json | --html out.html]  
   (次のセーフポイントで書く。`include/mruby/checkpoint.h`)。間の命令がスケジューラに切り替えを要求したか
   は、mruby-task が要求を数える数で見分ける (`patches/0002-task-switch-requests.patch`)。埋め込む側の Task は
   `mrb_checkpoint_set_host_task()` でイメージに記し、復元の後 `mrb_checkpoint_host_task()` で引く。
+- プログラムを決まった大きさのプールで動かす埋め込む側は、書き出しと復元の作業の領域 (書いている途中の
+  イメージ、表) に自前のアロケータを渡せる (`mrb_checkpoint_set_allocator()`)。VM の外にある埋め込む側の
+  状態 (時計、スケジューラの tick の数など) は、イメージの埋め込む側のセクション (`EMB0`) で運べる
+  (`mrb_checkpoint_set_embedder()`)。駆動の道具はどちらも全部の試験で使う。

@@ -138,13 +138,43 @@ MRB_API mrb_value mrb_checkpoint_continue(mrb_state *mrb);
 MRB_API void mrb_checkpoint_set_host_task(mrb_state *mrb, mrb_value task);
 MRB_API mrb_value mrb_checkpoint_host_task(mrb_state *mrb);
 
+/* The embedder's allocator for the work areas of a dump and of a restore:
+   the image being written, the number tables, the reader's tables, the
+   liveness pass. They live only while an image is written or read, and an
+   embedder that runs each program in a fixed pool (Family mruby) keeps them
+   out of it, so that a program whose pool is nearly full can still be
+   written. fn(ud, p, size) works like realloc: p NULL allocates, size 0
+   frees (and returns NULL). A NULL from an allocation raises NoMemoryError.
+   Without it (fn NULL, the default) the work areas come from the state's
+   allocator, as everything else does. What stays in the state (the
+   baseline, the restored objects) always comes from the state's allocator.
+   A buffer keeps the allocator it was made with, so the call may come at
+   any time; it takes effect for the next dump or restore. */
+typedef void *(*mrb_checkpoint_realloc_fn)(void *ud, void *p, size_t size);
+MRB_API void mrb_checkpoint_set_allocator(mrb_state *mrb, mrb_checkpoint_realloc_fn fn, void *ud);
+
+/* The embedder's own section of the image (EMB0, doc/format_v1.md section
+   13): state that lives outside the VM and must go on with the program, such
+   as the embedder's clock or its scheduler's tick counts (what is left of a
+   timeslice). dump is called once per image, after everything else is
+   written: it appends its bytes to out (mrb_checkpoint_buf_bytes) and returns
+   0, or non-zero to refuse the image. restore is called once the image is
+   restored without error (before mrb_checkpoint_continue), with the bytes
+   dump wrote; it is not called for an image without the section. The bytes
+   are the embedder's: the gem neither reads nor checks them, and another
+   reader skips them. Either may be NULL. */
+typedef struct mrb_checkpoint_buf mrb_checkpoint_buf;
+typedef int (*mrb_checkpoint_embedder_dump)(mrb_state *mrb, mrb_checkpoint_buf *out, void *ud);
+typedef void (*mrb_checkpoint_embedder_restore)(mrb_state *mrb, const uint8_t *bytes, size_t len, void *ud);
+MRB_API void mrb_checkpoint_set_embedder(mrb_state *mrb, mrb_checkpoint_embedder_dump dump,
+                                         mrb_checkpoint_embedder_restore restore, void *ud);
+
 /* Side table for C data (RData). There is no field in mrb_data_type for this:
    the table maps a data type pointer to a pair of callbacks and a name the
    other side uses to find the same type.
    dump: append the object's state to *out (see mrb_checkpoint_buf_*), return 0 on
          success or non-zero to refuse.
    restore: return the data pointer built from bytes[0..len). */
-typedef struct mrb_checkpoint_buf mrb_checkpoint_buf;
 typedef int (*mrb_checkpoint_data_dump)(mrb_state *mrb, mrb_value obj, mrb_checkpoint_buf *out);
 typedef void *(*mrb_checkpoint_data_restore)(mrb_state *mrb, const uint8_t *bytes, size_t len);
 MRB_API void mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const char *name,

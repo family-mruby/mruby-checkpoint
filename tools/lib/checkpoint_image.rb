@@ -761,6 +761,11 @@ module CheckpointImage
           case tag
           when 'DBG0' then dbg0(at)
           when 'SRC0' then src0(at)
+          when 'EMB0'
+            # the embedder's own bytes (mrb_checkpoint_set_embedder): not read here
+            body = r.take(len)
+            { 'tag' => 'EMB0', 'offset' => at, 'embedder' => true, 'head_hex' => body.byteslice(0, 64).unpack1('H*'),
+              'tail_hex' => len > 64 ? body.byteslice(-16, 16).unpack1('H*') : nil }
           when 'GCS0'
             fl = r.u8
             {

@@ -84,7 +84,12 @@ Embedders can request an image from outside, without the program's help, with
 `mrb_checkpoint_request()` (written at the next safe point; see
 `include/mruby/checkpoint.h`). The host's own Task is recorded with
 `mrb_checkpoint_set_host_task()` and found again after a restore with
-`mrb_checkpoint_host_task()`.
+`mrb_checkpoint_host_task()`. An embedder that runs each program in a fixed pool
+can give the work areas of a dump and a restore (the image being written, the
+tables) an allocator of its own (`mrb_checkpoint_set_allocator()`), and can carry
+state of its own that lives outside the VM, such as its clock or its scheduler's
+tick counts, in a section of the image (`mrb_checkpoint_set_embedder()`, `EMB0`).
+The driver uses both in every test.
 
 Notes:
 

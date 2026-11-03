@@ -246,8 +246,9 @@ jump_target(const linsn *in, uint32_t *t)
 static void
 lirep_free(mrb_state *mrb, lirep *L)
 {
-  mrb_free(mrb, L->insn);
-  mrb_free(mrb, L->in);
+  checkpoint_state *G = checkpoint_get(mrb);   /* work areas (ck_*) */
+  ck_free(G, L->insn);
+  ck_free(G, L->in);
   L->insn = NULL; L->in = NULL;
 }
 
@@ -260,6 +261,7 @@ lirep_free(mrb_state *mrb, lirep *L)
 static void
 analyze(mrb_state *mrb, const mrb_irep *irep, lirep *L)
 {
+  checkpoint_state *G = checkpoint_get(mrb);   /* work areas (ck_*) */
   memset(L, 0, sizeof(*L));
   L->irep = irep;
   uint32_t nr = irep->nregs + 1;
@@ -268,11 +270,11 @@ analyze(mrb_state *mrb, const mrb_irep *irep, lirep *L)
 
   /* decode */
   uint32_t cap = 64;
-  L->insn = (linsn*)mrb_malloc(mrb, sizeof(linsn) * cap);
+  L->insn = (linsn*)ck_malloc(G, sizeof(linsn) * cap);
   for (uint32_t pos = 0; pos < irep->ilen; ) {
     if (L->ninsn == cap) {
       cap *= 2;
-      L->insn = (linsn*)mrb_realloc(mrb, L->insn, sizeof(linsn) * cap);
+      L->insn = (linsn*)ck_realloc(G, L->insn, sizeof(linsn) * cap);
     }
     if (!decode(irep, pos, &L->insn[L->ninsn])) { L->ok = 0; return; }
     pos = L->insn[L->ninsn].end;
@@ -282,10 +284,10 @@ analyze(mrb_state *mrb, const mrb_irep *irep, lirep *L)
   const struct mrb_irep_catch_handler *ch = mrb_irep_catch_handler_table(irep);
 
   /* successors are found on the fly; use / def per instruction */
-  lword *use = (lword*)mrb_calloc(mrb, (size_t)n * w + 1, sizeof(lword));
-  lword *def = (lword*)mrb_calloc(mrb, (size_t)n * w + 1, sizeof(lword));
-  uint8_t *all = (uint8_t*)mrb_calloc(mrb, n + 1, 1);
-  int32_t *jt = (int32_t*)mrb_malloc(mrb, sizeof(int32_t) * (n + 1));
+  lword *use = (lword*)ck_calloc(G, (size_t)n * w + 1, sizeof(lword));
+  lword *def = (lword*)ck_calloc(G, (size_t)n * w + 1, sizeof(lword));
+  uint8_t *all = (uint8_t*)ck_calloc(G, n + 1, 1);
+  int32_t *jt = (int32_t*)ck_malloc(G, sizeof(int32_t) * (n + 1));
   int has_raiseif = 0;
   for (uint32_t i = 0; i < n; i++) {
     linsn *in = &L->insn[i];
@@ -299,14 +301,14 @@ analyze(mrb_state *mrb, const mrb_irep *irep, lirep *L)
     }
     if (in->op == OP_RAISEIF) has_raiseif = 1;
   }
-  int32_t *ht = (int32_t*)mrb_malloc(mrb, sizeof(int32_t) * (irep->clen + 1));
+  int32_t *ht = (int32_t*)ck_malloc(G, sizeof(int32_t) * (irep->clen + 1));
   for (int h = 0; h < irep->clen; h++) {
     ht[h] = find_insn(L, ch_u32(ch[h].target));
-    if (ht[h] < 0) { mrb_free(mrb, ht); L->ok = 0; goto out; }
+    if (ht[h] < 0) { ck_free(G, ht); L->ok = 0; goto out; }
   }
 
-  L->in = (lword*)mrb_calloc(mrb, (size_t)n * w + 1, sizeof(lword));
-  lword *tmp = (lword*)mrb_malloc(mrb, sizeof(lword) * w);
+  L->in = (lword*)ck_calloc(G, (size_t)n * w + 1, sizeof(lword));
+  lword *tmp = (lword*)ck_malloc(G, sizeof(lword) * w);
   int changed = 1;
   while (changed) {
     changed = 0;
@@ -344,14 +346,14 @@ analyze(mrb_state *mrb, const mrb_irep *irep, lirep *L)
       }
     }
   }
-  mrb_free(mrb, tmp);
-  mrb_free(mrb, ht);
+  ck_free(G, tmp);
+  ck_free(G, ht);
   L->ok = 1;
 out:
-  mrb_free(mrb, use);
-  mrb_free(mrb, def);
-  mrb_free(mrb, all);
-  mrb_free(mrb, jt);
+  ck_free(G, use);
+  ck_free(G, def);
+  ck_free(G, all);
+  ck_free(G, jt);
 }
 
 /* the registers live where a frame stands (pc = the next instruction for
@@ -379,8 +381,9 @@ live_at(mrb_state *mrb, lirep *L, uint32_t pc, lword *buf)
 void
 checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint8_t *keep)
 {
+  checkpoint_state *G = checkpoint_get(mrb);   /* work areas (ck_*) */
   memset(keep, 0, nslots);
-  uint8_t *covered = (uint8_t*)mrb_calloc(mrb, nslots + 1, 1);
+  uint8_t *covered = (uint8_t*)ck_calloc(G, nslots + 1, 1);
   lirep *cache = NULL; int ncache = 0, capcache = 0;
 
   for (mrb_callinfo *ci = c->cibase; ci <= c->ci; ci++) {
@@ -403,7 +406,7 @@ checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint
     if (!L) {
       if (ncache == capcache) {
         capcache = capcache ? capcache * 2 : 8;
-        cache = (lirep*)mrb_realloc(mrb, cache, sizeof(lirep) * capcache);
+        cache = (lirep*)ck_realloc(G, cache, sizeof(lirep) * capcache);
       }
       L = &cache[ncache++];
       analyze(mrb, irep, L);
@@ -412,7 +415,7 @@ checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint
     lword *heapbuf = NULL;
     lword *b = buf;
     if ((size_t)L->words > sizeof(buf) / sizeof(buf[0])) {
-      heapbuf = (lword*)mrb_malloc(mrb, sizeof(lword) * L->words);
+      heapbuf = (lword*)ck_malloc(G, sizeof(lword) * L->words);
       b = heapbuf;
     }
     const lword *live = (ci->pc == NULL || pc == 0) ? NULL : live_at(mrb, L, pc, b);
@@ -429,13 +432,13 @@ checkpoint_live_slots(mrb_state *mrb, struct mrb_context *c, size_t nslots, uint
       if (keep[s]) continue;
       if (r < fixed || !live || r >= (size_t)irep->nregs || get_bit(live, L->words, (uint32_t)r)) keep[s] = 1;
     }
-    mrb_free(mrb, heapbuf);
+    ck_free(G, heapbuf);
   }
   for (size_t s = 0; s < nslots; s++) if (!covered[s]) keep[s] = 1;
 
   for (int i = 0; i < ncache; i++) lirep_free(mrb, &cache[i]);
-  mrb_free(mrb, cache);
-  mrb_free(mrb, covered);
+  ck_free(G, cache);
+  ck_free(G, covered);
 }
 
 /* The instruction that ends at byte pos (a caller's pc right after a call):

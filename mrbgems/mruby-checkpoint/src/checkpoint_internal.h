@@ -100,6 +100,10 @@ checkpoint_random_set(mrb_value v, uint64_t state, uint32_t seed)
 struct mrb_checkpoint_buf {
   uint8_t *p;
   size_t len, cap;
+  /* the allocator the buffer was made with: the embedder's, for a work area
+     (mrb_checkpoint_set_allocator), or NULL for the state's */
+  mrb_checkpoint_realloc_fn fn;
+  void *ud;
 };
 typedef struct mrb_checkpoint_buf gbuf;
 
@@ -118,12 +122,29 @@ typedef struct {
   uintptr_t *keys;
   uint32_t *vals;
   size_t cap, n;
+  mrb_checkpoint_realloc_fn fn;   /* as in gbuf */
+  void *ud;
 } pmap;
 
 void pm_init(pmap *m);
 void pm_free(mrb_state *mrb, pmap *m);
 int pm_get(const pmap *m, const void *key, uint32_t *val);
 void pm_put(mrb_state *mrb, pmap *m, const void *key, uint32_t val);
+
+/* ---- work areas (mrb_checkpoint_set_allocator) ----
+
+   While a dump or a restore runs (g->work > 0), the tables and buffers that
+   live only as long as it does come from the embedder's allocator, if it
+   gave one. ck_* allocate and free such an area: the caller frees it inside
+   the same dump or restore. gbuf and pmap note the allocator at their first
+   allocation instead, so a buffer that outlives the dump (the image handed
+   to the handler) is freed the way it was made. */
+struct checkpoint_state;
+mrb_noreturn void mrb_raise_nomemory(mrb_state *mrb);   /* src/error.c */
+void *ck_malloc(struct checkpoint_state *g, size_t n);
+void *ck_calloc(struct checkpoint_state *g, size_t n, size_t size);
+void *ck_realloc(struct checkpoint_state *g, void *p, size_t n);
+void ck_free(struct checkpoint_state *g, void *p);
 
 /* ---- FNV-1a 64 ---- */
 #define FNV_INIT 0xcbf29ce484222325ULL
@@ -245,6 +266,15 @@ typedef struct checkpoint_state {
   int source_default;         /* mrb_checkpoint_set_include_source */
   int pending_source;         /* the source: of the save / suspend that waits */
   int dump_source;            /* the image being written carries SRC0 */
+  /* F1 (Family mruby): the embedder's allocator for the work areas, and
+     whether a dump or restore runs (the areas made now are work areas) */
+  mrb_checkpoint_realloc_fn alloc;
+  void *alloc_ud;
+  int work;
+  /* the embedder's section (EMB0) */
+  mrb_checkpoint_embedder_dump emb_dump;
+  mrb_checkpoint_embedder_restore emb_restore;
+  void *emb_ud;
 } checkpoint_state;
 
 checkpoint_state *checkpoint_get(mrb_state *mrb);    /* NULL until the gem is set up for mrb */

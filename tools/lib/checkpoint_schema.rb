@@ -104,7 +104,7 @@ module CheckpointSchema
               'interval_ratio?' => Integer, 'step_ratio?' => Integer, 'step_limit?' => String, 'malloc_threshold?' => String,
               'debt_limit?' => String,
               # a section this reader does not know
-              'unknown?' => :bool, 'head_hex?' => String, 'tail_hex?' => [:opt, String] }
+              'unknown?' => :bool, 'embedder?' => :bool, 'head_hex?' => String, 'tail_hex?' => [:opt, String] }
   ROOT = { 'key' => String, 'kind' => [:enum, 'global', 'variable', 'method', 'superclass', 'contents', 'frame', 'task', 'fiber'],
            'refs' => REFS, 'temps?' => REFS, 'context?' => Integer, 'frame?' => Integer, 'task?' => Integer }
   DOC = {

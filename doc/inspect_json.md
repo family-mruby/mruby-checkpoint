@@ -240,6 +240,8 @@ Task (`tasks[]`):
   出さないファイルのソースがあれば `warnings` に出る。
 - `GCS0`: `disabled`・`generational`・`step_per_allocation`・`scheduler_steps`・`interval_ratio`・
   `step_ratio`・`step_limit`・`malloc_threshold`・`debt_limit` (64 bit の値は 10 進の文字列)。
+- `EMB0` (埋め込む側のセクション): `embedder: true`、`head_hex`・`tail_hex` (知らないセクションと同じ切り方)。
+  中身は埋め込む側のもので、リーダーは読まない。
 - 知らないセクション: `unknown: true`、`head_hex` (先頭 64 バイト)、`tail_hex` (64 バイトを超えるとき最後の
   16 バイト)。長さぶん読み飛ばし、後ろのセクションは続けて読む。`warnings` にも出る。
 

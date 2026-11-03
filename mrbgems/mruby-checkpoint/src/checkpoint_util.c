@@ -4,16 +4,90 @@
 
 #include "checkpoint_internal.h"
 
+/* ---- work areas ---- */
+
+static int
+work_alloc_p(checkpoint_state *g)
+{
+  return g && g->alloc && g->work > 0;
+}
+
+static void*
+emb_realloc(mrb_state *mrb, mrb_checkpoint_realloc_fn fn, void *ud, void *p, size_t n)
+{
+  void *q = fn(ud, p, n);
+  if (!q && n > 0) mrb_raise_nomemory(mrb);
+  return q;
+}
+
+void*
+ck_realloc(checkpoint_state *g, void *p, size_t n)
+{
+  if (work_alloc_p(g)) return emb_realloc(g->mrb, g->alloc, g->alloc_ud, p, n ? n : 1);
+  return mrb_realloc(g->mrb, p, n);
+}
+
+void*
+ck_malloc(checkpoint_state *g, size_t n)
+{
+  return ck_realloc(g, NULL, n);
+}
+
+void*
+ck_calloc(checkpoint_state *g, size_t n, size_t size)
+{
+  if (!work_alloc_p(g)) return mrb_calloc(g->mrb, n, size);
+  if (size > 0 && n > SIZE_MAX / size) mrb_raise_nomemory(g->mrb);
+  void *p = ck_realloc(g, NULL, n * size);
+  memset(p, 0, n * size);
+  return p;
+}
+
+void
+ck_free(checkpoint_state *g, void *p)
+{
+  if (!p) return;
+  if (work_alloc_p(g)) g->alloc(g->alloc_ud, p, 0);
+  else mrb_free(g->mrb, p);
+}
+
+/* the allocator a new buffer or table takes: the embedder's while a dump or
+   restore runs (a work area), else the state's (NULL) */
+static void
+area_alloc(mrb_state *mrb, mrb_checkpoint_realloc_fn *fn, void **ud)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (work_alloc_p(g)) { *fn = g->alloc; *ud = g->alloc_ud; }
+  else { *fn = NULL; *ud = NULL; }
+}
+
+static void*
+area_realloc(mrb_state *mrb, mrb_checkpoint_realloc_fn fn, void *ud, void *p, size_t n)
+{
+  if (fn) return emb_realloc(mrb, fn, ud, p, n ? n : 1);
+  return mrb_realloc(mrb, p, n);
+}
+
+static void
+area_free(mrb_state *mrb, mrb_checkpoint_realloc_fn fn, void *ud, void *p)
+{
+  if (!p) return;
+  if (fn) fn(ud, p, 0);
+  else mrb_free(mrb, p);
+}
+
+/* ---- byte buffer ---- */
+
 void
 gb_init(gbuf *b)
 {
-  b->p = NULL; b->len = 0; b->cap = 0;
+  b->p = NULL; b->len = 0; b->cap = 0; b->fn = NULL; b->ud = NULL;
 }
 
 void
 gb_free(mrb_state *mrb, gbuf *b)
 {
-  mrb_free(mrb, b->p);
+  area_free(mrb, b->fn, b->ud, b->p);
   gb_init(b);
 }
 
@@ -23,7 +97,8 @@ gb_bytes(mrb_state *mrb, gbuf *b, const void *p, size_t n)
   if (b->len + n > b->cap) {
     size_t cap = b->cap ? b->cap : 256;
     while (cap < b->len + n) cap *= 2;
-    b->p = (uint8_t*)mrb_realloc(mrb, b->p, cap);
+    if (!b->p) area_alloc(mrb, &b->fn, &b->ud);
+    b->p = (uint8_t*)area_realloc(mrb, b->fn, b->ud, b->p, cap);
     b->cap = cap;
   }
   if (n > 0) memcpy(b->p + b->len, p, n);
@@ -75,14 +150,14 @@ mrb_checkpoint_buf_bytes(mrb_state *mrb, mrb_checkpoint_buf *b, const void *p, s
 void
 pm_init(pmap *m)
 {
-  m->keys = NULL; m->vals = NULL; m->cap = 0; m->n = 0;
+  m->keys = NULL; m->vals = NULL; m->cap = 0; m->n = 0; m->fn = NULL; m->ud = NULL;
 }
 
 void
 pm_free(mrb_state *mrb, pmap *m)
 {
-  mrb_free(mrb, m->keys);
-  mrb_free(mrb, m->vals);
+  area_free(mrb, m->fn, m->ud, m->keys);
+  area_free(mrb, m->fn, m->ud, m->vals);
   pm_init(m);
 }
 
@@ -128,13 +203,16 @@ pm_put(mrb_state *mrb, pmap *m, const void *key, uint32_t val)
   if ((m->n + 1) * 2 > m->cap) {
     size_t ncap = m->cap ? m->cap * 2 : 64;
     uintptr_t *ok = m->keys; uint32_t *ov = m->vals; size_t ocap = m->cap;
-    m->keys = (uintptr_t*)mrb_calloc(mrb, ncap, sizeof(uintptr_t));
-    m->vals = (uint32_t*)mrb_calloc(mrb, ncap, sizeof(uint32_t));
+    if (!ok) area_alloc(mrb, &m->fn, &m->ud);
+    m->keys = (uintptr_t*)area_realloc(mrb, m->fn, m->ud, NULL, ncap * sizeof(uintptr_t));
+    memset(m->keys, 0, ncap * sizeof(uintptr_t));
+    m->vals = (uint32_t*)area_realloc(mrb, m->fn, m->ud, NULL, ncap * sizeof(uint32_t));
+    memset(m->vals, 0, ncap * sizeof(uint32_t));
     m->cap = ncap; m->n = 0;
     for (size_t i = 0; i < ocap; i++) {
       if (ok[i]) pm_put_raw(m, ok[i], ov[i]);
     }
-    mrb_free(mrb, ok); mrb_free(mrb, ov);
+    area_free(mrb, m->fn, m->ud, ok); area_free(mrb, m->fn, m->ud, ov);
   }
   pm_put_raw(m, k, val);
 }

@@ -244,6 +244,26 @@ mrb_checkpoint_set_handler(mrb_state *mrb, mrb_checkpoint_handler fn, void *ud)
 }
 
 MRB_API void
+mrb_checkpoint_set_allocator(mrb_state *mrb, mrb_checkpoint_realloc_fn fn, void *ud)
+{
+  checkpoint_state *g = checkpoint_need(mrb);
+  if (!g) return;
+  g->alloc = fn;
+  g->alloc_ud = ud;
+}
+
+MRB_API void
+mrb_checkpoint_set_embedder(mrb_state *mrb, mrb_checkpoint_embedder_dump dump,
+                            mrb_checkpoint_embedder_restore restore, void *ud)
+{
+  checkpoint_state *g = checkpoint_need(mrb);
+  if (!g) return;
+  g->emb_dump = dump;
+  g->emb_restore = restore;
+  g->emb_ud = ud;
+}
+
+MRB_API void
 mrb_checkpoint_register_data(mrb_state *mrb, const mrb_data_type *type, const char *name,
                         mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore restore)
 {
