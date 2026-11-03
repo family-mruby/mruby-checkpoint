@@ -65,11 +65,21 @@ detach_cb(mrb_state *mrb, struct RBasic *obj, void *ud)
   return MRB_EACH_OBJ_OK;
 }
 
+static long work_blocks;   /* work areas given out and not yet back (work_realloc) */
+
+/* closes the state; the work areas must be back to what they were when it
+   was opened (an --inproc resume runs inside the handler of a dump, whose
+   image is still held) */
 static void
-close_state(mrb_state *mrb)
+close_state(mrb_state *mrb, long work_at_open)
 {
   mrb_objspace_each_objects(mrb, detach_cb, NULL);
   mrb_close(mrb);
+  if (work_blocks != work_at_open) {
+    fprintf(stderr, "checkpoint: %ld work area(s) of a dump or restore not given back\n",
+            work_blocks - work_at_open);
+    exit(5);
+  }
 }
 
 static void
@@ -119,6 +129,49 @@ static int with_source = 0;
 static void inproc_handler(mrb_state *mrb, const uint8_t *buf, size_t len, const char *path,
                            enum mrb_checkpoint_kind kind, void *ud);
 
+/* The driver gives the gem an allocator of its own for the work areas, as
+   an embedder with fixed pools does (mrb_checkpoint_set_allocator): every
+   test then checks that a dump and a restore take their work areas from it
+   and give them all back (a leak is reported when the state is closed). */
+
+static void*
+work_realloc(void *ud, void *p, size_t size)
+{
+  (void)ud;
+  if (size == 0) {
+    if (p) { free(p); work_blocks--; }
+    return NULL;
+  }
+  void *q = realloc(p, size);
+  if (q && !p) work_blocks++;
+  return q;
+}
+
+/* ... and a section of its own (mrb_checkpoint_set_embedder, EMB0): a fixed
+   mark, written into every image and checked on every restore, where the
+   restore callback must run exactly once. */
+static const uint8_t emb_mark[8] = { 'd', 'r', 'i', 'v', 'e', 'r', 0, 1 };
+static int emb_restored = 0;
+
+static int
+emb_dump(mrb_state *mrb, mrb_checkpoint_buf *out, void *ud)
+{
+  (void)ud;
+  mrb_checkpoint_buf_bytes(mrb, out, emb_mark, sizeof(emb_mark));
+  return 0;
+}
+
+static void
+emb_restore(mrb_state *mrb, const uint8_t *bytes, size_t len, void *ud)
+{
+  (void)mrb; (void)ud;
+  if (len != sizeof(emb_mark) || memcmp(bytes, emb_mark, len) != 0) {
+    fprintf(stderr, "checkpoint: the embedder's section came back changed\n");
+    exit(4);
+  }
+  emb_restored++;
+}
+
 /* what both sides have before the baseline */
 static mrb_state*
 open_state(void)
@@ -127,6 +180,8 @@ open_state(void)
   if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); exit(2); }
   mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
   mrb_checkpoint_baseline(mrb);
+  mrb_checkpoint_set_allocator(mrb, work_realloc, NULL);
+  mrb_checkpoint_set_embedder(mrb, emb_dump, emb_restore, NULL);
   if (with_source) mrb_checkpoint_set_include_source(mrb, TRUE);
   return mrb;
 }
@@ -149,12 +204,18 @@ host_task_status(mrb_state *mrb)
 static int
 resume_run(const uint8_t *buf, size_t len)
 {
+  long work_at_open = work_blocks;
   mrb_state *mrb = open_state();
   if (out_override) mrb_checkpoint_set_output(mrb, out_override);
   if (inproc) mrb_checkpoint_set_handler(mrb, inproc_handler, NULL);
   image im = { buf, len };
   mrb_bool error;
+  int restored_before = emb_restored;
   mrb_value r = mrb_protect_error(mrb, resume_body, &im, &error);
+  if (!error && emb_restored != restored_before + 1) {
+    fprintf(stderr, "checkpoint: the embedder's section was restored %d times\n", emb_restored - restored_before);
+    exit(4);
+  }
   int status = 0;
   if (error) {
     mrb->exc = mrb_obj_ptr(r);
@@ -176,7 +237,7 @@ resume_run(const uint8_t *buf, size_t len)
     status = host_task_status(mrb);
   }
   fflush(stdout);
-  close_state(mrb);
+  close_state(mrb, work_at_open);
   return status;
 }
 
@@ -212,7 +273,7 @@ main(int argc, char **argv)
     if (argc != 2) return usage();
     mrb_state *mrb = open_state();
     mrb_checkpoint_each_name(mrb, print_name, NULL);
-    close_state(mrb);
+    close_state(mrb, 0);
     return 0;
   }
   for (int i = 2; i < argc; i++) {
@@ -287,6 +348,6 @@ main(int argc, char **argv)
   }
   mrb_ccontext_free(mrb, c);
   fflush(stdout);
-  close_state(mrb);
+  close_state(mrb, 0);
   return status;
 }
