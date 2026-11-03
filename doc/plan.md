@@ -150,6 +150,20 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
   後回し。差はルートからのパスで取り、動いたものも見分けられている。
 - (同) 画面の言葉は日本語のまま (発表で英語が要るかはユーザが決める)。画面の写しの PNG は git に置く。
 
+## 決まったこと (2026-11-03、上流の不具合の確認のあと)
+
+- mruby-task の README は Task と Fiber を同じアプリで混ぜないこととしている。Family mruby は
+  アプリを全部 Task で動かすので、gembox に mruby-fiber と mruby-enumerator (外部イテレータが
+  Fiber を使う) を入れない (fmruby-core `doc/reference/mruby_task_fiber.md`)。
+- P4 の「Task の中の Fiber」を運ぶ対応は、素の mruby で使う人のために残す。Family mruby に
+  持ち込むときは使わない部分。
+- 上流の不具合のうち Fiber が関係するもの (U1・U3・U5) は、上流の決まりの外なので報告しない。
+  U4 は上流の master で直っている (Family mruby には取り込んだ)。U2 (Task の中、または C から
+  resume した Fiber の中で Integer などに `instance_exec`) は上流の master でも起き (SEGV)、
+  修正を上流に PR で出した (mruby/mruby#7731)。ここでは `patches/0003`、Family mruby では
+  `lib/patch` で直してある。
+- mrblib の行番号は、Family mruby では今のまま (`PICORB_DEBUG` のときだけ) にする。
+
 ## 未確定事項
 
 - 書き出す前のフル GC と、Env の切り離しの扱い。
