@@ -80,6 +80,8 @@ module CheckpointText
         end
       when 'SRC0'
         o << "sources: #{sec['files'].map { |f| "#{f['file']} (#{f['bytes']} bytes)" }.join(', ')}\n"
+      when 'SND0'
+        o << "methods called: #{sec['names'].join(' ')}\n"
       when 'GCS0'
         o << "GC settings: #{sec.reject { |k, _| %w(tag offset).include?(k) }.map { |k, x| "#{k}=#{x}" }.join(' ')}\n"
       else

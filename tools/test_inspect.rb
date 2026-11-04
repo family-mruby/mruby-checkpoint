@@ -623,6 +623,69 @@ end
 
 part_done
 
+# ---- the method names the program calls (SND0, F4) ----
+puts 'method names called (SND0):'
+Dir.mktmpdir('checkpoint-inspect') do |dir|
+  File.write(File.join(dir, 'snd.rb'), <<~RUBY)
+    class Mine
+      def pack_it(x) = [x].pack("C")
+      def own = 1
+      def method_missing(name, *args) = name
+      def respond_to_missing?(name, priv = false) = true
+    end
+    class Array
+      def mine_added = 2
+    end
+    m = Mine.new
+    Checkpoint.suspend("snd.ckpt")
+    puts m.pack_it(65)
+    puts m.own + [].mine_added
+    puts m.anything_at_all
+    x = nil
+    puts x&.upcase.inspect
+  RUBY
+  _, err, st = run(NORMAL['64'], 'run', 'snd.rb', dir: dir)
+  check('snd.rb runs and suspends', st == 0, err)
+  img = File.join(dir, 'snd.ckpt')
+  doc = CheckpointImage.read_file(img)
+  sec = doc['sections'].find { |x| x['tag'] == 'SND0' }
+  names = sec ? sec['names'] : []
+  check('SND0: the build\'s methods the code calls, in name order', names == names.sort && %w(pack puts inspect upcase).all? { |n| names.include?(n) }, names.inspect)
+  check('SND0: not the program\'s own methods, nor method_missing names', (%w(pack_it own mine_added anything_at_all suspend_x) & names).empty?, names.inspect)
+  check('SND0: nothing from the build\'s own code (mrblib)', !names.include?('__sub_replace') && !names.include?('alias_method'), names.inspect)
+  %w(64 32).each do |arch|
+    want, err, st = run(NORMAL[arch], 'resume', img, dir: dir)
+    check("#{arch}: the same build resumes it with no missing names", st == 0 && want.lines.first == "A\n" && !err.include?('lacks'), err)
+    got, err, st = run(NORMAL[arch], 'resume', '--without', 'Array#pack', img, dir: dir)
+    check("#{arch}: a build without Array#pack restores it and names pack as missing",
+          err.include?('the program calls methods this state lacks: pack') && got.empty? && st == 1 &&
+          err.include?("undefined method 'pack'"), err)
+  end
+  # an image with SND0 cut to a wrong count is refused (a known section fills its length)
+  bytes = File.binread(img)
+  at = bytes.index('SND0')
+  bad = bytes.dup
+  n = bad.byteslice(at + 8, 4).unpack1('N')
+  bad[at + 8, 4] = [n + 1].pack('N')
+  File.binwrite(File.join(dir, 'bad.ckpt'), bad)
+  _, err, st = run(NORMAL['64'], 'resume', File.join(dir, 'bad.ckpt'), dir: dir)
+  check('SND0 with a wrong count is refused', st == 3 && err.include?('SND0'), err)
+  begin
+    CheckpointImage.read(bad)
+    check('the Ruby reader refuses a wrong SND0 count', false)
+  rescue StandardError => e
+    check('the Ruby reader refuses a wrong SND0 count', e.message.include?('SND0'), e.message)
+  end
+  if (sb = sabiruby)
+    got, e2, st = Open3.capture3(sb, '--resume', img, chdir: dir)
+    check('SabiRuby resumes an image with SND0 (a section it skips)', st.success? && got.lines.first == "A\n", e2)
+  else
+    puts '  SKIP SabiRuby (set SABIRUBY_DIR or SABIRUBY_BIN)'
+  end
+end
+
+part_done
+
 puts
 puts "inspect: #{$pass} passed, #{$fail} failed"
 exit($fail == 0 ? 0 : 1)

@@ -1404,6 +1404,16 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     else w_object(&d, no++);
   }
   for (uint32_t i = 1; i <= d.nirep && !d.failed; i++) w_irep(&d, i);
+  /* the method names the program's code calls (SND0), by reference into the
+     symbol table: before the table is written */
+  gbuf snd; gb_init(&snd);
+  uint32_t nsnd = 0;
+  if (!d.failed) {
+    mrb_sym *sent;
+    nsnd = checkpoint_sent_syms(mrb, d.G, d.P, &sent);
+    for (uint32_t i = 0; i < nsnd; i++) gb_u32(mrb, &snd, sym_ref(&d, sent[i]));
+    ck_free(d.G, sent);
+  }
 
   if (!d.failed) {
     char tmp[64];
@@ -1471,6 +1481,12 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
       gb_u64(mrb, out, gcs.malloc_threshold);
       gb_u64(mrb, out, (uint64_t)gcs.debt_limit);
     }
+    if (nsnd > 0) {
+      gb_bytes(mrb, out, "SND0", 4);
+      gb_u32(mrb, out, (uint32_t)(4 + snd.len));
+      gb_u32(mrb, out, nsnd);
+      gb_bytes(mrb, out, snd.p, snd.len);
+    }
     /* the embedder's own section (mrb_checkpoint_set_embedder), last: what
        lives outside the VM (its clock, its scheduler's counts) as it is now */
     if (d.G->emb_dump) {
@@ -1493,6 +1509,7 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   mrb_gc_arena_restore(mrb, ai);
   mrb->gc.disabled = gc_was;
 
+  gb_free(mrb, &snd);
   gb_free(mrb, &d.syms); gb_free(mrb, &d.ireps); gb_free(mrb, &d.objs);
   gb_free(mrb, &d.patches); gb_free(mrb, &d.ctxs); gb_free(mrb, &d.sched);
   pm_free(mrb, &d.symid); pm_free(mrb, &d.irepid); pm_free(mrb, &d.objid);

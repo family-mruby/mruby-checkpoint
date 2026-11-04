@@ -289,6 +289,9 @@ typedef struct checkpoint_state {
   mrb_checkpoint_embedder_dump emb_dump;
   mrb_checkpoint_embedder_restore emb_restore;
   void *emb_ud;
+  /* F4 (Family mruby): the names the last restored image's code sends (SND0)
+     that no class of this baseline defines, NUL-terminated one after another */
+  char *missing; size_t missing_len; uint32_t nmissing;
 } checkpoint_state;
 
 checkpoint_state *checkpoint_get(mrb_state *mrb);    /* NULL until the gem is set up for mrb */
@@ -328,6 +331,19 @@ int checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen);
 /* the instruction that ends at pos (checkpoint_live.c) */
 int checkpoint_insn_ending_at(const mrb_irep *irep, uint32_t pos, uint32_t *start, uint8_t *op,
                               uint32_t *a, uint32_t *b, uint32_t *c);
+
+/* the instruction that starts at pos: its end, opcode and operands (0: not decodable) */
+int checkpoint_insn_at(const mrb_irep *irep, uint32_t pos, uint32_t *end, uint8_t *op,
+                       uint32_t *a, uint32_t *b, uint32_t *c);
+
+/* the method names the program's code sends (checkpoint_sends.c, SND0): the
+   program's ireps' send operands that a class of the baseline defines and the
+   program does not define itself, in name order; *out is a work area */
+uint32_t checkpoint_sent_syms(mrb_state *mrb, checkpoint_state *G, checkpoint_perm *P, mrb_sym **out);
+/* every method name a class or module of the baseline defines, sorted by symbol */
+uint32_t checkpoint_method_syms(checkpoint_state *G, checkpoint_perm *P, mrb_sym **out);
+/* note which of names (an image's SND0) this baseline lacks (G->missing) */
+void checkpoint_set_missing(mrb_state *mrb, checkpoint_state *G, const mrb_sym *names, uint32_t n);
 
 /* Tasks and Fibers (checkpoint_task.c) */
 int checkpoint_switch_func_name(const char *name, size_t len);

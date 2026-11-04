@@ -44,6 +44,7 @@
 #include <mruby.h>
 #include <mruby/class.h>
 #include <mruby/string.h>
+#include <mruby/array.h>
 #include <mruby/data.h>
 #include <mruby/variable.h>
 #include <mruby/proc.h>
@@ -134,6 +135,7 @@ checkpoint_delete(mrb_state *mrb)
   mrb_free(mrb, g->made);
   for (int k = 0; k < g->nsrc; k++) { mrb_free(mrb, g->src[k].name); mrb_free(mrb, g->src[k].text); }
   mrb_free(mrb, g->src);
+  mrb_free(mrb, g->missing);
   mrb_free(mrb, g);
 }
 
@@ -616,6 +618,21 @@ checkpoint_suspend(mrb_state *mrb, mrb_value self)
 }
 
 #ifdef CHECKPOINT_TEST_HELPERS
+/* test builds only: the names an image would carry in SND0 (mrb_checkpoint_sent_names) */
+static void
+sent_name_cb(mrb_state *mrb, const char *name, size_t len, void *ud)
+{
+  mrb_ary_push(mrb, *(mrb_value*)ud, mrb_str_new(mrb, name, (mrb_int)len));
+}
+
+static mrb_value
+checkpoint_sent_names_m(mrb_state *mrb, mrb_value self)
+{
+  mrb_value a = mrb_ary_new(mrb);
+  mrb_checkpoint_sent_names(mrb, sent_name_cb, &a);
+  return a;
+}
+
 /* test builds only: Task.pass and Checkpoint.save (or suspend) in one call,
    so that the image is taken where the scheduler has asked for a switch (the
    slice ends at that safe point, on both sides). The pass is the one of
@@ -735,6 +752,7 @@ checkpoint_need(mrb_state *mrb)
 #ifdef CHECKPOINT_TEST_HELPERS
   mrb_define_module_function(mrb, m, "__pass_and_save", checkpoint_pass_and_save, MRB_ARGS_OPT(1));
   mrb_define_module_function(mrb, m, "__pass_and_suspend", checkpoint_pass_and_suspend, MRB_ARGS_OPT(1));
+  mrb_define_module_function(mrb, m, "__sent_names", checkpoint_sent_names_m, MRB_ARGS_NONE());
 #endif
 
   struct RClass *box = mrb_define_class_under(mrb, m, "Box", mrb->object_class);

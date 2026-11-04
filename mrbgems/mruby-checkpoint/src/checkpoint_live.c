@@ -459,3 +459,13 @@ checkpoint_insn_ending_at(const mrb_irep *irep, uint32_t pos, uint32_t *start, u
   }
   return 0;
 }
+
+int
+checkpoint_insn_at(const mrb_irep *irep, uint32_t pos, uint32_t *end, uint8_t *op,
+                   uint32_t *a, uint32_t *b, uint32_t *c)
+{
+  linsn in;
+  if (!decode(irep, pos, &in)) return 0;
+  *end = in.end; *op = in.op; *a = in.a; *b = in.b; *c = in.c;
+  return 1;
+}

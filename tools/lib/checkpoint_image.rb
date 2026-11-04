@@ -766,6 +766,10 @@ module CheckpointImage
             body = r.take(len)
             { 'tag' => 'EMB0', 'offset' => at, 'embedder' => true, 'head_hex' => body.byteslice(0, 64).unpack1('H*'),
               'tail_hex' => len > 64 ? body.byteslice(-16, 16).unpack1('H*') : nil }
+          when 'SND0'
+            # the method names the program's code calls (F4): symbols
+            n = r.u32
+            { 'tag' => 'SND0', 'offset' => at, 'names' => Array.new(n) { |i| r.where = "sections > SND0 > #{i + 1}"; sym } }
           when 'GCS0'
             fl = r.u8
             {

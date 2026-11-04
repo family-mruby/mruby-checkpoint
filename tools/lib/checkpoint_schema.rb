@@ -99,6 +99,8 @@ module CheckpointSchema
                                                                         'lines' => ARR.([:tuple, Integer, Integer]) }) }),
               # SRC0 (the texts are in the top-level sources)
               'files?' => ARR.({ 'file' => String, 'bytes' => Integer }),
+              # SND0
+              'names?' => ARR.(String),
               # GCS0
               'disabled?' => :bool, 'generational?' => :bool, 'step_per_allocation?' => :bool, 'scheduler_steps?' => :bool,
               'interval_ratio?' => Integer, 'step_ratio?' => Integer, 'step_limit?' => String, 'malloc_threshold?' => String,

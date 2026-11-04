@@ -190,6 +190,28 @@ typedef void *(*mrb_checkpoint_data_restore_obj)(mrb_state *mrb, mrb_value obj, 
 MRB_API void mrb_checkpoint_register_data_obj(mrb_state *mrb, const mrb_data_type *type, const char *name,
                                               mrb_checkpoint_data_dump dump, mrb_checkpoint_data_restore_obj restore);
 
+/* The method names the program's code calls (F4, doc/format_v1.md section 13,
+   SND0): the send operands of the program's ireps (OP_SEND, OP_SSEND and
+   their block and no-argument forms) that some class or module of this
+   state's baseline defines and the program does not define itself, in name
+   order. Every image carries the same list; this gives it without writing an
+   image (to ask a destination before anything is stopped). Name-level only:
+   it does not know the receiver, and it does not see super, a computed send,
+   eval'd code or calls from C. fn is called once per name; returns the count,
+   or -1 without a baseline. */
+typedef void (*mrb_checkpoint_method_fn)(mrb_state *mrb, const char *name, size_t len, void *ud);
+MRB_API int mrb_checkpoint_sent_names(mrb_state *mrb, mrb_checkpoint_method_fn fn, void *ud);
+/* 1 if a class or module of this state's baseline defines a method of this
+   name, 0 if none does, -1 without a baseline: what a reader answers for each
+   name of SND0 */
+MRB_API int mrb_checkpoint_has_method(mrb_state *mrb, const char *name, size_t len);
+/* The names of the last restored image's SND0 that no class of this baseline
+   defines. The restore does not refuse them (a program may guard such calls
+   with respond_to? or rescue NoMethodError): the embedder tells whoever asked.
+   fn is called once per name; returns the count (0 after an image without
+   SND0). */
+MRB_API int mrb_checkpoint_missing_names(mrb_state *mrb, mrb_checkpoint_method_fn fn, void *ud);
+
 MRB_END_DECL
 
 #endif /* MRUBY_CHECKPOINT_H */

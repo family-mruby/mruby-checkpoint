@@ -38,6 +38,7 @@
 #include <mruby/compile.h>
 #include <mruby/error.h>
 #include <mruby/array.h>
+#include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/checkpoint.h>
 #include <mruby/proc.h>
@@ -94,7 +95,7 @@ usage(void)
 {
   fprintf(stderr,
           "usage: checkpoint run [--ignore] [--inproc] [--as-task] [--with-source] [--out FILE] prog.rb\n"
-          "       checkpoint resume [--inproc] [--with-source] [--out FILE] image\n"
+          "       checkpoint resume [--inproc] [--with-source] [--out FILE] [--without Class#method]... image\n"
           "       checkpoint names\n");
   return 2;
 }
@@ -172,6 +173,34 @@ emb_restore(mrb_state *mrb, const uint8_t *bytes, size_t len, void *ud)
   emb_restored++;
 }
 
+/* --without Class#method: methods taken out before the baseline, standing
+   for a reader whose build lacks them (SND0's missing names) */
+#define WITHOUT_MAX 8
+static const char *without[WITHOUT_MAX];
+static int nwithout;
+
+static void
+remove_without(mrb_state *mrb)
+{
+  for (int i = 0; i < nwithout; i++) {
+    const char *h = strchr(without[i], '#');
+    if (!h) { fprintf(stderr, "checkpoint: --without %s: Class#method expected\n", without[i]); exit(2); }
+    mrb_value cname = mrb_str_new(mrb, without[i], h - without[i]);
+    struct RClass *c = mrb_class_get(mrb, RSTRING_PTR(cname));
+    mrb_value name = mrb_symbol_value(mrb_intern_cstr(mrb, h + 1));
+    mrb_funcall_argv(mrb, mrb_obj_value(c), mrb_intern_lit(mrb, "remove_method"), 1, &name);
+  }
+}
+
+/* the names the restored image's code calls and this state lacks */
+static void
+print_missing(mrb_state *mrb, const char *name, size_t len, void *ud)
+{
+  int *first = (int*)ud;
+  fprintf(stderr, "%s%.*s", *first ? "" : ", ", (int)len, name);
+  *first = 0;
+}
+
 /* what both sides have before the baseline */
 static mrb_state*
 open_state(void)
@@ -179,6 +208,7 @@ open_state(void)
   mrb_state *mrb = mrb_open();
   if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); exit(2); }
   mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
+  remove_without(mrb);
   mrb_checkpoint_baseline(mrb);
   mrb_checkpoint_set_allocator(mrb, work_realloc, NULL);
   mrb_checkpoint_set_embedder(mrb, emb_dump, emb_restore, NULL);
@@ -236,6 +266,12 @@ resume_run(const uint8_t *buf, size_t len)
   else {
     status = host_task_status(mrb);
   }
+  if (!error && mrb_checkpoint_missing_names(mrb, NULL, NULL) > 0) {
+    int first = 1;
+    fprintf(stderr, "checkpoint: the program calls methods this state lacks: ");
+    mrb_checkpoint_missing_names(mrb, print_missing, &first);
+    fprintf(stderr, "\n");
+  }
   fflush(stdout);
   close_state(mrb, work_at_open);
   return status;
@@ -282,6 +318,7 @@ main(int argc, char **argv)
     else if (strcmp(argv[i], "--inproc") == 0) inproc = 1;
     else if (strcmp(argv[i], "--with-source") == 0) with_source = 1;
     else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_override = argv[++i];
+    else if (strcmp(argv[i], "--without") == 0 && i + 1 < argc && nwithout < WITHOUT_MAX) without[nwithout++] = argv[++i];
     else if (argv[i][0] == '-') return usage();
     else if (!file) file = argv[i];
     else return usage();

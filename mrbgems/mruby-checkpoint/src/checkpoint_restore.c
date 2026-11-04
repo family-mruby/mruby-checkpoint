@@ -1586,6 +1586,8 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
   gc_settings gcs;
   const uint8_t *emb = NULL;   /* the embedder's section: in the caller's buffer */
   uint32_t emb_len = 0;
+  mrb_sym *snd_names = NULL;   /* SND0 */
+  uint32_t nsnd = 0;
   while (!r.failed && r.end - r.p >= 4) {
     if (memcmp(r.p, "END0", 4) == 0) {
       r.p += 4;
@@ -1613,6 +1615,18 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
       emb = r.p;
       emb_len = len;
       r.p = body_end;
+    }
+    else if (memcmp(tag, "SND0", 4) == 0) {
+      /* the method names the program calls: those this build lacks are
+         noted for the embedder, not refused */
+      uint32_t n = r_u32(&r);
+      if (!r.failed && (size_t)n * 4 != (size_t)(body_end - r.p)) {
+        rfail(&r, "section SND0: %u names in %d bytes", n, (int)(body_end - r.p));
+      }
+      mrb_sym *names = (!r.failed && n) ? (mrb_sym*)ck_malloc(r.G, sizeof(mrb_sym) * n) : NULL;
+      for (uint32_t i = 0; i < n && !r.failed; i++) names[i] = r_sym(&r);
+      if (!r.failed) { snd_names = names; nsnd = n; }
+      else ck_free(r.G, names);
     }
     else if (memcmp(tag, "GCS0", 4) == 0) {
       has_gcs = 1;
@@ -1713,12 +1727,16 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
     mrb->root_c->ci = mrb->root_c->cibase;
     memset(&r.G->plan, 0, sizeof(r.G->plan));
     r.G->host_task = NULL;
+    ck_free(r.G, snd_names);
     char msg[600];
     snprintf(msg, sizeof(msg), "restore failed: %s", r.err);
     reader_free(&r);
     r.G->work = 0;
     mrb_raise(mrb, eCheckpoint, msg);
   }
+  /* what the program calls and this build lacks (none without SND0) */
+  checkpoint_set_missing(mrb, r.G, snd_names, nsnd);
+  ck_free(r.G, snd_names);
   reader_free(&r);
   r.G->work = 0;
 
