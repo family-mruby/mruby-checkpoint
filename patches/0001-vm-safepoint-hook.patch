@@ -1,3 +1,18 @@
+--- a/include/mruby.h
++++ b/include/mruby.h
+@@ -364,6 +364,12 @@
+   mrb_code (*bytecode_decoder)(mrb_state* mrb, mrb_code code);
+ #endif
+ 
++  /* Safe point hook (mruby-checkpoint): called from the task-switch check
++     (task_stop_requested in vm.c). NULL by default. A field of each state,
++     not a global: a state's hook costs the others nothing, and on a device
++     it lives where the state does (the VM's own memory). */
++  void (*safepoint_hook)(mrb_state *mrb);
++
+   struct RClass *eException_class;
+   struct RClass *eStandardError_class;
+   struct RObject *nomem_err;              /* pre-allocated NoMemoryError */
 --- a/src/vm.c
 +++ b/src/vm.c
 @@ -1622,6 +1622,42 @@
@@ -11,8 +26,8 @@
 +   point every frame's pc and registers are in memory (ci->pc, ci->stack).
 +   The hook may return (nothing to do), raise, or never return. It may call
 +   methods (mrb_funcall), which may move the call-info stack: the VM takes
-+   its frame from mrb->c->ci again after the check. NULL by default. */
-+void (*mrb_vm_safepoint_hook)(mrb_state *mrb) = NULL;
++   its frame from mrb->c->ci again after the check. The pointer is the
++   state's own (mrb->safepoint_hook, include/mruby.h); NULL by default. */
 +
 +/* The slow half of RETURN_IF_TASK_STOPPED, kept out of line so that the
 +   check expanded at every instruction boundary is two loads and a branch.
@@ -25,8 +40,8 @@
 +{
 +  if (mrb->task.switching && !mrb->exc && !mrb->gc.iterating &&
 +      !task_across_c_boundary(mrb)) {
-+    if (mrb_vm_safepoint_hook) {
-+      mrb_vm_safepoint_hook(mrb);
++    if (mrb->safepoint_hook) {
++      mrb->safepoint_hook(mrb);
 +      if (!mrb->task.switching) return mrb->c->status == MRB_TASK_STOPPED;
 +    }
 +    if (mrb->c != mrb->root_c) return TRUE;

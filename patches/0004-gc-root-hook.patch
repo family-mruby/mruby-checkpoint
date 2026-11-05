@@ -1,6 +1,19 @@
+--- a/include/mruby.h
++++ b/include/mruby.h
+@@ -379,6 +379,10 @@
+      it lives where the state does (the VM's own memory). */
+   void (*safepoint_hook)(mrb_state *mrb);
+ 
++  /* Root hook (mruby-checkpoint): called at the end of every root scan of
++     the GC (root_scan_phase in gc.c). NULL by default. */
++  void (*gc_root_hook)(mrb_state *mrb);
++
+   struct RClass *eException_class;
+   struct RClass *eStandardError_class;
+   struct RObject *nomem_err;              /* pre-allocated NoMemoryError */
 --- a/src/gc.c
 +++ b/src/gc.c
-@@ -1206,6 +1206,14 @@
+@@ -1206,6 +1206,13 @@
    obj->tt = MRB_TT_FREE;
  }
  
@@ -9,17 +22,16 @@
 +   them (mruby-checkpoint keeps the objects of its baseline this way, as an
 +   array of addresses: a value each would cost four times as much on a
 +   32-bit machine). It must only call mrb_gc_mark and must not allocate.
++   The pointer is the state's own (mrb->gc_root_hook, include/mruby.h);
 +   NULL by default. */
-+void (*mrb_gc_root_hook)(mrb_state *mrb) = NULL;
-+
  static void
  root_scan_phase(mrb_state *mrb, mrb_gc *gc)
  {
-@@ -1260,6 +1268,7 @@
+@@ -1260,6 +1267,7 @@
    /* mark tasks - calls into task.c to mark all task queues */
    mrb_task_mark_all(mrb);
  #endif
-+  if (mrb_gc_root_hook) mrb_gc_root_hook(mrb);
++  if (mrb->gc_root_hook) mrb->gc_root_hook(mrb);
  }
  
  static void

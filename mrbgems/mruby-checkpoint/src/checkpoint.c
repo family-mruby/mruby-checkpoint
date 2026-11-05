@@ -4,8 +4,8 @@
 **
 ** save(path) and suspend(path) only raise a request: they mark the state
 ** and set mrb->task.switching, the flag the VM already tests at every
-** instruction boundary for task switches. The VM then calls
-** mrb_vm_safepoint_hook (patches/0001-vm-safepoint-hook.patch) at the next
+** instruction boundary for task switches. The VM then calls the state's
+** safepoint_hook (patches/0001-vm-safepoint-hook.patch) at the next
 ** boundary where a task switch would be allowed (no C function between the
 ** root frame and the current one, no exception in flight). The request is
 ** only accepted when there is no C function between the root frame and the
@@ -53,53 +53,36 @@
 #include "checkpoint_internal.h"
 #include "task.h"
 
-extern void (*mrb_vm_safepoint_hook)(mrb_state *mrb);
-extern void (*mrb_gc_root_hook)(mrb_state *mrb);   /* patches/0004-gc-root-hook.patch */
-
 
 /* ---- per-state side table ----
 
    Each mrb_state has its own checkpoint_state, allocated from that state's
    allocator (mrb_malloc), so that any number of VMs can coexist in one
    process, on several threads (Family mruby runs every application in its
-   own VM, each with its own memory pool). Nothing of it is static (a count
-   of the requests pending in all states is, below). The
+   own VM, each with its own memory pool). Nothing of it is static. The
    pointer lives in a global variable of the state, under a name Ruby code
    cannot spell; it holds a C pointer, which is an immediate value: it is
    neither a permanent object nor something an image carries. */
 
 #define STATE_GV "_checkpoint_state_"
 
-/* How many states of the process have a request pending. The VM calls the
-   safe point hook at every task switch of every state; looking the state up
-   there (a symbol and a global variable) costs hundreds of instructions, so
-   the hook looks only while some state has a request. The one static of the
-   gem, and only a count: any number of states may come and go. */
-static uint32_t npending;
+static void checkpoint_safepoint(mrb_state *mrb);
+static void checkpoint_gc_root(mrb_state *mrb);
 
+/* The VM calls the state's safe point hook (mrb->safepoint_hook) at a task
+   switch; looking the state up there (a symbol and a global variable) costs
+   hundreds of instructions, so the hook is set only while this state has a
+   request pending. A state without one does not call anything. The pointer
+   is a field of the state (patches/0001), so the gem keeps nothing static
+   and on a device it lives in the VM's own memory. A request is made and
+   taken on the state's own thread. */
 static void
 set_pending(checkpoint_state *g, int on)
 {
   on = on ? 1 : 0;
   if (g->pending == on) return;
   g->pending = on;
-#if defined(__GNUC__) || defined(__clang__)
-  __atomic_add_fetch(&npending, on ? 1u : (uint32_t)-1, __ATOMIC_SEQ_CST);
-#else
-  npending += on ? 1u : (uint32_t)-1;
-#endif
-}
-
-static int
-any_pending(void)
-{
-#if defined(__GNUC__) || defined(__clang__)
-  /* a state's own request is made on its own thread before it raises the
-     flag, so that thread sees its own count */
-  return __atomic_load_n(&npending, __ATOMIC_RELAXED) != 0;
-#else
-  return npending != 0;
-#endif
+  g->mrb->safepoint_hook = on ? checkpoint_safepoint : NULL;
 }
 
 checkpoint_state*
@@ -115,6 +98,9 @@ checkpoint_new(mrb_state *mrb)
   checkpoint_state *g = (checkpoint_state*)mrb_calloc(mrb, 1, sizeof(checkpoint_state));
   g->mrb = mrb;
   mrb_gv_set(mrb, mrb_intern_lit(mrb, STATE_GV), mrb_cptr_value(mrb, g));
+  /* the state's GC root hook (patches/0004): only the states that use the
+     gem have one, the others call nothing at a root scan */
+  mrb->gc_root_hook = checkpoint_gc_root;
   return g;
 }
 
@@ -124,6 +110,7 @@ checkpoint_delete(mrb_state *mrb)
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g) return;
   set_pending(g, 0);
+  mrb->gc_root_hook = NULL;
   mrb_gv_remove(mrb, mrb_intern_lit(mrb, STATE_GV));
   checkpoint_perm_free(mrb, g->perm);
   mrb_free(mrb, g->pending_path);
@@ -444,7 +431,6 @@ external_safepoint(mrb_state *mrb, checkpoint_state *g)
 static void
 checkpoint_safepoint(mrb_state *mrb)
 {
-  if (!any_pending()) return;
   checkpoint_state *g = checkpoint_get(mrb);
   if (!g || !g->pending) return;
   if (g->pending_kind == MRB_CHECKPOINT_EXTERNAL) {
@@ -757,8 +743,7 @@ box_restore(mrb_state *mrb, const uint8_t *bytes, size_t len)
    Checkpoint::Error, Checkpoint::Box) and the gem's own C data type. Nothing
    of it exists in a state until the embedder asks: mrb_checkpoint_open(), or
    any call that configures the gem (the baseline, a handler, a registration).
-   A VM that never uses the gem pays nothing for it but the safe point hook's
-   test of npending at a task switch. */
+   A VM that never uses the gem pays nothing for it (its hooks stay NULL). */
 checkpoint_state*
 checkpoint_need(mrb_state *mrb)
 {
@@ -797,8 +782,8 @@ mrb_checkpoint_open(mrb_state *mrb)
 /* ---- gem ---- */
 
 /* the GC's root hook (patches/0004): the objects of a baseline kept as
-   addresses (with a table). Called in every state of the process, also
-   those that never use the gem: a lookup only, nothing is allocated. */
+   addresses (with a table). Set in the states that use the gem
+   (checkpoint_new): a lookup only, nothing is allocated. */
 static void
 checkpoint_gc_root(mrb_state *mrb)
 {
@@ -813,11 +798,9 @@ checkpoint_gc_root(mrb_state *mrb)
 void
 mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
 {
+  /* nothing until the embedder asks (checkpoint_need): the state's hooks
+     stay NULL */
   (void)mrb;
-  /* the same functions for every state; the state itself comes later
-     (checkpoint_need) */
-  mrb_vm_safepoint_hook = checkpoint_safepoint;
-  mrb_gc_root_hook = checkpoint_gc_root;
 }
 
 void
