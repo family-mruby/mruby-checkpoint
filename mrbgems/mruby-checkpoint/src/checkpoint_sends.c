@@ -178,16 +178,37 @@ checkpoint_method_syms(checkpoint_state *G, checkpoint_perm *P, mrb_sym **out)
   return uniq_syms(s, n);
 }
 
-static mrb_state *sort_mrb;   /* for the name order below (qsort has no user data) */
-
+/* the name order of two symbols of one state */
 static int
-cmp_name(const void *a, const void *b)
+cmp_name(mrb_state *mrb, mrb_sym a, mrb_sym b)
 {
   mrb_int la, lb;
-  const char *x = mrb_sym_name_len(sort_mrb, *(const mrb_sym*)a, &la);
-  const char *y = mrb_sym_name_len(sort_mrb, *(const mrb_sym*)b, &lb);
+  const char *x = mrb_sym_name_len(mrb, a, &la);
+  const char *y = mrb_sym_name_len(mrb, b, &lb);
   int c = memcmp(x, y, (size_t)(la < lb ? la : lb));
   return c ? c : (la < lb ? -1 : la > lb);
+}
+
+/* Sorts the names by their text. A binary insertion sort that carries the
+   state: qsort() has no argument for the comparison's context, and a static
+   one would be shared by the states of every thread (and cost a word of
+   internal RAM on a device). The list is a program's sent names, short. */
+static void
+sort_names(mrb_state *mrb, mrb_sym *s, uint32_t n)
+{
+  for (uint32_t i = 1; i < n; i++) {
+    mrb_sym v = s[i];
+    uint32_t lo = 0, hi = i;
+    while (lo < hi) {
+      uint32_t mid = (lo + hi) / 2;
+      if (cmp_name(mrb, s[mid], v) <= 0) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < i) {
+      memmove(s + lo + 1, s + lo, (i - lo) * sizeof(mrb_sym));
+      s[lo] = v;
+    }
+  }
 }
 
 uint32_t
@@ -231,8 +252,7 @@ checkpoint_sent_syms(mrb_state *mrb, checkpoint_state *G, checkpoint_perm *P, mr
     }
   }
   nsent = uniq_syms(sent, nsent);
-  sort_mrb = mrb;
-  if (nsent > 1) qsort(sent, nsent, sizeof(mrb_sym), cmp_name);
+  sort_names(mrb, sent, nsent);
   ck_free(G, have);
   ck_free(G, w.defs);
   ck_free(G, w.ireps);
