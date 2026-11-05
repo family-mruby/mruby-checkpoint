@@ -57,7 +57,8 @@
 # --bless writes NAME.out from the reference run (and NAME.resumed.out from
 # the 64->64 resume of a save sample).
 #
-# CHECKPOINT_BIN64 replaces the 64-bit driver (the ASan builds, see Rakefile).
+# CHECKPOINT_BIN64 replaces the 64-bit driver (the ASan builds, see Rakefile),
+# CHECKPOINT_BIN32 the 32-bit one (the drivers with a fixed table, build:table).
 
 require 'open3'
 require 'tmpdir'
@@ -67,7 +68,7 @@ ROOT = File.expand_path('..', __dir__)
 INSPECT = File.join(ROOT, 'tools/checkpoint_inspect.rb')
 CHECKPOINT = {
   '64' => ENV['CHECKPOINT_BIN64'] ? File.expand_path(ENV['CHECKPOINT_BIN64']) : File.join(ROOT, 'build/mruby/host/bin/checkpoint'),
-  '32' => File.join(ROOT, 'build/mruby/host32/bin/checkpoint'),
+  '32' => ENV['CHECKPOINT_BIN32'] ? File.expand_path(ENV['CHECKPOINT_BIN32']) : File.join(ROOT, 'build/mruby/host32/bin/checkpoint'),
 }
 CHECKPOINT.each_value { |b| abort "missing #{b}" unless File.exist?(b) }
 VIRTUAL = {

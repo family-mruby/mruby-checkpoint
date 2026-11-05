@@ -23,6 +23,7 @@ The gem `mrbgems/mruby-checkpoint` works with an mruby that has these patches ap
 | `0001-vm-safepoint-hook.patch` | `src/vm.c` | A safe-point hook, called from the slow path of the per-instruction check (`RETURN_IF_TASK_STOPPED`). The VM reloads its frame afterwards, since the hook may move the call-info stack. A switch request raised while the root context runs (no task to leave) is dropped there, so it does not keep the following instructions on the slow path. |
 | `0002-task-switch-requests.patch` | `include/mruby.h`, mruby-task | The scheduler counts its switch requests, so an external checkpoint request never swallows one (e.g. a `Task.pass`). |
 | `0003-vm-return-target-class.patch` | `src/vm.c`, `include/mruby.h` | Removes a stale test in `OP_RETURN`. Merged upstream as mruby/mruby#7731; not needed with later mruby. |
+| `0004-gc-root-hook.patch` | `src/gc.c` | A root hook at the end of every root scan. With a fixed table of the baseline (`mrb_checkpoint_set_table`, `doc/format_v1.md` 8.1) the gem keeps the baseline's objects alive as an array of addresses instead of a hidden Array. |
 
 ## Usage
 
@@ -32,6 +33,7 @@ rake test     # test/samples with and without checkpoints, plus the inspector te
 rake test:asan, rake test:stress   # 64-bit under AddressSanitizer (stress: GC at every allocation too)
 rake bench    # benchmarks: no patch / patches only / patches + gem
 rake sabiruby # build SabiRuby in SABIRUBY_DIR with its `checkpoint` feature
+rake build:table              # the drivers with a fixed table of their baseline (build/tabled; rake test uses them)
 rake build:fuzz               # test builds (build/fuzz) with checkpoint-fuzz, an external trigger
 rake fuzz[seed,runs,points]   # stop mruby's own test suite at random safe points, round-trip, compare
 rake fuzz:sabiruby[seed,points]   # continue a subset of those on SabiRuby

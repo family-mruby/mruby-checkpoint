@@ -1628,6 +1628,18 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
       if (!r.failed) { snd_names = names; nsnd = n; }
       else ck_free(r.G, names);
     }
+    else if (memcmp(tag, "TBL0", 4) == 0) {
+      /* the rules the image's permanent names follow: another version of
+         them names other things the same way (the digest of the writer's
+         baseline differs between builds and is not checked: the names are
+         bound one by one) */
+      uint32_t ver = r_u32(&r);
+      (void)r_u64(&r);
+      if (!r.failed && ver != MRB_CHECKPOINT_TABLE_VERSION) {
+        rfail(&r, "the image names its permanent objects by the rules of table version %u, "
+                  "this build by version %u", (unsigned)ver, (unsigned)MRB_CHECKPOINT_TABLE_VERSION);
+      }
+    }
     else if (memcmp(tag, "GCS0", 4) == 0) {
       has_gcs = 1;
       gcs.flags = r_u8(&r);

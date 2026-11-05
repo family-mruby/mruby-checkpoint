@@ -16,6 +16,7 @@
 #                     suite at random safe points, and mrbgems/hal-task-virtual,
 #                     a virtual clock for mruby-task in place of the POSIX timer.
 #                     Never in the normal builds.
+# CHECKPOINT_TABLE=file.c  the driver links that fixed table (rake build:table)
 # CHECKPOINT_VIRTUAL_CLOCK=1  only the virtual clock (mrbgems/hal-task-virtual), for
 #                     measuring Task programs with instruction counts (a timer
 #                     makes them depend on time)
@@ -67,6 +68,11 @@ def checkpoint_common(conf)
     conf.gem "#{CHECKPOINT_ROOT}/mrbgems/mruby-checkpoint-fuzz"
     conf.defines << 'MRB_USE_DEBUG_HOOK'   # the per-instruction hook the trigger counts with
     conf.defines << 'CHECKPOINT_TEST_HELPERS'   # Checkpoint.__pass_and_save / __pass_and_suspend
+  end
+  if ENV['CHECKPOINT_TABLE']
+    # the driver links a fixed table (rake build:table): the C source that
+    # `checkpoint table checkpoint_driver_table` printed
+    conf.defines << %Q[CHECKPOINT_DRIVER_TABLE=\\"#{File.expand_path(ENV['CHECKPOINT_TABLE'])}\\"]
   end
   conf.mrbc.compile_options += ' -g'   # mrblib with line numbers (above)
   conf.defines += %w(MRB_NO_BOXING MRB_INT64 MRB_UTF8_STRING)

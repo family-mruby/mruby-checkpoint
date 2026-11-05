@@ -198,7 +198,14 @@ typedef struct {
 
 void checkpoint_gc_settings(mrb_state *mrb, gc_settings *out);
 
-/* the baseline, in flat tables (checkpoint_perm.c, "building") */
+/* the baseline, in flat tables (checkpoint_perm.c, "building").
+
+   With a fixed table (mrb_checkpoint_set_table, T below) the names, the
+   snapshots' methods and ivars and the irep hashes are the table's: the
+   state keeps the address of each name (ptrs), the objects alive at the
+   baseline (keepp), the mrblib ireps (irepp) and the values that are not
+   names (slots). names, name_off, is_func, ireps, snaps, mt and iv are then
+   NULL. */
 typedef struct checkpoint_perm {
   /* named permanent things (objects and C functions), in the order named */
   char *names;            /* the names, NUL-terminated, one after another */
@@ -210,6 +217,9 @@ typedef struct checkpoint_perm {
   uint32_t *func_idx; uint32_t nfunc;   /* names of C functions, sorted by pointer */
 
   struct RArray *keep;    /* every heap object alive at baseline, sorted by address */
+  /* ... or, with a table (and for writing one), the same as addresses, kept
+     from the GC by checkpoint_perm_mark */
+  uintptr_t *keepp; uint32_t nkeep;
 
   girep_perm *ireps; uint32_t nireps;   /* in the order found */
   uint32_t *irep_idx;                   /* the same, sorted by irep pointer */
@@ -219,6 +229,22 @@ typedef struct checkpoint_perm {
   giv_entry *iv; uint32_t niv;          /* the snapshots' ivars */
   giv_entry *gv; int ngv;
   gc_settings gc;    /* at the baseline */
+
+  /* with a table. Name i < T->nnames is the table's (its address NULL when
+     this state lacks it); the names this state has and the table does not
+     follow, in names / name_off / is_func above (nx of them). A table
+     snapshot this state sees otherwise, and the snapshots of its own names,
+     are kept as without a table, in snaps / mt / iv. */
+  const mrb_checkpoint_table *T;
+  uint32_t nx;                          /* names of the state's own */
+  uint32_t *snap_over;                  /* table snapshot k: index + 1 into snaps, or 0 */
+  uint32_t *xsnap; uint32_t nxsnap;     /* the snapshots of the state's own names */
+  uint32_t nmissing;                    /* table names this state lacks */
+  const mrb_irep **irepp;               /* the ireps of T->irep_hash, in its order
+                                           (NULL: they differ; ireps above then) */
+  uint64_t *slotv; uint8_t *slott;      /* the values of the slots (T->nslots) */
+  /* the digest of the names and snapshots (TBL0), once computed */
+  uint64_t stamp; int stamp_set;
 } checkpoint_perm;
 
 typedef struct checkpoint_data_ent {
@@ -292,6 +318,12 @@ typedef struct checkpoint_state {
   /* F4 (Family mruby): the names the last restored image's code sends (SND0)
      that no class of this baseline defines, NUL-terminated one after another */
   char *missing; size_t missing_len; uint32_t nmissing;
+  /* Ff (Family mruby): the fixed table (mrb_checkpoint_set_table), whether
+     the baseline is taken for writing one (mrb_checkpoint_prepare_table),
+     and why the last baseline does not use the table */
+  const mrb_checkpoint_table *table;
+  int for_table;
+  char table_why[200];
 } checkpoint_state;
 
 checkpoint_state *checkpoint_get(mrb_state *mrb);    /* NULL until the gem is set up for mrb */
@@ -311,7 +343,23 @@ uint32_t checkpoint_perm_count(checkpoint_perm *P);
 const char *checkpoint_perm_name_at(checkpoint_perm *P, uint32_t i, int *is_func);
 int checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash);
 const mrb_irep *checkpoint_perm_irep_by_hash(checkpoint_perm *P, uint64_t hash);
-gsnap *checkpoint_perm_snap(checkpoint_perm *P, const void *obj);
+/* the snapshots, the same with a table or without */
+uint32_t checkpoint_perm_nsnaps(checkpoint_perm *P);
+struct RBasic *checkpoint_perm_snap_obj(checkpoint_perm *P, uint32_t k);
+struct RClass *checkpoint_perm_snap_super(checkpoint_perm *P, uint32_t k);
+int checkpoint_perm_snap_cflags(checkpoint_perm *P, uint32_t k);
+uint64_t checkpoint_perm_snap_digest(checkpoint_perm *P, uint32_t k);
+/* a snapshot's methods / ivars as the baseline saw them, as a work area
+   (checkpoint_collect_free); returns the count */
+int checkpoint_perm_snap_mt(mrb_state *mrb, checkpoint_perm *P, uint32_t k, gsnap_mt **out);
+int checkpoint_perm_snap_iv(mrb_state *mrb, checkpoint_perm *P, uint32_t k, giv_entry **out);
+/* the method names some class of the baseline defines: 1 / 0 */
+int checkpoint_perm_has_method(mrb_state *mrb, checkpoint_perm *P, const char *name, size_t len);
+/* the digest of the names and snapshots (section TBL0): the table's stamp, or
+   the same digest computed from this state's own tables */
+uint64_t checkpoint_perm_stamp(mrb_state *mrb, checkpoint_perm *P);
+/* keeps the objects of keepp alive (the GC's root hook) */
+void checkpoint_perm_mark(mrb_state *mrb, checkpoint_perm *P);
 uint64_t checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep);
 uint64_t checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj);
 

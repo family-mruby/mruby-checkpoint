@@ -241,6 +241,8 @@ Task (`tasks[]`):
 - `GCS0`: `disabled`・`generational`・`step_per_allocation`・`scheduler_steps`・`interval_ratio`・
   `step_ratio`・`step_limit`・`malloc_threshold`・`debt_limit` (64 bit の値は 10 進の文字列)。
 - `SND0`: `names: [名前, ...]` (プログラムのコードが呼ぶメソッドの名前、名前の順。F4 で足した。版は 1 のまま)。
+- `TBL0`: `table_version` (permanent の名前の決まりの版)、`stamp` (書いた側の基準のダイジェスト、16 桁の 16 進の
+  文字列)。Ff で足した。版は 1 のまま。
 - `EMB0` (埋め込む側のセクション): `embedder: true`、`head_hex`・`tail_hex` (知らないセクションと同じ切り方)。
   中身は埋め込む側のもので、リーダーは読まない。
 - 知らないセクション: `unknown: true`、`head_hex` (先頭 64 バイト)、`tail_hex` (64 バイトを超えるとき最後の

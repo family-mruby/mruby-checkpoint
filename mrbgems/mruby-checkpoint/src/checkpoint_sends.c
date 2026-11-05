@@ -101,20 +101,23 @@ static void
 patched_defs(mrb_state *mrb, sends_walk *w)
 {
   checkpoint_perm *P = w->P;
-  for (uint32_t k = 0; k < P->nsnaps; k++) {
-    gsnap *s = &P->snaps[k];
-    struct RBasic *o = s->obj;
+  uint32_t nsnaps = checkpoint_perm_nsnaps(P);
+  for (uint32_t k = 0; k < nsnaps; k++) {
+    struct RBasic *o = checkpoint_perm_snap_obj(P, k);
+    if (!o) continue;   /* a table name this state lacks */
     if (o->tt != MRB_TT_CLASS && o->tt != MRB_TT_MODULE && o->tt != MRB_TT_SCLASS) continue;
     gmt_entry *mt; int n;
     checkpoint_collect_mt(mrb, (struct RClass*)o, &mt, &n);
-    const gsnap_mt *smt = P->mt + s->mt;
+    gsnap_mt *smt;
+    int snmt = checkpoint_perm_snap_mt(mrb, P, k, &smt);
     for (int i = 0; i < n; i++) {
       if (!mt[i].ptr) continue;
       int j;
-      for (j = 0; j < s->nmt; j++) if (smt[j].sym == mt[i].sym) break;
-      if (j < s->nmt && checkpoint_perm_ref(P, smt[j].ref) == mt[i].ptr) continue;
+      for (j = 0; j < snmt; j++) if (smt[j].sym == mt[i].sym) break;
+      if (j < snmt && checkpoint_perm_ref(P, smt[j].ref) == mt[i].ptr) continue;
       add_def(w, mt[i].sym);
     }
+    checkpoint_collect_free(mrb, smt);
     checkpoint_collect_free(mrb, mt);
   }
 }
@@ -153,6 +156,21 @@ uniq_syms(mrb_sym *s, uint32_t n)
 uint32_t
 checkpoint_method_syms(checkpoint_state *G, checkpoint_perm *P, mrb_sym **out)
 {
+  if (P->T) {
+    /* the table's list of names (a name this state never interned is no
+       method of it either) */
+    const mrb_checkpoint_table *T = P->T;
+    mrb_sym *s = (mrb_sym*)ck_malloc(G, sizeof(mrb_sym) * (T->nmethods + P->nmt + 1));
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < T->nmethods; i++) {
+      mrb_sym sym = mrb_intern_check_cstr(G->mrb, T->syms + T->methods[i]);
+      if (sym) s[n++] = sym;
+    }
+    /* ... and the snapshots of the state's own */
+    for (uint32_t i = 0; i < P->nmt; i++) if (P->mt[i].ref != 0) s[n++] = P->mt[i].sym;
+    *out = s;
+    return uniq_syms(s, n);
+  }
   mrb_sym *s = (mrb_sym*)ck_malloc(G, sizeof(mrb_sym) * (P->nmt ? P->nmt : 1));
   uint32_t n = 0;
   for (uint32_t i = 0; i < P->nmt; i++) if (P->mt[i].ref != 0) s[n++] = P->mt[i].sym;
@@ -277,11 +295,8 @@ mrb_checkpoint_has_method(mrb_state *mrb, const char *name, size_t len)
 {
   checkpoint_state *G = checkpoint_get(mrb);
   if (!G || !G->perm) return -1;
-  mrb_sym sym = mrb_intern_check(mrb, name, len);
-  if (sym == 0) return 0;
-  checkpoint_perm *P = G->perm;
-  for (uint32_t i = 0; i < P->nmt; i++) if (P->mt[i].ref != 0 && P->mt[i].sym == sym) return 1;
-  return 0;
+  /* with a table, its list of names: the classes of the state are not walked */
+  return checkpoint_perm_has_method(mrb, G->perm, name, len);
 }
 
 MRB_API int

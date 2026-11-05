@@ -1,6 +1,7 @@
 # mruby-checkpoint: build, test and benchmark entry points.
 #
 #   rake build   -- patched mruby + mruby-checkpoint, 64-bit (host) and 32-bit (host32)
+#   rake build:table -- the same drivers with a fixed table of their baseline (build/tabled)
 #   rake test    -- run test/samples with and without checkpoints, all combinations,
 #                   the points aimed at on purpose (tools/targeted.rb), the image
 #                   reader and its views (tools/test_inspect.rb) and the short fuzz
@@ -91,6 +92,32 @@ task :build do
   end
 end
 
+TABLE_BUILD = File.join(BUILD, 'tabled')
+TABLE_SRC = File.join(BUILD, 'table', 'checkpoint_table.c')
+
+desc 'build the drivers with a fixed table of their baseline (build/tabled, 64-bit and 32-bit)'
+task 'build:table' => :build do
+  # the table is made by the 64-bit driver and linked into both: the same
+  # table serves every pointer width (it holds names, not addresses)
+  FileUtils.mkdir_p(File.dirname(TABLE_SRC))
+  tmp = "#{TABLE_SRC}.new"
+  sh "#{File.join(BUILD, 'mruby', 'host', 'bin', 'checkpoint')} table checkpoint_driver_table > #{tmp}"
+  if File.exist?(TABLE_SRC) && File.read(TABLE_SRC) == File.read(tmp)
+    FileUtils.rm_f(tmp)
+  else
+    FileUtils.mv(tmp, TABLE_SRC)
+  end
+  src = prepare_source('patched', PATCHES)
+  mruby_build(src, TABLE_BUILD, 'CHECKPOINT_TABLE' => TABLE_SRC)
+  %w(host host32).each do |t|
+    bin = File.join(TABLE_BUILD, t, 'bin', 'checkpoint')
+    abort "missing #{bin}" unless File.exist?(bin)
+    out = `CHECKPOINT_TABLE_STATUS=1 #{bin} names 2>&1 >/dev/null`.strip
+    abort "#{t}: #{out}" unless out == 'checkpoint: table used'
+    puts "#{t}: #{out}"
+  end
+end
+
 FUZZ_BUILD = File.join(BUILD, 'fuzz')
 
 desc 'build the test builds with the external trigger (build/fuzz, 64-bit and 32-bit)'
@@ -111,8 +138,17 @@ task 'build:fuzz' do
 end
 
 desc 'run the samples with and without checkpoints, and the short fuzz of the test suite'
-task :test => [:build, 'build:fuzz'] do
+task :test => [:build, 'build:fuzz', 'build:table'] do
   ruby File.join(ROOT, 'tools/run_tests.rb')
+  # the same samples with the drivers that take their baseline from a fixed
+  # table (and images between the two kinds of driver: run_tests mixes them
+  # through CHECKPOINT_BIN64 / CHECKPOINT_BIN32)
+  sh({ 'CHECKPOINT_BIN64' => File.join(TABLE_BUILD, 'host', 'bin', 'checkpoint'),
+       'CHECKPOINT_BIN32' => File.join(TABLE_BUILD, 'host32', 'bin', 'checkpoint') },
+     'ruby', File.join(ROOT, 'tools/run_tests.rb'))
+  sh({ 'CHECKPOINT_BIN64' => File.join(TABLE_BUILD, 'host', 'bin', 'checkpoint') },
+     'ruby', File.join(ROOT, 'tools/run_tests.rb'))
+  ruby File.join(ROOT, 'tools/test_table.rb')
   # points aimed at on purpose: Task.pass right after an external request, an
   # image written where the call-info stack is full
   ruby File.join(ROOT, 'tools/targeted.rb')
@@ -145,10 +181,15 @@ end
 
 namespace :test do
   { asan: 'asan', stress: 'asan-stress' }.each do |t, name|
-    desc "rake test with the 64-bit driver built as #{name}"
-    task t => :build do
+    desc "rake test with the 64-bit driver built as #{name}, without and with a fixed table"
+    task t => [:build, 'build:table'] do
       sh 'sh', File.join(ROOT, 'tools/asan.sh'), *(t == :stress ? ['stress'] : [])
       bin = File.join(BUILD, name, 'host', 'bin', 'checkpoint')
+      sh({ 'CHECKPOINT_BIN64' => bin }, 'ruby', File.join(ROOT, 'tools/run_tests.rb'))
+      # the same driver with the table (keepp kept by the GC's root hook,
+      # the snapshots read from the table)
+      sh({ 'CHECKPOINT_TABLE' => TABLE_SRC }, 'sh', File.join(ROOT, 'tools/asan.sh'), *(t == :stress ? ['stress'] : []))
+      bin = File.join(BUILD, "#{name}-tabled", 'host', 'bin', 'checkpoint')
       sh({ 'CHECKPOINT_BIN64' => bin }, 'ruby', File.join(ROOT, 'tools/run_tests.rb'))
     end
   end

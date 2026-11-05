@@ -835,9 +835,10 @@ w_patches(dumper *d)
      are not the program's: the reader's scheduler and host register theirs */
   mrb_sym gc_root = mrb_intern_lit(mrb, "_gc_root_");
   mrb_value roots = mrb_gv_get(mrb, gc_root);
-  for (uint32_t k = 0; k < P->nsnaps && !d->failed; k++) {
-    gsnap *s = &P->snaps[k];
-    struct RBasic *o = s->obj;
+  uint32_t nsnaps = checkpoint_perm_nsnaps(P);
+  for (uint32_t k = 0; k < nsnaps && !d->failed; k++) {
+    struct RBasic *o = checkpoint_perm_snap_obj(P, k);
+    if (!o) continue;   /* a table name this state lacks */
     if (mrb_array_p(roots) && o == mrb_basic_ptr(roots)) continue;
     const char *name = checkpoint_perm_name_of(P, o);
     snprintf(label, sizeof(label), "permanent %s", name);
@@ -847,18 +848,19 @@ w_patches(dumper *d)
       struct RClass *c = (struct RClass*)o;
       gmt_entry *mt; int n;
       checkpoint_collect_mt(mrb, c, &mt, &n);
-      const gsnap_mt *smt = P->mt + s->mt;
+      gsnap_mt *smt;
+      int snmt = checkpoint_perm_snap_mt(mrb, P, k, &smt);
       for (int i = 0; i < n; i++) {
         int j;
-        for (j = 0; j < s->nmt; j++) if (smt[j].sym == mt[i].sym) break;
-        if (j < s->nmt && smt[j].flags == mt[i].flags &&
+        for (j = 0; j < snmt; j++) if (smt[j].sym == mt[i].sym) break;
+        if (j < snmt && smt[j].flags == mt[i].flags &&
             checkpoint_perm_ref(P, smt[j].ref) == mt[i].ptr) continue;
         gb_u8(mrb, &d->patches, GP_METHOD_SET);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
         w_method(d, &d->patches, c, mt[i].sym, mt[i].flags, mt[i].ptr, name);
         d->npatch++;
       }
-      for (int j = 0; j < s->nmt; j++) {
+      for (int j = 0; j < snmt; j++) {
         int i;
         for (i = 0; i < n; i++) if (smt[j].sym == mt[i].sym) break;
         if (i < n) continue;
@@ -867,18 +869,19 @@ w_patches(dumper *d)
         gb_u32(mrb, &d->patches, sym_ref(d, smt[j].sym));
         d->npatch++;
       }
+      checkpoint_collect_free(mrb, smt);
       checkpoint_collect_free(mrb, mt);
     }
       /* fall through */
     case MRB_TT_ICLASS: {
       struct RClass *c = (struct RClass*)o;
-      if (c->super != s->u.super) {
+      if (c->super != checkpoint_perm_snap_super(P, k)) {
         gb_u8(mrb, &d->patches, GP_SUPER_SET);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
         gb_u32(mrb, &d->patches, obj_ref(d, c->super, label));
         d->npatch++;
       }
-      if (o->tt != MRB_TT_ICLASS && ((c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0) != s->cflags) {
+      if (o->tt != MRB_TT_ICLASS && ((c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0) != checkpoint_perm_snap_cflags(P, k)) {
         gb_u8(mrb, &d->patches, GP_CLASS_FLAGS);
         gb_u32(mrb, &d->patches, obj_ref(d, o, label));
         gb_u8(mrb, &d->patches, (c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0);
@@ -888,14 +891,16 @@ w_patches(dumper *d)
     }
       /* fall through */
     case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: {
-      giv_entry *iv; int n;
+      giv_entry *iv, *siv; int n;
       checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
-      diff_iv(d, o, P->iv + s->iv, s->niv, iv, n, name);  /* refers to o only if something changed */
+      int sniv = checkpoint_perm_snap_iv(mrb, P, k, &siv);
+      diff_iv(d, o, siv, sniv, iv, n, name);  /* refers to o only if something changed */
+      checkpoint_collect_free(mrb, siv);
       checkpoint_collect_free(mrb, iv);
       break;
     }
     case MRB_TT_ISTRUCT:
-      if (checkpoint_content_digest(mrb, o) != s->u.digest) {
+      if (checkpoint_content_digest(mrb, o) != checkpoint_perm_snap_digest(P, k)) {
         if (!is_random(mrb, o)) {
           fail(d, "permanent %s (inline C struct of class %s) was modified", name, class_name(mrb, o->c));
           break;
@@ -910,7 +915,7 @@ w_patches(dumper *d)
       }
       break;
     case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_HASH:
-      if (checkpoint_content_digest(mrb, o) != s->u.digest) {
+      if (checkpoint_content_digest(mrb, o) != checkpoint_perm_snap_digest(P, k)) {
         /* the whole contents again, as in the object record (and frozen) */
         mrb_value v = mrb_obj_value(o);
         gb_u8(mrb, &d->patches, GP_CONTENT_SET);
@@ -937,9 +942,11 @@ w_patches(dumper *d)
       if (o->tt != MRB_TT_HASH) break;
       {
         /* a Hash's ivars (its default value) */
-        giv_entry *iv; int n;
+        giv_entry *iv, *siv; int n;
         checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
-        diff_iv(d, o, P->iv + s->iv, s->niv, iv, n, name);
+        int sniv = checkpoint_perm_snap_iv(mrb, P, k, &siv);
+        diff_iv(d, o, siv, sniv, iv, n, name);
+        checkpoint_collect_free(mrb, siv);
         checkpoint_collect_free(mrb, iv);
       }
       break;
@@ -1434,6 +1441,12 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
     gb_u32(mrb, out, d.nctx);   gb_bytes(mrb, out, d.ctxs.p, d.ctxs.len);
     gb_u32(mrb, out, current);
     gb_bytes(mrb, out, d.sched.p, d.sched.len);
+    /* the rules the permanent names follow and the digest of the writer's
+       baseline (TBL0): a reader of other rules refuses the image */
+    gb_bytes(mrb, out, "TBL0", 4);
+    gb_u32(mrb, out, 4 + 8);
+    gb_u32(mrb, out, MRB_CHECKPOINT_TABLE_VERSION);
+    gb_u64(mrb, out, checkpoint_perm_stamp(mrb, d.P));
     /* line numbers of the carried ireps (optional: left out when no carried
        irep has them) */
     gbuf dbg; gb_init(&dbg);

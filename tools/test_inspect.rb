@@ -506,7 +506,7 @@ check('an unknown section is skipped by its length and kept as hex', sec && sec[
       sec['head_hex'] == '010203' && doc['warnings'].any? { |w| w.include?('ZZZ9') })
 # a known section after an unknown one is still read
 first = CheckpointImage.read(bytes)['sections'].map { |s| s['tag'] }
-at = bytes.index('DBG0') || bytes.index('GCS0') || (bytes.bytesize - 4)
+at = bytes.index('TBL0') || bytes.index('DBG0') || bytes.index('GCS0') || (bytes.bytesize - 4)
 doc = CheckpointImage.read(bytes.byteslice(0, at) + unknown + bytes.byteslice(at..))
 check('the sections after an unknown one are read', doc['sections'].map { |s| s['tag'] } == ['ZZZ9'] + first)
 begin

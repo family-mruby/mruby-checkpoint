@@ -1,0 +1,25 @@
+--- a/src/gc.c
++++ b/src/gc.c
+@@ -1206,6 +1206,14 @@
+   obj->tt = MRB_TT_FREE;
+ }
+ 
++/* Root hook (mruby-checkpoint). Called at the end of every root scan, to
++   mark objects that an embedding keeps alive without a Ruby value holding
++   them (mruby-checkpoint keeps the objects of its baseline this way, as an
++   array of addresses: a value each would cost four times as much on a
++   32-bit machine). It must only call mrb_gc_mark and must not allocate.
++   NULL by default. */
++void (*mrb_gc_root_hook)(mrb_state *mrb) = NULL;
++
+ static void
+ root_scan_phase(mrb_state *mrb, mrb_gc *gc)
+ {
+@@ -1260,6 +1268,7 @@
+   /* mark tasks - calls into task.c to mark all task queues */
+   mrb_task_mark_all(mrb);
+ #endif
++  if (mrb_gc_root_hook) mrb_gc_root_hook(mrb);
+ }
+ 
+ static void

@@ -101,6 +101,8 @@ module CheckpointSchema
               'files?' => ARR.({ 'file' => String, 'bytes' => Integer }),
               # SND0
               'names?' => ARR.(String),
+              # TBL0
+              'table_version?' => Integer, 'stamp?' => String,
               # GCS0
               'disabled?' => :bool, 'generational?' => :bool, 'step_per_allocation?' => :bool, 'scheduler_steps?' => :bool,
               'interval_ratio?' => Integer, 'step_ratio?' => Integer, 'step_limit?' => String, 'malloc_threshold?' => String,

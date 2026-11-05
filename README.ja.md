@@ -20,6 +20,7 @@ gem `mrbgems/mruby-checkpoint` は、mruby の本体に次の patch を当てた
 | `0001-vm-safepoint-hook.patch` | `src/vm.c` | セーフポイントの hook。命令の境目の判定 (`RETURN_IF_TASK_STOPPED`) の遅い側から呼び、hook が呼び出しの表を動かしたらフレームを取り直す。ルートのコンテキスト (抜ける Task が無い) で立った切り替えの要求はそこで下ろし、続く命令が遅い側を通り続けないようにする |
 | `0002-task-switch-requests.patch` | `include/mruby.h`、mruby-task | スケジューラが切り替えを要求した回数を数える (外からの停止と `Task.pass` が重なっても失わない) |
 | `0003-vm-return-target-class.patch` | `src/vm.c`、`include/mruby.h` | `OP_RETURN` の古い判定を消す。上流の mruby/mruby#7731 で取り込まれたので、それ以降の mruby では要らない |
+| `0004-gc-root-hook.patch` | `src/gc.c` | root をなめる最後に呼ぶ hook。基準の固定の表 (`mrb_checkpoint_set_table`、`doc/format_v1.md` 8.1) を使うとき、gem は基準のオブジェクトを隠した Array でなくアドレスの配列で生かしておく |
 
 ## 使い方
 
@@ -29,6 +30,7 @@ rake test     # test/samples を checkpoint あり・なしで比べる
 rake test:asan, rake test:stress   # 64bit を AddressSanitizer (stress は GC の負荷も) で
 rake bench    # patch なし / patch のみ / patch + gem のベンチマーク
 rake sabiruby # SABIRUBY_DIR の SabiRuby を feature checkpoint 付きで作る
+rake build:table              # 基準の固定の表を持つドライバ (build/tabled。rake test が使う)
 rake build:fuzz               # 試験のビルド (build/fuzz): 外から止める checkpoint-fuzz
 rake fuzz[seed,runs,points]   # mruby の試験一式をランダムなセーフポイントで止めて往復させ、往復なしと比べる
 rake fuzz:sabiruby[seed,points]   # その一部を SabiRuby で続ける

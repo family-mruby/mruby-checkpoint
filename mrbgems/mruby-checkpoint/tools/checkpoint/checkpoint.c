@@ -26,6 +26,14 @@
 **       Prints the names of the baseline (the permanent objects and C
 **       functions an image refers to by name), one per line, in the order
 **       they were given; C functions are prefixed by "F:" already.
+**   checkpoint table SYMBOL
+**       Prints the baseline as a fixed table (C source defining
+**       `const mrb_checkpoint_table SYMBOL`, mrb_checkpoint_write_table).
+**       A driver built with CHECKPOINT_DRIVER_TABLE="file.c" links such a
+**       file (SYMBOL checkpoint_driver_table) and gives it to every state;
+**       with CHECKPOINT_TABLE_STATUS set in the environment it prints
+**       whether the baseline uses it. CHECKPOINT_BASELINE_SIZE prints what
+**       the baseline keeps, by part.
 **
 ** Exit status: 0 normal end or suspend, 1 uncaught exception, 2 usage / I/O,
 ** 3 the image could not be restored.
@@ -90,13 +98,31 @@ print_name(const char *name, int is_func, void *ud)
   puts(name);
 }
 
+static void
+write_text(const char *text, size_t len, void *ud)
+{
+  fwrite(text, 1, len, (FILE*)ud);
+}
+
+static void
+print_size(const char *part, size_t count, size_t bytes, void *ud)
+{
+  (void)ud;
+  fprintf(stderr, "checkpoint: baseline %-18s %6zu entries %8zu bytes\n", part, count, bytes);
+}
+
+#ifdef CHECKPOINT_DRIVER_TABLE
+#include CHECKPOINT_DRIVER_TABLE
+#endif
+
 static int
 usage(void)
 {
   fprintf(stderr,
           "usage: checkpoint run [--ignore] [--inproc] [--as-task] [--with-source] [--out FILE] prog.rb\n"
           "       checkpoint resume [--inproc] [--with-source] [--out FILE] [--without Class#method]... image\n"
-          "       checkpoint names\n");
+          "       checkpoint names\n"
+          "       checkpoint table SYMBOL\n");
   return 2;
 }
 
@@ -209,7 +235,18 @@ open_state(void)
   if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); exit(2); }
   mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
   remove_without(mrb);
+#ifdef CHECKPOINT_DRIVER_TABLE
+  mrb_checkpoint_set_table(mrb, &checkpoint_driver_table);
+#endif
   mrb_checkpoint_baseline(mrb);
+  if (getenv("CHECKPOINT_BASELINE_SIZE")) {
+    size_t total = mrb_checkpoint_baseline_size(mrb, print_size, NULL);
+    fprintf(stderr, "checkpoint: baseline %zu bytes\n", total);
+  }
+  if (getenv("CHECKPOINT_TABLE_STATUS")) {
+    const char *why = mrb_checkpoint_table_status(mrb);
+    fprintf(stderr, "checkpoint: table %s\n", why ? why : "used");
+  }
   mrb_checkpoint_set_allocator(mrb, work_realloc, NULL);
   mrb_checkpoint_set_embedder(mrb, emb_dump, emb_restore, NULL);
   if (with_source) mrb_checkpoint_set_include_source(mrb, TRUE);
@@ -305,6 +342,19 @@ main(int argc, char **argv)
 
   if (argc < 2) return usage();
   const char *cmd = argv[1];
+  if (strcmp(cmd, "table") == 0) {
+    if (argc != 3) return usage();
+    mrb_state *mrb = mrb_open();
+    if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); return 2; }
+    mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
+    mrb_checkpoint_prepare_table(mrb);
+    mrb_checkpoint_baseline(mrb);
+    char why[200];
+    int r = mrb_checkpoint_write_table(mrb, argv[2], write_text, stdout, why, sizeof(why));
+    if (r != 0) fprintf(stderr, "checkpoint: %s\n", why);
+    mrb_close(mrb);
+    return r == 0 ? 0 : 2;
+  }
   if (strcmp(cmd, "names") == 0) {
     if (argc != 2) return usage();
     mrb_state *mrb = open_state();

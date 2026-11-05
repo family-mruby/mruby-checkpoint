@@ -3,6 +3,7 @@
 #   tools/asan.sh          -> build/asan
 #   tools/asan.sh stress   -> build/asan-stress (also MRB_GC_STRESS)
 #   tools/asan.sh fuzz     -> build/asan-fuzz (the test build with checkpoint-fuzz)
+#   CHECKPOINT_TABLE=file.c tools/asan.sh [stress] -> build/asan[-stress]-tabled
 # All three run mruby-task on the virtual clock (mrbgems/hal-task-virtual): under
 # AddressSanitizer (and more so a full GC at every allocation) a program is so
 # slow that the POSIX timer ends timeslices where the normal build never does,
@@ -13,6 +14,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 name=asan; mode=asan; fuzz=
 if [ "$1" = stress ]; then name=asan-stress; mode=asan-stress; fi
 if [ "$1" = fuzz ]; then name=asan-fuzz; fuzz=1; fi
+# CHECKPOINT_TABLE=file.c (rake test:asan, test:stress): the driver links that
+# fixed table of its baseline, in build/<name>-tabled
+if [ -n "$CHECKPOINT_TABLE" ]; then name=$name-tabled; fi
 cd "$root/build/src/patched"
 # the POSIX timer left in the archive by a build from before the virtual clock
 lib="$root/build/$name/host/lib/libmruby.a"

@@ -54,6 +54,7 @@
 #include "task.h"
 
 extern void (*mrb_vm_safepoint_hook)(mrb_state *mrb);
+extern void (*mrb_gc_root_hook)(mrb_state *mrb);   /* patches/0004-gc-root-hook.patch */
 
 
 /* ---- per-state side table ----
@@ -161,6 +162,28 @@ mrb_checkpoint_baseline(mrb_state *mrb)
   checkpoint_bundled_register(mrb);
   checkpoint_task_register(mrb);
   g->perm = checkpoint_perm_build(mrb, g);
+}
+
+MRB_API void
+mrb_checkpoint_set_table(mrb_state *mrb, const mrb_checkpoint_table *table)
+{
+  checkpoint_state *g = checkpoint_need(mrb);
+  if (g) g->table = table;
+}
+
+MRB_API void
+mrb_checkpoint_prepare_table(mrb_state *mrb)
+{
+  checkpoint_state *g = checkpoint_need(mrb);
+  if (g) g->for_table = 1;
+}
+
+MRB_API const char*
+mrb_checkpoint_table_status(mrb_state *mrb)
+{
+  checkpoint_state *g = checkpoint_get(mrb);
+  if (!g || !g->perm) return "not used: no baseline";
+  return g->table_why[0] ? g->table_why : NULL;
 }
 
 MRB_API void
@@ -773,13 +796,28 @@ mrb_checkpoint_open(mrb_state *mrb)
 
 /* ---- gem ---- */
 
+/* the GC's root hook (patches/0004): the objects of a baseline kept as
+   addresses (with a table). Called in every state of the process, also
+   those that never use the gem: a lookup only, nothing is allocated. */
+static void
+checkpoint_gc_root(mrb_state *mrb)
+{
+  mrb_sym sym = mrb_intern_check(mrb, STATE_GV, sizeof(STATE_GV) - 1);
+  if (sym == 0) return;
+  mrb_value v = mrb_gv_get(mrb, sym);
+  if (!mrb_cptr_p(v)) return;
+  checkpoint_state *g = (checkpoint_state*)mrb_cptr(v);
+  if (g->perm) checkpoint_perm_mark(mrb, g->perm);
+}
+
 void
 mrb_mruby_checkpoint_gem_init(mrb_state *mrb)
 {
   (void)mrb;
-  /* the same function for every state; the state itself comes later
+  /* the same functions for every state; the state itself comes later
      (checkpoint_need) */
   mrb_vm_safepoint_hook = checkpoint_safepoint;
+  mrb_gc_root_hook = checkpoint_gc_root;
 }
 
 void

@@ -176,6 +176,7 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 | F3 | 窓のあるアプリ (画面つきのデモ) | 未着手 |
 | F4 | ビルドの違う端末の間 (sim ⇔ ネイティブ版、ブラウザ版 ⇔ ネイティブ版)。gem はプログラムのコードが呼ぶメソッドの名前をイメージに入れる (`SND0`、`doc/format_v1.md` §13)。読む側は足りない名前を埋め込む側に渡すだけで断らない (`mrb_checkpoint_missing_names`)。同じ一覧はイメージを書かずに取れる (`mrb_checkpoint_sent_names`、F5 の止める前の確認のため) | Family mruby の側で検収済 (2026-11-04、fmruby-core `doc/checkpoint/report/f4.md`) |
 | F5 | Asterism で分けて送り、受け取った側で起動する (ネットワーク越し) | 未着手 |
+| Ff | 基準の表をファームを作るときに作り、固定の表として渡す (`mrb_checkpoint_set_table`・`mrb_checkpoint_write_table`、`doc/format_v1.md` §8.1 と `TBL0`)。生かしておくオブジェクトはアドレスの配列にして GC の root の hook (`patches/0004`) で印を付ける | 実装済・検収待ち (fmruby-core `doc/checkpoint/report/ff.md`) |
 | F6 | 実機 (まず Tab5、その後 S3) | 未着手 |
 
 ## 決まったこと (2026-11-03、Family mruby への持ち込み。ユーザが選択肢から選んだ)

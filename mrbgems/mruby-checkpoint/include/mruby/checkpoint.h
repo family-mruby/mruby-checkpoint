@@ -61,6 +61,100 @@ MRB_API void mrb_checkpoint_baseline(mrb_state *mrb);
 typedef void (*mrb_checkpoint_name_fn)(const char *name, int is_func, void *ud);
 MRB_API void mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn, void *ud);
 
+/* ---- a fixed table of the baseline (doc/format_v1.md section 8) ----
+
+   What the baseline names and records depends only on the build: the names,
+   which of them are C functions, the methods and ivars each permanent class
+   had, the mrblib ireps' content hashes. A build can make that once, when
+   the firmware is built (mrb_checkpoint_write_table on a build of the same
+   gems), and link it in as constant data (flash on a microcontroller). A
+   state given the table keeps only what is its own: the address of each
+   name, the set of the objects alive at the baseline (kept from the GC
+   without an Array), and the values that are not names (an Integer constant,
+   a String's contents digest).
+
+   The baseline still walks the state as before and looks each name up in
+   the table. A name the table lacks, and a snapshot this state sees
+   otherwise (a cache a gem's mrblib fills at load from a file, a method
+   only this machine has), are kept by the state as without a table; a
+   table name the state lacks has no address. The names never bind to the
+   wrong object, whatever table is given; the table only saves memory where
+   it matches (mrb_checkpoint_table_status says how well). */
+
+#define MRB_CHECKPOINT_TABLE_VERSION 1   /* the layout below and the naming rules */
+
+typedef struct mrb_checkpoint_table_snap {
+  uint32_t name;      /* the object: index of its name */
+  uint32_t super;     /* class-likes: name index + 1 of its superclass (0: none) */
+  uint32_t mt, iv;    /* the first of its entries in mt[] / iv[] */
+  uint32_t slot;      /* String/Array/Hash/inline struct: the slot of its contents digest */
+  uint16_t nmt, niv;
+  uint8_t tt;         /* its mrb_vtype */
+  uint8_t cflags;     /* classes: 1 if prepended */
+} mrb_checkpoint_table_snap;
+
+typedef struct mrb_checkpoint_table_mt {
+  uint32_t sym;       /* the method name: offset into syms */
+  uint32_t flags;     /* mrb_method_t flags */
+  uint32_t ref;       /* name index + 1 of its Proc or C function (0: undefined) */
+} mrb_checkpoint_table_mt;
+
+#define MRB_CHECKPOINT_TABLE_SLOT 0x80000000u
+typedef struct mrb_checkpoint_table_iv {
+  uint32_t sym;       /* the ivar or constant name: offset into syms */
+  uint32_t ref;       /* name index + 1 of a named object, or
+                         MRB_CHECKPOINT_TABLE_SLOT | the slot holding the value */
+} mrb_checkpoint_table_iv;
+
+typedef struct mrb_checkpoint_table {
+  uint32_t version;                 /* MRB_CHECKPOINT_TABLE_VERSION */
+  uint64_t stamp;                   /* a digest of everything below */
+  uint32_t nnames;
+  const char *names;                /* every name, NUL after each, in the order given */
+  const uint32_t *name_off;         /* where name i starts; [nnames] is the end */
+  const uint8_t *is_func;           /* bit i: name i is a C function */
+  const uint32_t *by_name;          /* the name indices in name order (strcmp) */
+  uint32_t nsnaps;
+  const mrb_checkpoint_table_snap *snaps;   /* in the order taken */
+  uint32_t nmt;
+  const mrb_checkpoint_table_mt *mt;  /* each snapshot's in name order */
+  uint32_t niv;
+  const mrb_checkpoint_table_iv *iv;  /* each snapshot's in name order */
+  uint32_t nslots;                  /* the values a state keeps for itself */
+  const char *syms;                 /* method and ivar names, NUL after each */
+  uint32_t nireps;
+  const uint64_t *irep_hash;        /* the mrblib ireps' content hashes, in the order found */
+  uint32_t nmethods;
+  const uint32_t *methods;          /* every method name some class defines (offsets into
+                                       syms), in name order: mrb_checkpoint_has_method */
+} mrb_checkpoint_table;
+
+/* Use the table for this state's baseline. Call before mrb_checkpoint_baseline;
+   the table must stay as long as the state. NULL: none (the default). */
+MRB_API void mrb_checkpoint_set_table(mrb_state *mrb, const mrb_checkpoint_table *table);
+/* NULL when the baseline uses the table given and this state is the table's
+   exactly; otherwise "used with differences (...); first: ..." or
+   "not used: ..." (no table, another version). After mrb_checkpoint_baseline. */
+MRB_API const char *mrb_checkpoint_table_status(mrb_state *mrb);
+
+/* Write this state's baseline as a table: C source that defines
+   `const mrb_checkpoint_table <symbol>`, given to fn piece by piece. The
+   baseline must have been taken the way a state with a table takes it:
+   call mrb_checkpoint_prepare_table before mrb_checkpoint_baseline (it only
+   changes how the objects of the baseline are kept from the GC, which is
+   itself part of what the walk finds). Returns 0, or -1 with a reason in
+   why. */
+typedef void (*mrb_checkpoint_text_fn)(const char *text, size_t len, void *ud);
+MRB_API void mrb_checkpoint_prepare_table(mrb_state *mrb);
+MRB_API int mrb_checkpoint_write_table(mrb_state *mrb, const char *symbol, mrb_checkpoint_text_fn fn,
+                                       void *ud, char *why, size_t whylen);
+
+/* What the baseline keeps in this state, by part (for measuring): fn is
+   called once per part with its name, the number of entries and the bytes
+   asked of the allocator. Returns the total. */
+typedef void (*mrb_checkpoint_size_fn)(const char *part, size_t count, size_t bytes, void *ud);
+MRB_API size_t mrb_checkpoint_baseline_size(mrb_state *mrb, mrb_checkpoint_size_fn fn, void *ud);
+
 /* Name a C function the program's C code makes Procs or methods of at run
    time (mrb_proc_new_cfunc_with_env and the like): an image can then refer
    to it by "F:<name>". Call before mrb_checkpoint_baseline, the same on

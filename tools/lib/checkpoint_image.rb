@@ -770,6 +770,10 @@ module CheckpointImage
             # the method names the program's code calls (F4): symbols
             n = r.u32
             { 'tag' => 'SND0', 'offset' => at, 'names' => Array.new(n) { |i| r.where = "sections > SND0 > #{i + 1}"; sym } }
+          when 'TBL0'
+            # the rules the permanent names follow and the digest of the
+            # writer's baseline (Ff, a fixed table of the baseline)
+            { 'tag' => 'TBL0', 'offset' => at, 'table_version' => r.u32, 'stamp' => format('%016x', r.u64) }
           when 'GCS0'
             fl = r.u8
             {

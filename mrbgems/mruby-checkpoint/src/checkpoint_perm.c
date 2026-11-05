@@ -23,6 +23,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
 #include <mruby/array.h>
@@ -325,7 +326,42 @@ typedef struct {
   gsnap *snaps; uint32_t nsnaps, capsnaps;
   gsnap_mt *mt; uint32_t nmt, capmt;
   giv_entry *iv; uint32_t niv, capiv;
+  /* with a table (mrb_checkpoint_set_table): each name the walk gives is
+     looked up in T, and only the state's own part is kept (in P): the
+     address of a table name, and the names and snapshots T does not have
+     as they would be kept without a table (blob/off/isf and snaps/mt/iv
+     above). The first difference is noted in why, for the status. */
+  const mrb_checkpoint_table *T;
+  checkpoint_perm *P;
+  int failed;
+  char why[200];
+  uint32_t *name2snap;                  /* T name -> its snapshot + 1 */
+  struct RBasic **xobj; uint32_t nxobj, capxobj;   /* snapshots of the state's own */
+  uint32_t ndiff;                       /* table snapshots this state sees otherwise */
 } pbuild;
+
+static void
+mismatch(pbuild *B, const char *fmt, ...)
+{
+  if (B->failed) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(B->why, sizeof(B->why), fmt, ap);
+  va_end(ap);
+  B->failed = 1;
+}
+
+static const char*
+tname(const mrb_checkpoint_table *T, uint32_t i)
+{
+  return T->names + T->name_off[i];
+}
+
+static int
+tbit(const uint8_t *bits, uint32_t i)
+{
+  return (bits[i / 8] >> (i % 8)) & 1;
+}
 
 /* room for `need` elements of `size` bytes in a table that grows */
 static void*
@@ -342,6 +378,52 @@ grow(pbuild *B, void *p, uint32_t *cap, uint32_t need, size_t size, uint32_t fir
 static void
 add_name(pbuild *B, const char *name, const void *ptr, int is_func)
 {
+  if (B->T) {
+    /* a table name: its address; a name of the state's own: kept as below,
+       numbered after the table's */
+    const mrb_checkpoint_table *T = B->T;
+    uint32_t lo = 0, hi = T->nnames;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      int r = strcmp(name, tname(T, T->by_name[mid]));
+      if (r == 0) { lo = mid; break; }
+      if (r > 0) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < hi) {
+      uint32_t t = T->by_name[lo];
+      if (tbit(T->is_func, t) == is_func && !B->P->ptrs[t]) {
+        B->P->ptrs[t] = ptr;
+        pm_put(B->mrb, is_func ? &B->func2name : &B->obj2name, ptr, t + 1);
+        return;
+      }
+    }
+    mismatch(B, "%s%s is not in the table", is_func ? "C function " : "", name);
+    uint32_t idx = T->nnames + B->n;   /* (B->n counts the state's own here) */
+    pm_put(B->mrb, is_func ? &B->func2name : &B->obj2name, ptr, idx + 1);
+    /* kept as without a table (finish_table moves them after the table's) */
+    uint32_t len = (uint32_t)strlen(name) + 1;
+    if (B->blen + len > B->bcap) {
+      uint32_t c = B->bcap ? B->bcap : 1024;
+      while (c < B->blen + len) c *= 2;
+      B->blob = (char*)mrb_realloc(B->mrb, B->blob, c);
+      B->bcap = c;
+    }
+    if (B->n == B->cap) {
+      uint32_t c = B->cap ? B->cap * 2 : 32;
+      B->off = (uint32_t*)mrb_realloc(B->mrb, B->off, sizeof(uint32_t) * c);
+      B->ptrs = (const void**)mrb_realloc(B->mrb, B->ptrs, sizeof(void*) * c);
+      B->isf = (uint8_t*)mrb_realloc(B->mrb, B->isf, c);
+      B->cap = c;
+    }
+    memcpy(B->blob + B->blen, name, len);
+    B->off[B->n] = B->blen;
+    B->blen += len;
+    B->ptrs[B->n] = ptr;
+    B->isf[B->n] = (uint8_t)is_func;
+    B->n++;
+    return;
+  }
   uint32_t len = (uint32_t)strlen(name) + 1;
   if (B->blen + len > B->bcap) {
     uint32_t c = B->bcap ? B->bcap : 16384;
@@ -417,6 +499,39 @@ add_irep(pbuild *B, const mrb_irep *irep)
   for (int i = 0; irep->reps && i < irep->rlen; i++) add_irep(B, irep->reps[i]);
 }
 
+/* with a table: the snapshot of a table name is the table's (compared at
+   the end, in reconcile_snaps, when every name has its address; a
+   String's (Array's, ...) contents digest is the state's own value, kept in
+   its slot); one of a name of the state's own is made at the end too. */
+static void
+tsnap(pbuild *B, struct RBasic *o)
+{
+  const mrb_checkpoint_table *T = B->T;
+  uint32_t idx = 0;
+  pm_get(&B->obj2name, o, &idx);
+  uint32_t k1 = (idx >= 1 && idx <= T->nnames) ? B->name2snap[idx - 1] : 0;
+  if (k1 == 0) {
+    if (B->nxobj == B->capxobj) {
+      B->capxobj = B->capxobj ? B->capxobj * 2 : 16;
+      B->xobj = (struct RBasic**)mrb_realloc(B->mrb, B->xobj, sizeof(void*) * B->capxobj);
+    }
+    B->xobj[B->nxobj++] = o;
+    return;
+  }
+  const mrb_checkpoint_table_snap *ts = &T->snaps[k1 - 1];
+  if (ts->tt != (uint8_t)o->tt) return;   /* (reconcile_snaps keeps its own) */
+  switch (o->tt) {
+  case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_HASH:
+    if (ts->slot < T->nslots) {
+      B->P->slotv[ts->slot] = checkpoint_content_digest(B->mrb, o);
+      B->P->slott[ts->slot] = 0;
+    }
+    break;
+  default:
+    break;
+  }
+}
+
 static void snap_object(pbuild *B, struct RBasic *o);
 static void visit_class(pbuild *B, struct RClass *c, const char *path);
 
@@ -441,6 +556,17 @@ static void
 snap_object(pbuild *B, struct RBasic *o)
 {
   uint32_t s;
+  if (B->T) {
+    switch (o->tt) {
+    case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
+    case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_HASH:
+      tsnap(B, o);
+      break;
+    default:
+      break;
+    }
+    return;
+  }
   switch (o->tt) {
   case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
     s = new_snap(B, o);
@@ -476,13 +602,21 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
   if (named_obj(B, c)) return;
   add_name(B, path, c, 0);
 
-  uint32_t sidx = new_snap(B, (struct RBasic*)c);
-  B->snaps[sidx].u.super = c->super;
-  B->snaps[sidx].cflags = (c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0;
+  uint32_t sidx = 0;
+  giv_entry *civ = NULL; int nciv = 0;   /* (with a table) its ivars, for the walk below */
+  if (B->T) {
+    tsnap(B, (struct RBasic*)c);
+    checkpoint_collect_iv(mrb, mrb_obj_value(c), &civ, &nciv);
+  }
+  else {
+    sidx = new_snap(B, (struct RBasic*)c);
+    B->snaps[sidx].u.super = c->super;
+    B->snaps[sidx].cflags = (c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0;
+  }
   gmt_entry *mt0; int nmt;
   checkpoint_collect_mt(mrb, c, &mt0, &nmt);
   snap_count(B, (uint32_t)nmt, "methods");
-  snap_iv(B, sidx, (struct RBasic*)c);
+  if (!B->T) snap_iv(B, sidx, (struct RBasic*)c);
 
   /* methods, in name order */
   if (nmt > 0) {
@@ -522,9 +656,12 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
   }
   /* the snapshot of the methods, in the table's own order, each referring
      to its Proc or C function by name (every one has a name by now) */
+  if (B->T) nmt = 0;   /* compared with the table's at the end */
   B->mt = (gsnap_mt*)grow(B, B->mt, &B->capmt, B->nmt + (uint32_t)nmt, sizeof(gsnap_mt), 1024);
-  B->snaps[sidx].mt = B->nmt;
-  B->snaps[sidx].nmt = (uint16_t)nmt;
+  if (!B->T) {
+    B->snaps[sidx].mt = B->nmt;
+    B->snaps[sidx].nmt = (uint16_t)nmt;
+  }
   for (int i = 0; i < nmt; i++) {
     gsnap_mt *e = &B->mt[B->nmt++];
     uint32_t ref = 0;
@@ -543,6 +680,10 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
     if (named_obj(B, ic)) continue;
     snprintf(buf, sizeof(buf), "I:%s/%d", path, k);
     add_name(B, buf, ic, 0);
+    if (B->T) {
+      tsnap(B, (struct RBasic*)ic);
+      continue;
+    }
     uint32_t is = new_snap(B, (struct RBasic*)ic);
     B->snaps[is].u.super = ic->super;
   }
@@ -568,10 +709,10 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
   }
 
   /* ivars and constants, in name order */
-  int niv = B->snaps[sidx].niv;
+  int niv = B->T ? nciv : B->snaps[sidx].niv;
   if (niv > 0) {
     giv_entry *iv = (giv_entry*)mrb_malloc(B->mrb, sizeof(giv_entry) * niv);
-    memcpy(iv, B->iv + B->snaps[sidx].iv, sizeof(giv_entry) * niv);
+    memcpy(iv, B->T ? civ : B->iv + B->snaps[sidx].iv, sizeof(giv_entry) * niv);
     sort_by_name(mrb, iv, niv, sizeof(giv_entry), cmp_iv);
     /* plain values first, so a class reached by two constants is named
        by the first one in a stable order */
@@ -598,6 +739,7 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
     }
     mrb_free(B->mrb, iv);
   }
+  if (civ) checkpoint_collect_free(mrb, civ);
 }
 
 /* ---- the flat tables that stay ---- */
@@ -793,31 +935,359 @@ heap_cb(mrb_state *mrb, struct RBasic *obj, void *data)
   return MRB_EACH_OBJ_OK;
 }
 
+/* ---- a value in a slot (with a table: what is the state's own) ---- */
+
+static void
+slot_put(checkpoint_perm *P, uint32_t slot, mrb_value v)
+{
+  uint64_t bits = 0;
+  enum mrb_vtype t = mrb_type(v);
+  switch (t) {
+  case MRB_TT_FALSE: bits = mrb_nil_p(v) ? 0 : 1; break;
+  case MRB_TT_TRUE: bits = 1; break;
+  case MRB_TT_INTEGER: bits = (uint64_t)mrb_integer(v); break;
+  case MRB_TT_FLOAT: { double d = (double)mrb_float(v); memcpy(&bits, &d, 8); break; }
+  case MRB_TT_SYMBOL: bits = (uint64_t)mrb_symbol(v); break;
+  case MRB_TT_UNDEF: break;
+  case MRB_TT_CPTR: bits = (uint64_t)(uintptr_t)mrb_cptr(v); break;
+  default: bits = (uint64_t)(uintptr_t)mrb_ptr(v); break;
+  }
+  P->slotv[slot] = bits;
+  P->slott[slot] = (uint8_t)t;
+}
+
+static mrb_value
+slot_get(mrb_state *mrb, checkpoint_perm *P, uint32_t slot)
+{
+  uint64_t bits = P->slotv[slot];
+  switch ((enum mrb_vtype)P->slott[slot]) {
+  case MRB_TT_FALSE: return bits ? mrb_false_value() : mrb_nil_value();
+  case MRB_TT_TRUE: return mrb_true_value();
+  case MRB_TT_INTEGER: return mrb_int_value(mrb, (mrb_int)bits);
+  case MRB_TT_FLOAT: { double d; memcpy(&d, &bits, 8); return mrb_float_value(mrb, (mrb_float)d); }
+  case MRB_TT_SYMBOL: return mrb_symbol_value((mrb_sym)bits);
+  case MRB_TT_UNDEF: return mrb_undef_value();
+  case MRB_TT_CPTR: return mrb_cptr_value(mrb, (void*)(uintptr_t)bits);
+  default: return mrb_obj_value((void*)(uintptr_t)bits);
+  }
+}
+
+/* (name, len) against the table's string s: <0, 0, >0 */
+static int
+cmp_name(const char *name, size_t len, const char *s)
+{
+  size_t sl = strlen(s);
+  int r = memcmp(name, s, len < sl ? len : sl);
+  if (r) return r;
+  return len < sl ? -1 : len > sl ? 1 : 0;
+}
+
+static int
+same_sym_name(mrb_state *mrb, mrb_sym sym, const char *s)
+{
+  mrb_int len;
+  const char *n = mrb_sym_name_len(mrb, sym, &len);
+  return n && cmp_name(n, (size_t)len, s) == 0;
+}
+
+/* with a table: whether this state sees table snapshot k (of o) as the
+   table has it -- methods, ivars, superclass, marker. The ivars that are not
+   names go to their slots on the way. */
+static int
+snap_matches(pbuild *B, uint32_t k, struct RBasic *o)
+{
+  mrb_state *mrb = B->mrb;
+  const mrb_checkpoint_table *T = B->T;
+  checkpoint_perm *P = B->P;
+  const mrb_checkpoint_table_snap *ts = &T->snaps[k];
+  const char *oname = tname(T, ts->name);
+  int ok = 1;
+  if (ts->tt != (uint8_t)o->tt) {
+    mismatch(B, "%s is of another type than in the table", oname);
+    return 0;
+  }
+  int cls = o->tt == MRB_TT_CLASS || o->tt == MRB_TT_MODULE || o->tt == MRB_TT_SCLASS;
+  if (cls || o->tt == MRB_TT_ICLASS) {
+    struct RClass *c = (struct RClass*)o;
+    const void *want = (ts->super && ts->super <= T->nnames) ? P->ptrs[ts->super - 1] : NULL;
+    if ((const void*)c->super != want) { mismatch(B, "%s has another superclass than in the table", oname); return 0; }
+  }
+  if (cls) {
+    struct RClass *c = (struct RClass*)o;
+    if (((c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0) != ts->cflags) {
+      mismatch(B, "%s: prepended here, not in the table (or the other way)", oname);
+      return 0;
+    }
+    gmt_entry *mt; int n;
+    checkpoint_collect_mt(mrb, c, &mt, &n);
+    sort_by_name(mrb, mt, (size_t)n, sizeof(gmt_entry), cmp_mt);
+    if ((uint32_t)n != ts->nmt) {
+      mismatch(B, "%s has %d methods here, %u in the table", oname, n, (unsigned)ts->nmt);
+      ok = 0;
+    }
+    for (int i = 0; ok && i < n; i++) {
+      const mrb_checkpoint_table_mt *e = &T->mt[ts->mt + i];
+      const void *want = (e->ref == 0 || e->ref > T->nnames) ? NULL : P->ptrs[e->ref - 1];
+      if (!same_sym_name(mrb, mt[i].sym, T->syms + e->sym) || mt[i].flags != e->flags || mt[i].ptr != want) {
+        mismatch(B, "%s#%s is not the method of the table", oname, mrb_sym_name(mrb, mt[i].sym));
+        ok = 0;
+      }
+    }
+    checkpoint_collect_free(mrb, mt);
+    if (!ok) return 0;
+  }
+  switch (o->tt) {
+  case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS:
+  case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: case MRB_TT_HASH: {
+    giv_entry *iv; int n;
+    checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
+    sort_by_name(mrb, iv, (size_t)n, sizeof(giv_entry), cmp_iv);
+    if ((uint32_t)n != ts->niv) {
+      mismatch(B, "%s has %d ivars here, %u in the table", oname, n, (unsigned)ts->niv);
+      ok = 0;
+    }
+    for (int i = 0; ok && i < n; i++) {
+      const mrb_checkpoint_table_iv *e = &T->iv[ts->iv + i];
+      if (!same_sym_name(mrb, iv[i].sym, T->syms + e->sym)) {
+        mismatch(B, "%s: ivar %s is not in the table", oname, mrb_sym_name(mrb, iv[i].sym));
+        ok = 0;
+      }
+      else if (e->ref & MRB_CHECKPOINT_TABLE_SLOT) {
+        uint32_t slot = e->ref & ~MRB_CHECKPOINT_TABLE_SLOT;
+        if (slot < T->nslots) slot_put(P, slot, iv[i].val);
+        else ok = 0;
+      }
+      else if (e->ref == 0 || e->ref > T->nnames || mrb_immediate_p(iv[i].val) ||
+               mrb_ptr(iv[i].val) != P->ptrs[e->ref - 1]) {
+        mismatch(B, "%s: %s holds another object than in the table", oname, mrb_sym_name(mrb, iv[i].sym));
+        ok = 0;
+      }
+    }
+    checkpoint_collect_free(mrb, iv);
+    return ok;
+  }
+  default:
+    return ts->nmt == 0 && ts->niv == 0;
+  }
+}
+
+/* a snapshot of o as without a table (in B->snaps, B->mt, B->iv): one the
+   table does not have, or one this state sees otherwise */
+static uint32_t
+own_snap(pbuild *B, struct RBasic *o)
+{
+  mrb_state *mrb = B->mrb;
+  uint32_t s = new_snap(B, o);
+  switch (o->tt) {
+  case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS: {
+    struct RClass *c = (struct RClass*)o;
+    B->snaps[s].u.super = c->super;
+    B->snaps[s].cflags = (c->flags & MRB_FL_CLASS_IS_PREPENDED) ? 1 : 0;
+    gmt_entry *mt; int n;
+    checkpoint_collect_mt(mrb, c, &mt, &n);
+    snap_count(B, (uint32_t)n, "methods");
+    B->mt = (gsnap_mt*)grow(B, B->mt, &B->capmt, B->nmt + (uint32_t)n, sizeof(gsnap_mt), 64);
+    B->snaps[s].mt = B->nmt;
+    B->snaps[s].nmt = (uint16_t)n;
+    for (int i = 0; i < n; i++) {
+      gsnap_mt *e = &B->mt[B->nmt++];
+      uint32_t ref = 0;
+      if (mt[i].ptr) pm_get((mt[i].flags & MRB_METHOD_FUNC_FL) ? &B->func2name : &B->obj2name, mt[i].ptr, &ref);
+      e->sym = mt[i].sym;
+      e->flags = mt[i].flags;
+      e->ref = ref;
+    }
+    checkpoint_collect_free(mrb, mt);
+    snap_iv(B, s, o);
+    break;
+  }
+  case MRB_TT_ICLASS:
+    B->snaps[s].u.super = ((struct RClass*)o)->super;
+    break;
+  case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
+    snap_iv(B, s, o);
+    break;
+  case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT:
+    B->snaps[s].u.digest = checkpoint_content_digest(mrb, o);
+    break;
+  case MRB_TT_HASH:
+    B->snaps[s].u.digest = checkpoint_content_digest(mrb, o);
+    snap_iv(B, s, o);
+    break;
+  default:
+    break;
+  }
+  return s;
+}
+
+/* with a table: the snapshots as the table has them, those this state sees
+   otherwise and those of its own names */
+static void
+reconcile_snaps(pbuild *B)
+{
+  const mrb_checkpoint_table *T = B->T;
+  checkpoint_perm *P = B->P;
+  for (uint32_t k = 0; k < T->nsnaps; k++) {
+    struct RBasic *o = (struct RBasic*)P->ptrs[T->snaps[k].name];
+    if (!o || snap_matches(B, k, o)) continue;   /* (absent: the name is missing) */
+    if (!P->snap_over) P->snap_over = (uint32_t*)mrb_calloc(B->mrb, T->nsnaps, sizeof(uint32_t));
+    P->snap_over[k] = own_snap(B, o) + 1;
+    B->ndiff++;
+  }
+  if (B->nxobj > 0) {
+    P->xsnap = (uint32_t*)mrb_malloc(B->mrb, sizeof(uint32_t) * B->nxobj);
+    for (uint32_t i = 0; i < B->nxobj; i++) P->xsnap[i] = own_snap(B, B->xobj[i]);
+    P->nxsnap = B->nxobj;
+  }
+}
+
+static const char *name_str(checkpoint_perm *P, uint32_t i);
+static int name_is_func(checkpoint_perm *P, uint32_t i);
+
+/* the names of objects / of C functions, sorted by address (with a table:
+   the table's that this state has, then its own) */
+static uint32_t*
+table_sorted_index(mrb_state *mrb, checkpoint_perm *P, int funcs, uint32_t *count)
+{
+  uint32_t total = P->T->nnames + P->nx;
+  uint32_t m = 0;
+  for (uint32_t i = 0; i < total; i++) if (P->ptrs[i] && name_is_func(P, i) == funcs) m++;
+  *count = m;
+  if (m == 0) return NULL;
+  keyed *k = (keyed*)mrb_malloc(mrb, sizeof(keyed) * m);
+  m = 0;
+  for (uint32_t i = 0; i < total; i++) {
+    if (!P->ptrs[i] || name_is_func(P, i) != funcs) continue;
+    k[m].key = (uintptr_t)P->ptrs[i];
+    k[m].idx = i;
+    m++;
+  }
+  qsort(k, m, sizeof(keyed), cmp_keyed);
+  uint32_t *idx = (uint32_t*)mrb_malloc(mrb, sizeof(uint32_t) * m);
+  for (uint32_t i = 0; i < m; i++) idx[i] = k[i].idx;
+  mrb_free(mrb, k);
+  return idx;
+}
+
+static void
+finish_table(pbuild *B, checkpoint_perm *P)
+{
+  mrb_state *mrb = B->mrb;
+  const mrb_checkpoint_table *T = B->T;
+  P->T = T;
+  /* the names of the state's own, after the table's */
+  P->nx = B->n;
+  P->n = T->nnames + B->n;
+  P->ptrs = (const void**)mrb_realloc(mrb, (void*)P->ptrs, sizeof(void*) * (P->n ? P->n : 1));
+  for (uint32_t i = 0; i < B->n; i++) P->ptrs[T->nnames + i] = B->ptrs[i];
+  for (uint32_t i = 0; i < T->nnames; i++) if (!P->ptrs[i]) P->nmissing++;
+  if (B->n > 0) {
+    P->names = (char*)shrink(mrb, B->blob, B->blen);
+    P->name_off = (uint32_t*)mrb_realloc(mrb, B->off, sizeof(uint32_t) * (B->n + 1));
+    P->name_off[B->n] = B->blen;
+    P->is_func = (uint8_t*)mrb_calloc(mrb, (B->n + 7) / 8 + 1, 1);
+    for (uint32_t i = 0; i < B->n; i++) if (B->isf[i]) P->is_func[i / 8] |= (uint8_t)(1 << (i % 8));
+  }
+  else {
+    mrb_free(mrb, B->blob); mrb_free(mrb, B->off);
+  }
+  mrb_free(mrb, (void*)B->ptrs); mrb_free(mrb, B->isf);
+  B->blob = NULL; B->off = NULL; B->ptrs = NULL; B->isf = NULL;
+  /* the snapshots of the state's own */
+  P->nsnaps = T->nsnaps + P->nxsnap;
+  P->snaps = (gsnap*)shrink(mrb, B->snaps, sizeof(gsnap) * B->nsnaps);
+  P->mt = (gsnap_mt*)shrink(mrb, B->mt, sizeof(gsnap_mt) * B->nmt);
+  P->nmt = B->nmt;
+  P->iv = (giv_entry*)shrink(mrb, B->iv, sizeof(giv_entry) * B->niv);
+  P->niv = B->niv;
+  B->snaps = NULL; B->mt = NULL; B->iv = NULL;
+  /* the mrblib ireps: the table's hashes when they are the same code in the
+     same order, the state's own (as without a table) otherwise */
+  int same = B->nireps == T->nireps;
+  for (uint32_t i = 0; same && i < T->nireps; i++) same = B->ireps[i].hash == T->irep_hash[i];
+  P->nireps = B->nireps;
+  if (same) {
+    P->irepp = (const mrb_irep**)mrb_malloc(mrb, sizeof(void*) * (B->nireps ? B->nireps : 1));
+    for (uint32_t i = 0; i < B->nireps; i++) P->irepp[i] = B->ireps[i].irep;
+    mrb_free(mrb, B->ireps);
+  }
+  else {
+    mismatch(B, "the mrblib ireps differ from the table's (%u here, %u there)", (unsigned)B->nireps,
+             (unsigned)T->nireps);
+    P->ireps = (girep_perm*)shrink(mrb, B->ireps, sizeof(girep_perm) * B->nireps);
+  }
+  B->ireps = NULL;
+  pm_free(mrb, &B->obj2name); pm_free(mrb, &B->func2name); pm_free(mrb, &B->irep2idx);
+  P->obj_idx = table_sorted_index(mrb, P, 0, &P->nobj);
+  P->func_idx = table_sorted_index(mrb, P, 1, &P->nfunc);
+  if (P->nireps > 0) {
+    keyed *k = (keyed*)mrb_malloc(mrb, sizeof(keyed) * P->nireps);
+    for (uint32_t i = 0; i < P->nireps; i++) {
+      k[i].key = (uintptr_t)(P->irepp ? P->irepp[i] : P->ireps[i].irep);
+      k[i].idx = i;
+    }
+    qsort(k, P->nireps, sizeof(keyed), cmp_keyed);
+    P->irep_idx = (uint32_t*)mrb_malloc(mrb, sizeof(uint32_t) * P->nireps);
+    for (uint32_t i = 0; i < P->nireps; i++) P->irep_idx[i] = k[i].idx;
+    mrb_free(mrb, k);
+  }
+  /* the stamp is the table's only when this state has the table's names
+     and snapshots exactly */
+  if (!B->failed) {
+    P->stamp = T->stamp;
+    P->stamp_set = 1;
+  }
+  mrb_free(mrb, B->name2snap);
+  mrb_free(mrb, B->xobj);
+}
+
+static void perm_free_parts(mrb_state *mrb, checkpoint_perm *P);
+
 static checkpoint_perm*
 build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
 {
   char buf[512];
   checkpoint_perm *P = (checkpoint_perm*)mrb_calloc(mrb, 1, sizeof(checkpoint_perm));
+  const mrb_checkpoint_table *T = B->T;
+  B->P = P;
+  if (T) {
+    P->ptrs = (const void**)mrb_calloc(mrb, T->nnames ? T->nnames : 1, sizeof(void*));
+    B->name2snap = (uint32_t*)mrb_calloc(mrb, T->nnames ? T->nnames : 1, sizeof(uint32_t));
+    for (uint32_t k = 0; k < T->nsnaps; k++) {
+      if (T->snaps[k].name < T->nnames) B->name2snap[T->snaps[k].name] = k + 1;
+    }
+    P->slotv = (uint64_t*)mrb_calloc(mrb, T->nslots ? T->nslots : 1, sizeof(uint64_t));
+    P->slott = (uint8_t*)mrb_calloc(mrb, T->nslots ? T->nslots : 1, 1);
+  }
 
   /* every heap object alive now is permanent, named or not. None of them
      may be freed later (the program can drop the last reference, e.g.
-     remove_const, and a new object would then take the slot and the name):
-     a hidden Array keeps them all alive, in an ivar of Checkpoint whose
-     name Ruby code cannot spell. Its elements are sorted by address, so
-     the same Array is the set of these objects (checkpoint_perm_heap_p). */
+     remove_const, and a new object would then take the slot and the name).
+     Without a table, a hidden Array keeps them all alive, in an ivar of
+     Checkpoint whose name Ruby code cannot spell; its elements are sorted
+     by address, so the same Array is the set of these objects
+     (checkpoint_perm_heap_p). With a table (and for writing one) the set is
+     an array of addresses, 4 bytes each on a 32-bit machine instead of a
+     value each, and the GC's root hook marks them (checkpoint_perm_mark). */
   {
     heap_acc h = { B, NULL, 0, 0 };
     mrb_objspace_each_objects(mrb, heap_cb, &h);
     if (h.n > 1) qsort(h.a, h.n, sizeof(uintptr_t), cmp_uintptr);
-    int ai = mrb_gc_arena_save(mrb);
-    mrb_value keep = mrb_ary_new_capa(mrb, (mrb_int)h.n);
-    for (uint32_t i = 0; i < h.n; i++) mrb_ary_push(mrb, keep, mrb_obj_value((void*)h.a[i]));
-    mrb_free(mrb, h.a);
-    mrb_obj_ptr(keep)->c = NULL;   /* hidden from ObjectSpace, like the GC roots */
-    P->keep = mrb_ary_ptr(keep);
-    struct RClass *ck = mrb_module_get(mrb, "Checkpoint");
-    mrb_obj_iv_set(mrb, (struct RObject*)ck, mrb_intern_lit(mrb, "__checkpoint_keep__"), keep);
-    mrb_gc_arena_restore(mrb, ai);
+    if (T || g->for_table) {
+      P->keepp = (uintptr_t*)shrink(mrb, h.a, sizeof(uintptr_t) * h.n);
+      P->nkeep = h.n;
+    }
+    else {
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_value keep = mrb_ary_new_capa(mrb, (mrb_int)h.n);
+      for (uint32_t i = 0; i < h.n; i++) mrb_ary_push(mrb, keep, mrb_obj_value((void*)h.a[i]));
+      mrb_free(mrb, h.a);
+      mrb_obj_ptr(keep)->c = NULL;   /* hidden from ObjectSpace, like the GC roots */
+      P->keep = mrb_ary_ptr(keep);
+      struct RClass *ck = mrb_module_get(mrb, "Checkpoint");
+      mrb_obj_iv_set(mrb, (struct RObject*)ck, mrb_intern_lit(mrb, "__checkpoint_keep__"), keep);
+      mrb_gc_arena_restore(mrb, ai);
+    }
   }
 
   /* C functions the core puts in closures */
@@ -872,6 +1342,26 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
   }
 
   checkpoint_gc_settings(mrb, &P->gc);
+  if (T) {
+    reconcile_snaps(B);
+    finish_table(B, P);
+    for (uint32_t i = 0; i < T->nnames && !B->failed; i++) {
+      if (!P->ptrs[i]) mismatch(B, "%s of the table is not in this build", tname(T, i));
+    }
+    if (B->failed) {
+      snprintf(g->table_why, sizeof(g->table_why),
+               "used with differences (%u names of its own, %u missing, %u snapshots seen otherwise); first: %s",
+               (unsigned)P->nx, (unsigned)P->nmissing, (unsigned)B->ndiff, B->why);
+      uint64_t h = fnv_u64(T->stamp, P->nx);
+      h = fnv_u64(h, P->nmissing);
+      P->stamp = fnv_u64(h, B->ndiff);
+      P->stamp_set = 1;
+    }
+    else {
+      g->table_why[0] = 0;
+    }
+    return P;
+  }
   finish_perm(B, P);
   return P;
 }
@@ -892,22 +1382,50 @@ checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g)
   }
   pbuild B;
   memset(&B, 0, sizeof(B));
+  if (g->table) {
+    if (g->table->version != MRB_CHECKPOINT_TABLE_VERSION) {
+      snprintf(g->table_why, sizeof(g->table_why), "not used: the table is of version %u, this gem reads %u",
+               (unsigned)g->table->version, (unsigned)MRB_CHECKPOINT_TABLE_VERSION);
+    }
+    else {
+      B.T = g->table;
+    }
+  }
+  else {
+    snprintf(g->table_why, sizeof(g->table_why), "not used: no table");
+  }
   B.mrb = mrb;
   pm_init(&B.obj2name); pm_init(&B.func2name); pm_init(&B.irep2idx);
   return build_perm(mrb, g, &B);
+}
+
+static void
+perm_free_parts(mrb_state *mrb, checkpoint_perm *P)
+{
+  mrb_free(mrb, P->names); mrb_free(mrb, P->name_off);
+  mrb_free(mrb, (void*)P->ptrs); mrb_free(mrb, P->is_func);
+  mrb_free(mrb, P->obj_idx); mrb_free(mrb, P->func_idx);
+  mrb_free(mrb, P->ireps); mrb_free(mrb, P->irep_idx);
+  mrb_free(mrb, P->snaps); mrb_free(mrb, P->mt); mrb_free(mrb, P->iv);
+  mrb_free(mrb, P->gv);
+  mrb_free(mrb, P->keepp);
+  mrb_free(mrb, (void*)P->irepp); mrb_free(mrb, P->slotv); mrb_free(mrb, P->slott);
+  mrb_free(mrb, P->snap_over); mrb_free(mrb, P->xsnap);
 }
 
 void
 checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P)
 {
   if (!P) return;
-  mrb_free(mrb, P->names); mrb_free(mrb, P->name_off);
-  mrb_free(mrb, P->ptrs); mrb_free(mrb, P->is_func);
-  mrb_free(mrb, P->obj_idx); mrb_free(mrb, P->func_idx);
-  mrb_free(mrb, P->ireps); mrb_free(mrb, P->irep_idx);
-  mrb_free(mrb, P->snaps); mrb_free(mrb, P->mt); mrb_free(mrb, P->iv);
-  mrb_free(mrb, P->gv);
+  perm_free_parts(mrb, P);
   mrb_free(mrb, P);
+}
+
+void
+checkpoint_perm_mark(mrb_state *mrb, checkpoint_perm *P)
+{
+  if (!P || !P->keepp) return;
+  for (uint32_t i = 0; i < P->nkeep; i++) mrb_gc_mark(mrb, (struct RBasic*)P->keepp[i]);
 }
 
 /* ---- looking things up ---- */
@@ -927,12 +1445,28 @@ idx_find(const uint32_t *idx, uint32_t n, const void *const *keys, uintptr_t k)
   return -1;
 }
 
+static const char*
+name_str(checkpoint_perm *P, uint32_t i)
+{
+  if (P->T && i < P->T->nnames) return tname(P->T, i);
+  if (P->T) i -= P->T->nnames;
+  return P->names + P->name_off[i];
+}
+
+static int
+name_is_func(checkpoint_perm *P, uint32_t i)
+{
+  if (P->T && i < P->T->nnames) return tbit(P->T->is_func, i);
+  if (P->T) i -= P->T->nnames;
+  return tbit(P->is_func, i);
+}
+
 const char*
 checkpoint_perm_name_of(checkpoint_perm *P, const void *obj)
 {
   if (!obj) return NULL;
   int64_t i = idx_find(P->obj_idx, P->nobj, P->ptrs, (uintptr_t)obj);
-  return i < 0 ? NULL : P->names + P->name_off[i];
+  return i < 0 ? NULL : name_str(P, (uint32_t)i);
 }
 
 const char*
@@ -940,17 +1474,28 @@ checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f)
 {
   if (!f) return NULL;
   int64_t i = idx_find(P->func_idx, P->nfunc, P->ptrs, (uintptr_t)f);
-  return i < 0 ? NULL : P->names + P->name_off[i];
+  return i < 0 ? NULL : name_str(P, (uint32_t)i);
 }
 
 int
 checkpoint_perm_heap_p(checkpoint_perm *P, const void *obj)
 {
-  if (!obj || !P->keep) return 0;
+  if (!obj) return 0;
+  uintptr_t k = (uintptr_t)obj;
+  if (P->keepp) {
+    uint32_t lo = 0, hi = P->nkeep;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      if (P->keepp[mid] == k) return 1;
+      if (P->keepp[mid] < k) lo = mid + 1;
+      else hi = mid;
+    }
+    return 0;
+  }
+  if (!P->keep) return 0;
   if (obj == (const void*)P->keep) return 1;
   const mrb_value *a = ARY_PTR(P->keep);
   mrb_int lo = 0, hi = ARY_LEN(P->keep);
-  uintptr_t k = (uintptr_t)obj;
   while (lo < hi) {
     mrb_int mid = lo + (hi - lo) / 2;
     uintptr_t m = (uintptr_t)mrb_ptr(a[mid]);
@@ -964,6 +1509,31 @@ checkpoint_perm_heap_p(checkpoint_perm *P, const void *obj)
 const void*
 checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is_func)
 {
+  if (P->T) {
+    /* the table's names in name order: a binary search */
+    const mrb_checkpoint_table *T = P->T;
+    uint32_t lo = 0, hi = T->nnames;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      uint32_t i = T->by_name[mid];
+      int r = cmp_name(name, len, tname(T, i));
+      if (r == 0) {
+        if (!P->ptrs[i]) break;   /* the table's, not in this state */
+        if (is_func) *is_func = tbit(T->is_func, i);
+        return P->ptrs[i];
+      }
+      if (r > 0) lo = mid + 1;
+      else hi = mid;
+    }
+    /* the names of the state's own */
+    for (uint32_t j = 0; j < P->nx; j++) {
+      if (P->name_off[j + 1] - P->name_off[j] - 1 == len && memcmp(P->names + P->name_off[j], name, len) == 0) {
+        if (is_func) *is_func = tbit(P->is_func, j);
+        return P->ptrs[T->nnames + j];
+      }
+    }
+    return NULL;
+  }
   for (uint32_t i = 0; i < P->n; i++) {
     if (P->name_off[i + 1] - P->name_off[i] - 1 == len &&
         memcmp(P->names + P->name_off[i], name, len) == 0) {
@@ -984,8 +1554,8 @@ const char*
 checkpoint_perm_name_at(checkpoint_perm *P, uint32_t i, int *is_func)
 {
   if (i >= P->n) return NULL;
-  if (is_func) *is_func = (P->is_func[i / 8] >> (i % 8)) & 1;
-  return P->names + P->name_off[i];
+  if (is_func) *is_func = name_is_func(P, i);
+  return name_str(P, i);
 }
 
 const void*
@@ -1001,10 +1571,10 @@ checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash)
   uintptr_t k = (uintptr_t)irep;
   while (lo < hi) {
     uint32_t mid = lo + (hi - lo) / 2;
-    const girep_perm *e = &P->ireps[P->irep_idx[mid]];
-    uintptr_t m = (uintptr_t)e->irep;
+    uint32_t i = P->irep_idx[mid];
+    uintptr_t m = (uintptr_t)(P->irepp ? P->irepp[i] : P->ireps[i].irep);
     if (m == k) {
-      if (hash) *hash = e->hash;
+      if (hash) *hash = P->irepp ? P->T->irep_hash[i] : P->ireps[i].hash;
       return 1;
     }
     if (m < k) lo = mid + 1;
@@ -1017,16 +1587,518 @@ const mrb_irep*
 checkpoint_perm_irep_by_hash(checkpoint_perm *P, uint64_t hash)
 {
   for (uint32_t i = 0; i < P->nireps; i++) {
-    if (P->ireps[i].hash == hash) return P->ireps[i].irep;
+    if (P->irepp) {
+      if (P->T->irep_hash[i] == hash) return P->irepp[i];
+    }
+    else if (P->ireps[i].hash == hash) return P->ireps[i].irep;
   }
   return NULL;
 }
 
-gsnap*
-checkpoint_perm_snap(checkpoint_perm *P, const void *obj)
+/* ---- the snapshots ---- */
+
+uint32_t
+checkpoint_perm_nsnaps(checkpoint_perm *P)
 {
-  for (uint32_t i = 0; i < P->nsnaps; i++) {
-    if (P->snaps[i].obj == obj) return &P->snaps[i];
-  }
+  return P->nsnaps;
+}
+
+/* snapshot k as kept without a table (NULL: the table's) */
+static gsnap*
+own_of(checkpoint_perm *P, uint32_t k)
+{
+  if (!P->T) return &P->snaps[k];
+  if (k >= P->T->nsnaps) return &P->snaps[P->xsnap[k - P->T->nsnaps]];
+  if (P->snap_over && P->snap_over[k]) return &P->snaps[P->snap_over[k] - 1];
   return NULL;
+}
+
+/* NULL for a table snapshot whose object this state lacks */
+struct RBasic*
+checkpoint_perm_snap_obj(checkpoint_perm *P, uint32_t k)
+{
+  gsnap *o = own_of(P, k);
+  return o ? o->obj : (struct RBasic*)P->ptrs[P->T->snaps[k].name];
+}
+
+struct RClass*
+checkpoint_perm_snap_super(checkpoint_perm *P, uint32_t k)
+{
+  gsnap *o = own_of(P, k);
+  if (o) return o->u.super;
+  uint32_t s = P->T->snaps[k].super;
+  return s ? (struct RClass*)P->ptrs[s - 1] : NULL;
+}
+
+int
+checkpoint_perm_snap_cflags(checkpoint_perm *P, uint32_t k)
+{
+  gsnap *o = own_of(P, k);
+  return o ? o->cflags : P->T->snaps[k].cflags;
+}
+
+uint64_t
+checkpoint_perm_snap_digest(checkpoint_perm *P, uint32_t k)
+{
+  gsnap *o = own_of(P, k);
+  return o ? o->u.digest : P->slotv[P->T->snaps[k].slot];
+}
+
+int
+checkpoint_perm_snap_mt(mrb_state *mrb, checkpoint_perm *P, uint32_t k, gsnap_mt **out)
+{
+  gsnap *o = own_of(P, k);
+  int n = o ? o->nmt : P->T->snaps[k].nmt;
+  gsnap_mt *a = (gsnap_mt*)coll_realloc(mrb, NULL, sizeof(gsnap_mt) * (n ? n : 1));
+  if (o) {
+    if (n > 0) memcpy(a, P->mt + o->mt, sizeof(gsnap_mt) * n);
+  }
+  else {
+    const mrb_checkpoint_table_mt *e = P->T->mt + P->T->snaps[k].mt;
+    for (int i = 0; i < n; i++) {
+      a[i].sym = mrb_intern_check_cstr(mrb, P->T->syms + e[i].sym);
+      a[i].flags = e[i].flags;
+      a[i].ref = e[i].ref;
+    }
+  }
+  *out = a;
+  return n;
+}
+
+int
+checkpoint_perm_snap_iv(mrb_state *mrb, checkpoint_perm *P, uint32_t k, giv_entry **out)
+{
+  gsnap *o = own_of(P, k);
+  int n = o ? o->niv : P->T->snaps[k].niv;
+  giv_entry *a = (giv_entry*)coll_realloc(mrb, NULL, sizeof(giv_entry) * (n ? n : 1));
+  if (o) {
+    if (n > 0) memcpy(a, P->iv + o->iv, sizeof(giv_entry) * n);
+  }
+  else {
+    const mrb_checkpoint_table_iv *e = P->T->iv + P->T->snaps[k].iv;
+    for (int i = 0; i < n; i++) {
+      a[i].sym = mrb_intern_check_cstr(mrb, P->T->syms + e[i].sym);
+      if (e[i].ref & MRB_CHECKPOINT_TABLE_SLOT) a[i].val = slot_get(mrb, P, e[i].ref & ~MRB_CHECKPOINT_TABLE_SLOT);
+      else a[i].val = mrb_obj_value((void*)P->ptrs[e[i].ref - 1]);
+    }
+  }
+  *out = a;
+  return n;
+}
+
+int
+checkpoint_perm_has_method(mrb_state *mrb, checkpoint_perm *P, const char *name, size_t len)
+{
+  if (P->T) {
+    const mrb_checkpoint_table *T = P->T;
+    uint32_t lo = 0, hi = T->nmethods;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      int r = cmp_name(name, len, T->syms + T->methods[mid]);
+      if (r == 0) return 1;
+      if (r > 0) lo = mid + 1;
+      else hi = mid;
+    }
+    /* (the snapshots of the state's own, below) */
+  }
+  mrb_sym sym = mrb_intern_check(mrb, name, len);
+  if (sym == 0) return 0;
+  for (uint32_t i = 0; i < P->nmt; i++) if (P->mt[i].ref != 0 && P->mt[i].sym == sym) return 1;
+  return 0;
+}
+
+/* ---- a table from the state's own tables (writing one; the stamp) ---- */
+
+typedef struct {
+  mrb_checkpoint_table t;
+  uint32_t *by_name;
+  mrb_checkpoint_table_snap *snaps;
+  mrb_checkpoint_table_mt *mt;
+  mrb_checkpoint_table_iv *iv;
+  char *syms; uint32_t slen, scap;
+  pmap sym2off;              /* mrb_sym -> offset + 1 */
+  uint64_t *irep_hash;
+  uint32_t *methods;
+} tbuild;
+
+static uint32_t
+tb_sym(mrb_state *mrb, checkpoint_state *G, tbuild *tb, mrb_sym sym)
+{
+  uint32_t off;
+  if (pm_get(&tb->sym2off, (const void*)(uintptr_t)sym, &off)) return off - 1;
+  mrb_int len;
+  const char *s = mrb_sym_name_len(mrb, sym, &len);
+  if (tb->slen + (uint32_t)len + 1 > tb->scap) {
+    uint32_t c = tb->scap ? tb->scap : 4096;
+    while (c < tb->slen + (uint32_t)len + 1) c *= 2;
+    tb->syms = (char*)ck_realloc(G, tb->syms, c);
+    tb->scap = c;
+  }
+  off = tb->slen;
+  memcpy(tb->syms + off, s, (size_t)len);
+  tb->syms[off + len] = 0;
+  tb->slen += (uint32_t)len + 1;
+  pm_put(mrb, &tb->sym2off, (const void*)(uintptr_t)sym, off + 1);
+  return off;
+}
+
+/* index sort by the strings base + off[idx] (merge sort: no static context) */
+static void
+sort_by_str(checkpoint_state *G, uint32_t *idx, uint32_t n, const char *base, const uint32_t *off)
+{
+  if (n < 2) return;
+  uint32_t *tmp = (uint32_t*)ck_malloc(G, sizeof(uint32_t) * n);
+  for (uint32_t w = 1; w < n; w *= 2) {
+    for (uint32_t lo = 0; lo < n - w; lo += 2 * w) {
+      uint32_t mid = lo + w, hi = lo + 2 * w < n ? lo + 2 * w : n;
+      uint32_t i = lo, j = mid, k = 0;
+      while (i < mid && j < hi) {
+        const char *a = base + (off ? off[idx[i]] : idx[i]);
+        const char *b = base + (off ? off[idx[j]] : idx[j]);
+        if (strcmp(b, a) < 0) tmp[k++] = idx[j++];
+        else tmp[k++] = idx[i++];
+      }
+      while (i < mid) tmp[k++] = idx[i++];
+      while (j < hi) tmp[k++] = idx[j++];
+      memcpy(idx + lo, tmp, sizeof(uint32_t) * k);
+    }
+  }
+  ck_free(G, tmp);
+}
+
+static int64_t
+obj_index(checkpoint_perm *P, const void *p)
+{
+  return p ? idx_find(P->obj_idx, P->nobj, P->ptrs, (uintptr_t)p) : -1;
+}
+
+static uint64_t
+table_digest(const mrb_checkpoint_table *t)
+{
+  uint64_t h = FNV_INIT;
+  h = fnv_u64(h, t->version);
+  h = fnv_u64(h, t->nnames);
+  h = fnv_bytes(h, t->names, t->name_off[t->nnames]);
+  h = fnv_bytes(h, t->is_func, (t->nnames + 7) / 8);
+  h = fnv_u64(h, t->nsnaps);
+  for (uint32_t i = 0; i < t->nsnaps; i++) {
+    const mrb_checkpoint_table_snap *s = &t->snaps[i];
+    h = fnv_u64(h, s->name); h = fnv_u64(h, s->super); h = fnv_u64(h, s->mt); h = fnv_u64(h, s->iv);
+    h = fnv_u64(h, s->slot); h = fnv_u64(h, s->nmt); h = fnv_u64(h, s->niv);
+    h = fnv_u64(h, s->tt); h = fnv_u64(h, s->cflags);
+  }
+  h = fnv_u64(h, t->nmt);
+  for (uint32_t i = 0; i < t->nmt; i++) {
+    h = fnv_u64(h, t->mt[i].sym); h = fnv_u64(h, t->mt[i].flags); h = fnv_u64(h, t->mt[i].ref);
+  }
+  h = fnv_u64(h, t->niv);
+  for (uint32_t i = 0; i < t->niv; i++) { h = fnv_u64(h, t->iv[i].sym); h = fnv_u64(h, t->iv[i].ref); }
+  h = fnv_u64(h, t->nslots);
+  uint32_t slen = 0;
+  /* the strings up to the end of the last one any entry names */
+  for (uint32_t i = 0; i < t->nmt; i++) { uint32_t e = t->mt[i].sym + (uint32_t)strlen(t->syms + t->mt[i].sym) + 1; if (e > slen) slen = e; }
+  for (uint32_t i = 0; i < t->niv; i++) { uint32_t e = t->iv[i].sym + (uint32_t)strlen(t->syms + t->iv[i].sym) + 1; if (e > slen) slen = e; }
+  h = fnv_bytes(h, t->syms, slen);
+  h = fnv_u64(h, t->nireps);
+  for (uint32_t i = 0; i < t->nireps; i++) h = fnv_u64(h, t->irep_hash[i]);
+  h = fnv_u64(h, t->nmethods);
+  for (uint32_t i = 0; i < t->nmethods; i++) h = fnv_u64(h, t->methods[i]);
+  return h;
+}
+
+static void
+tb_free(checkpoint_state *G, tbuild *tb)
+{
+  ck_free(G, tb->by_name); ck_free(G, tb->snaps); ck_free(G, tb->mt); ck_free(G, tb->iv);
+  ck_free(G, tb->syms); ck_free(G, tb->irep_hash); ck_free(G, tb->methods);
+  pm_free(G->mrb, &tb->sym2off);
+}
+
+static int
+cmp_mt_name(mrb_state *mrb, const void *a, const void *b)
+{
+  return sym_cmp(mrb, ((const gsnap_mt*)a)->sym, ((const gsnap_mt*)b)->sym);
+}
+
+/* the table of this state's own (not a table's) baseline; 0, or -1 with why */
+static int
+table_from_perm(mrb_state *mrb, checkpoint_state *G, checkpoint_perm *P, tbuild *tb, char *why, size_t whylen)
+{
+  memset(tb, 0, sizeof(*tb));
+  pm_init(&tb->sym2off);
+  mrb_checkpoint_table *t = &tb->t;
+  t->version = MRB_CHECKPOINT_TABLE_VERSION;
+  t->nnames = P->n;
+  t->names = P->names;
+  t->name_off = P->name_off;
+  t->is_func = P->is_func;
+  tb->by_name = (uint32_t*)ck_malloc(G, sizeof(uint32_t) * (P->n ? P->n : 1));
+  for (uint32_t i = 0; i < P->n; i++) tb->by_name[i] = i;
+  sort_by_str(G, tb->by_name, P->n, P->names, P->name_off);
+  t->by_name = tb->by_name;
+
+  tb->snaps = (mrb_checkpoint_table_snap*)ck_calloc(G, P->nsnaps ? P->nsnaps : 1, sizeof(mrb_checkpoint_table_snap));
+  tb->mt = (mrb_checkpoint_table_mt*)ck_malloc(G, sizeof(mrb_checkpoint_table_mt) * (P->nmt ? P->nmt : 1));
+  tb->iv = (mrb_checkpoint_table_iv*)ck_malloc(G, sizeof(mrb_checkpoint_table_iv) * (P->niv ? P->niv : 1));
+  uint32_t nmt = 0, niv = 0, nslots = 0;
+  for (uint32_t k = 0; k < P->nsnaps; k++) {
+    gsnap *s = &P->snaps[k];
+    mrb_checkpoint_table_snap *ts = &tb->snaps[k];
+    int64_t ni = obj_index(P, s->obj);
+    if (ni < 0) { snprintf(why, whylen, "snapshot %u has no name", (unsigned)k); return -1; }
+    ts->name = (uint32_t)ni;
+    ts->tt = (uint8_t)s->obj->tt;
+    switch (s->obj->tt) {
+    case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS: case MRB_TT_ICLASS: {
+      int64_t si = obj_index(P, s->u.super);
+      if (s->u.super && si < 0) {
+        snprintf(why, whylen, "the superclass of %s has no name", P->names + P->name_off[ni]);
+        return -1;
+      }
+      ts->super = s->u.super ? (uint32_t)si + 1 : 0;
+      ts->cflags = s->obj->tt == MRB_TT_ICLASS ? 0 : s->cflags;
+      break;
+    }
+    case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_HASH:
+      ts->slot = nslots++;
+      break;
+    default:
+      break;
+    }
+    /* methods, in name order */
+    ts->mt = nmt;
+    ts->nmt = s->nmt;
+    if (s->nmt > 0) {
+      gsnap_mt *m = (gsnap_mt*)ck_malloc(G, sizeof(gsnap_mt) * s->nmt);
+      memcpy(m, P->mt + s->mt, sizeof(gsnap_mt) * s->nmt);
+      sort_by_name(mrb, m, s->nmt, sizeof(gsnap_mt), cmp_mt_name);
+      for (uint32_t i = 0; i < s->nmt; i++) {
+        tb->mt[nmt].sym = tb_sym(mrb, G, tb, m[i].sym);
+        tb->mt[nmt].flags = m[i].flags;
+        tb->mt[nmt].ref = m[i].ref;
+        nmt++;
+      }
+      ck_free(G, m);
+    }
+    /* ivars, in name order: a named object by its name, anything else in a
+       slot of the state's own */
+    ts->iv = niv;
+    ts->niv = s->niv;
+    if (s->niv > 0) {
+      giv_entry *v = (giv_entry*)ck_malloc(G, sizeof(giv_entry) * s->niv);
+      memcpy(v, P->iv + s->iv, sizeof(giv_entry) * s->niv);
+      sort_by_name(mrb, v, s->niv, sizeof(giv_entry), cmp_iv);
+      for (uint32_t i = 0; i < s->niv; i++) {
+        tb->iv[niv].sym = tb_sym(mrb, G, tb, v[i].sym);
+        int64_t oi = mrb_immediate_p(v[i].val) ? -1 : obj_index(P, mrb_ptr(v[i].val));
+        tb->iv[niv].ref = oi >= 0 ? (uint32_t)oi + 1 : (MRB_CHECKPOINT_TABLE_SLOT | nslots++);
+        niv++;
+      }
+      ck_free(G, v);
+    }
+  }
+  t->nsnaps = P->nsnaps; t->snaps = tb->snaps;
+  t->nmt = nmt; t->mt = tb->mt;
+  t->niv = niv; t->iv = tb->iv;
+  t->nslots = nslots;
+
+  /* every method name some class defines (an undefined method is no
+     definition) */
+  uint32_t *m = (uint32_t*)ck_malloc(G, sizeof(uint32_t) * (nmt ? nmt : 1));
+  uint32_t nm = 0;
+  for (uint32_t i = 0; i < nmt; i++) if (tb->mt[i].ref != 0) m[nm++] = tb->mt[i].sym;
+  sort_by_str(G, m, nm, tb->syms ? tb->syms : "", NULL);
+  uint32_t u = 0;
+  for (uint32_t i = 0; i < nm; i++) if (u == 0 || strcmp(tb->syms + m[i], tb->syms + m[u - 1]) != 0) m[u++] = m[i];
+  tb->methods = m;
+  t->nmethods = u; t->methods = m;
+  t->syms = tb->syms ? tb->syms : "";
+
+  tb->irep_hash = (uint64_t*)ck_malloc(G, sizeof(uint64_t) * (P->nireps ? P->nireps : 1));
+  for (uint32_t i = 0; i < P->nireps; i++) tb->irep_hash[i] = P->ireps[i].hash;
+  t->nireps = P->nireps; t->irep_hash = tb->irep_hash;
+  t->stamp = table_digest(t);
+  return 0;
+}
+
+uint64_t
+checkpoint_perm_stamp(mrb_state *mrb, checkpoint_perm *P)
+{
+  if (P->stamp_set) return P->stamp;
+  checkpoint_state *G = checkpoint_get(mrb);
+  tbuild tb;
+  char why[160];
+  P->stamp = (G && table_from_perm(mrb, G, P, &tb, why, sizeof(why)) == 0) ? tb.t.stamp : 0;
+  if (G) tb_free(G, &tb);
+  P->stamp_set = 1;
+  return P->stamp;
+}
+
+/* ---- writing a table as C source ---- */
+
+typedef struct {
+  mrb_checkpoint_text_fn fn;
+  void *ud;
+  char buf[1024];
+  size_t len;
+} emitter;
+
+static void
+em_flush(emitter *e)
+{
+  if (e->len) e->fn(e->buf, e->len, e->ud);
+  e->len = 0;
+}
+
+static void
+em(emitter *e, const char *fmt, ...)
+{
+  char tmp[512];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if ((size_t)n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+  if (e->len + (size_t)n > sizeof(e->buf)) em_flush(e);
+  memcpy(e->buf + e->len, tmp, (size_t)n);
+  e->len += (size_t)n;
+}
+
+/* a C string literal of s (one name), with its NUL */
+static void
+em_cstr(emitter *e, const char *s)
+{
+  char out[600];
+  size_t o = 0;
+  out[o++] = '"';
+  for (const unsigned char *p = (const unsigned char*)s; *p && o < sizeof(out) - 8; p++) {
+    if (*p == '"' || *p == '\\' || *p == '?') { out[o++] = '\\'; out[o++] = (char)*p; }
+    else if (*p < 0x20 || *p >= 0x7f) o += (size_t)snprintf(out + o, sizeof(out) - o, "\\%03o", *p);
+    else out[o++] = (char)*p;
+  }
+  memcpy(out + o, "\\0\"\n", 4);
+  o += 4;
+  out[o] = 0;
+  em(e, "%s", out);
+}
+
+static void
+em_u32s(emitter *e, const char *name, const uint32_t *a, uint32_t n)
+{
+  em(e, "static const uint32_t %s[] = {", name);
+  for (uint32_t i = 0; i < n; i++) em(e, "%s%u,", i % 12 ? "" : "\n  ", (unsigned)a[i]);
+  if (n == 0) em(e, "0");
+  em(e, "\n};\n");
+}
+
+MRB_API int
+mrb_checkpoint_write_table(mrb_state *mrb, const char *symbol, mrb_checkpoint_text_fn fn, void *ud,
+                           char *why, size_t whylen)
+{
+  checkpoint_state *G = checkpoint_get(mrb);
+  if (!G || !G->perm) { snprintf(why, whylen, "no baseline"); return -1; }
+  checkpoint_perm *P = G->perm;
+  if (P->T || !P->keepp) {
+    snprintf(why, whylen, "the baseline was not taken for a table (mrb_checkpoint_prepare_table)");
+    return -1;
+  }
+  tbuild tb;
+  if (table_from_perm(mrb, G, P, &tb, why, whylen) != 0) { tb_free(G, &tb); return -1; }
+  const mrb_checkpoint_table *t = &tb.t;
+  emitter e = { fn, ud, {0}, 0 };
+
+  em(&e, "/* The checkpoint table of this build (mruby-checkpoint, mrb_checkpoint_write_table).\n"
+         "   Made when the build is built; do not edit. %u names, %u snapshots, %u mrblib ireps,\n"
+         "   %u values of the state's own. */\n\n", (unsigned)t->nnames, (unsigned)t->nsnaps,
+     (unsigned)t->nireps, (unsigned)t->nslots);
+  em(&e, "#include <mruby.h>\n#include <mruby/checkpoint.h>\n\n");
+  em(&e, "static const char names[] =\n");
+  for (uint32_t i = 0; i < t->nnames; i++) em_cstr(&e, t->names + t->name_off[i]);
+  if (t->nnames == 0) em(&e, "\"\"\n");
+  em(&e, ";\n");
+  {
+    uint32_t *off = (uint32_t*)ck_malloc(G, sizeof(uint32_t) * (t->nnames + 1));
+    memcpy(off, t->name_off, sizeof(uint32_t) * (t->nnames + 1));
+    em_u32s(&e, "name_off", off, t->nnames + 1);
+    ck_free(G, off);
+  }
+  em(&e, "static const uint8_t is_func[] = {");
+  for (uint32_t i = 0; i < (t->nnames + 7) / 8; i++) em(&e, "%s%u,", i % 16 ? "" : "\n  ", (unsigned)t->is_func[i]);
+  em(&e, "0\n};\n");
+  em_u32s(&e, "by_name", t->by_name, t->nnames);
+  em(&e, "static const mrb_checkpoint_table_snap snaps[] = {\n");
+  for (uint32_t i = 0; i < t->nsnaps; i++) {
+    const mrb_checkpoint_table_snap *s = &t->snaps[i];
+    em(&e, "  {%u,%u,%u,%u,%u,%u,%u,%u,%u},\n", (unsigned)s->name, (unsigned)s->super, (unsigned)s->mt,
+       (unsigned)s->iv, (unsigned)s->slot, (unsigned)s->nmt, (unsigned)s->niv, (unsigned)s->tt, (unsigned)s->cflags);
+  }
+  if (t->nsnaps == 0) em(&e, "  {0,0,0,0,0,0,0,0,0}\n");
+  em(&e, "};\nstatic const mrb_checkpoint_table_mt mt[] = {\n");
+  for (uint32_t i = 0; i < t->nmt; i++) {
+    em(&e, "  {%u,0x%x,%u},\n", (unsigned)t->mt[i].sym, (unsigned)t->mt[i].flags, (unsigned)t->mt[i].ref);
+  }
+  if (t->nmt == 0) em(&e, "  {0,0,0}\n");
+  em(&e, "};\nstatic const mrb_checkpoint_table_iv iv[] = {\n");
+  for (uint32_t i = 0; i < t->niv; i++) em(&e, "  {%u,0x%x},\n", (unsigned)t->iv[i].sym, (unsigned)t->iv[i].ref);
+  if (t->niv == 0) em(&e, "  {0,0}\n");
+  em(&e, "};\nstatic const char syms[] =\n");
+  for (uint32_t o = 0; o < tb.slen; o += (uint32_t)strlen(t->syms + o) + 1) em_cstr(&e, t->syms + o);
+  if (tb.slen == 0) em(&e, "\"\"\n");
+  em(&e, ";\nstatic const uint64_t irep_hash[] = {");
+  for (uint32_t i = 0; i < t->nireps; i++) {
+    em(&e, "%s0x%08x%08xULL,", i % 4 ? "" : "\n  ", (unsigned)(t->irep_hash[i] >> 32), (unsigned)(t->irep_hash[i] & 0xffffffffu));
+  }
+  if (t->nireps == 0) em(&e, "0");
+  em(&e, "\n};\n");
+  em_u32s(&e, "methods", t->methods, t->nmethods);
+  em(&e, "\nconst mrb_checkpoint_table %s = {\n", symbol);
+  em(&e, "  %u, 0x%08x%08xULL,\n", (unsigned)t->version, (unsigned)(t->stamp >> 32), (unsigned)(t->stamp & 0xffffffffu));
+  em(&e, "  %u, names, name_off, is_func, by_name,\n", (unsigned)t->nnames);
+  em(&e, "  %u, snaps, %u, mt, %u, iv,\n", (unsigned)t->nsnaps, (unsigned)t->nmt, (unsigned)t->niv);
+  em(&e, "  %u, syms, %u, irep_hash, %u, methods,\n};\n", (unsigned)t->nslots, (unsigned)t->nireps, (unsigned)t->nmethods);
+  em_flush(&e);
+  tb_free(G, &tb);
+  return 0;
+}
+
+/* ---- what the baseline keeps (measuring) ---- */
+
+MRB_API size_t
+mrb_checkpoint_baseline_size(mrb_state *mrb, mrb_checkpoint_size_fn fn, void *ud)
+{
+  checkpoint_state *G = checkpoint_get(mrb);
+  if (!G || !G->perm) return 0;
+  checkpoint_perm *P = G->perm;
+  size_t total = 0;
+#define PART(name, count, bytes) do { \
+    size_t b_ = (size_t)(bytes); \
+    if (b_ > 0) { if (fn) fn(name, (size_t)(count), b_, ud); total += b_; } \
+  } while (0)
+  PART("struct", 1, sizeof(checkpoint_perm));
+  uint32_t nown = P->T ? P->nx : P->n;   /* the names kept in the state */
+  PART(P->T ? "names (own)" : "names", nown, nown ? P->name_off[nown] : 0);
+  PART(P->T ? "name_off (own)" : "name_off", nown + 1, nown ? sizeof(uint32_t) * (nown + 1) : 0);
+  PART(P->T ? "is_func (own)" : "is_func", nown, nown ? (nown + 7) / 8 + 1 : 0);
+  PART("ptrs", P->n, sizeof(void*) * P->n);
+  PART("obj_idx", P->nobj, sizeof(uint32_t) * P->nobj);
+  PART("func_idx", P->nfunc, sizeof(uint32_t) * P->nfunc);
+  if (P->keep) PART("keep (Array)", ARY_LEN(P->keep), sizeof(struct RArray) + sizeof(mrb_value) * ARY_CAPA(P->keep));
+  if (P->keepp) PART("keep (addresses)", P->nkeep, sizeof(uintptr_t) * P->nkeep);
+  if (P->irepp) PART("ireps", P->nireps, sizeof(void*) * P->nireps);
+  else PART("ireps", P->nireps, sizeof(girep_perm) * P->nireps);
+  PART("irep_idx", P->nireps, sizeof(uint32_t) * P->nireps);
+  uint32_t nown_snaps = P->T ? P->nxsnap : P->nsnaps;
+  if (P->T) {
+    for (uint32_t k = 0; P->snap_over && k < P->T->nsnaps; k++) if (P->snap_over[k]) nown_snaps++;
+    PART("snap_over", P->T->nsnaps, P->snap_over ? sizeof(uint32_t) * P->T->nsnaps : 0);
+    PART("xsnap", P->nxsnap, sizeof(uint32_t) * P->nxsnap);
+    PART("slots", P->T->nslots, (sizeof(uint64_t) + 1) * P->T->nslots);
+  }
+  PART(P->T ? "snaps (own)" : "snaps", nown_snaps, sizeof(gsnap) * nown_snaps);
+  PART(P->T ? "mt (own)" : "mt", P->nmt, sizeof(gsnap_mt) * P->nmt);
+  PART(P->T ? "iv (own)" : "iv", P->niv, sizeof(giv_entry) * P->niv);
+  PART("gv", P->ngv, sizeof(giv_entry) * P->ngv);
+#undef PART
+  return total;
 }
