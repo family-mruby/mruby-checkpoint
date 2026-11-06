@@ -62,7 +62,9 @@ enum {
   GP_SUPER_SET = 5, GP_GV_SET = 6, GP_GV_REMOVE = 7,
   GP_RANDOM_SET = 8,   /* the state of a permanent Random (the default one) */
   GP_CLASS_FLAGS = 9,  /* a permanent class got prepended modules */
-  GP_CONTENT_SET = 10, /* the contents of a permanent String / Array / Hash (ARGV << x) */
+  GP_CONTENT_SET = 10, /* the contents of a permanent String / Array / Hash (ARGV << x),
+                          Struct, Set, Env, Exception */
+  GP_CLASS_SET = 11,   /* a permanent object got a singleton class (def obj.m, extend) */
 };
 
 /* mruby-random's state, kept inline in the object (MRB_TT_ISTRUCT):
@@ -337,6 +339,7 @@ void checkpoint_perm_free(mrb_state *mrb, checkpoint_perm *P);
 const char *checkpoint_perm_name_of(checkpoint_perm *P, const void *obj);
 const char *checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f);
 int checkpoint_perm_heap_p(checkpoint_perm *P, const void *obj);   /* alive at baseline */
+int checkpoint_perm_internal_p(checkpoint_perm *P, const void *obj);   /* the gem's own (the hidden Array) */
 const void *checkpoint_perm_ref(checkpoint_perm *P, uint32_t ref);   /* name index + 1 -> pointer */
 const void *checkpoint_perm_lookup(checkpoint_perm *P, const char *name, size_t len, int *is_func);
 uint32_t checkpoint_perm_count(checkpoint_perm *P);
@@ -362,6 +365,12 @@ uint64_t checkpoint_perm_stamp(mrb_state *mrb, checkpoint_perm *P);
 void checkpoint_perm_mark(mrb_state *mrb, checkpoint_perm *P);
 uint64_t checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep);
 uint64_t checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj);
+/* what the snapshot of a permanent object of type tt holds (not classes) */
+#define SNAP_DIGEST 1   /* its contents, as checkpoint_content_digest */
+#define SNAP_IVARS 2    /* its ivars */
+int checkpoint_snap_kind(enum mrb_vtype tt);
+/* a Set's elements (Set#to_a), nil while it is not initialized */
+mrb_value checkpoint_set_elements(mrb_state *mrb, struct RBasic *o);
 
 /* snapshots of a class's method table and ivars (also used by the dumper);
    work areas while a dump or the baseline runs */

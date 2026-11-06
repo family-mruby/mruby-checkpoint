@@ -173,7 +173,8 @@ module CheckpointDiff
         when 'set_superclass' then ["#{tn}.superclass", oident(doc, c['superclass'])]
         when 'random_state' then ["#{tn}.state", "#{c['state']} seed #{c['seed']}"]
         when 'class_flags' then ["#{tn}.prepended", c['prepended'].to_s]
-        when 'contents' then ["#{tn}.contents", c['items'] ? "[#{c['items'].map { |v| ident(doc, v) }.join(', ')}]" : (c['pairs'] ? "{#{c['pairs'].map { |k, v| "#{ident(doc, k)} => #{ident(doc, v)}" }.join(', ')}}" : c['text'].inspect)]
+        when 'set_class' then ["#{tn}.singleton_class", oident(doc, c['class'])]
+        when 'contents' then ["#{tn}.contents", c['items'] ? "[#{c['items'].map { |v| ident(doc, v) }.join(', ')}]" : (c['pairs'] ? "{#{c['pairs'].map { |k, v| "#{ident(doc, k)} => #{ident(doc, v)}" }.join(', ')}}" : (c['type'] == 'exception' ? "message #{ident(doc, c['message'])}" : c['text'].inspect))]
         end
       m[key] = val
       refs[key] = ref_of(c['value']) || (c['method'] && c['method']['proc'])

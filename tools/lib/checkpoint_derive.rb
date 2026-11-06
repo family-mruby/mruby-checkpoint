@@ -545,9 +545,12 @@ module CheckpointImage
                     'refs' => c['method']['proc'] ? [['', c['method']['proc']]] : [] }
         when 'set_superclass'
           list << { 'key' => "#{perm_text(c['target'])}.superclass", 'kind' => 'superclass', 'refs' => c['superclass'] ? [['', c['superclass']]] : [] }
+        when 'set_class'
+          list << { 'key' => "#{perm_text(c['target'])}.singleton_class", 'kind' => 'superclass', 'refs' => c['class'] ? [['', c['class']]] : [] }
         when 'contents'
           list << { 'key' => "#{perm_text(c['target'])}.contents", 'kind' => 'contents',
-                    'refs' => ((c['items'] || []).each_with_index.map { |v, i| v.is_a?(Hash) && v['ref'] ? ["[#{i}]", v['ref']] : nil } +
+                    'refs' => ((c['message'].is_a?(Hash) && c['message']['ref'] ? [['message', c['message']['ref']]] : []) +
+                               (c['items'] || []).each_with_index.map { |v, i| v.is_a?(Hash) && v['ref'] ? ["[#{i}]", v['ref']] : nil } +
                                (c['pairs'] || []).each_with_index.flat_map { |(k, v), i| [k.is_a?(Hash) && k['ref'] ? ["(key #{i})", k['ref']] : nil, v.is_a?(Hash) && v['ref'] ? ["{#{key_label(k)}}", v['ref']] : nil] }).compact }
         end
       end

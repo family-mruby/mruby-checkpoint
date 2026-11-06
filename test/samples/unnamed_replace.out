@@ -1,0 +1,17 @@
+moved
+{"en" => {hello: "hello"}, "ja" => {hello: "yaa"}}
+{hello: "konnichiwa"}
+["a", "b"]
+[[1, 2]]
+{n: 0, moved: [1, 2]}
+true
+RuntimeError
+"x"
+{[1] => "array key", "en" => :string_key}
+:string_key
+true
+{}
+[1]
+nil
+["a", "b", "c"]
+{hello: "konnichiwa?"}

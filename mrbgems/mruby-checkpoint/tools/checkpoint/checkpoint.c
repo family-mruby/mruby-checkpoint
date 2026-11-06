@@ -35,6 +35,10 @@
 **       whether the baseline uses it. CHECKPOINT_BASELINE_SIZE prints what
 **       the baseline keeps, by part.
 **
+** Every state loads a small library before its baseline (the module CkBase,
+** fixture_rb below), as an embedder's mrblib would; CHECKPOINT_NO_FIXTURE
+** leaves it out (for measuring).
+**
 ** Exit status: 0 normal end or suspend, 1 uncaught exception, 2 usage / I/O,
 ** 3 the image could not be restored.
 */
@@ -227,6 +231,59 @@ print_missing(mrb_state *mrb, const char *name, size_t len, void *ud)
   *first = 0;
 }
 
+/* What a library's Ruby code makes before the baseline, the way an
+   embedder's mrblib does (Family mruby's FmrbI18n kept its words in a
+   constant Hash of Hashes): objects reached from a constant without a
+   name of their own, for test/samples/unnamed_*.rb. Both sides load it. */
+static const char fixture_rb[] =
+  "module CkBase\n"
+  "  STRINGS = { 'en' => { hello: 'hello' }, 'ja' => { hello: 'konnichiwa' } }\n"
+  "  NESTED = [[1, 2], ['a', 'b']]\n"
+  "  class Box\n"
+  "    attr_accessor :inner\n"
+  "    def initialize(x)\n"
+  "      @inner = x\n"
+  "    end\n"
+  "  end\n"
+  "  BOXED = Box.new({ n: 0 })\n"
+  "  DEEP = { list: [Box.new([1])] }\n"
+  "  Pair = Struct.new(:a, :b)\n"
+  "  PAIRS = [Pair.new(1, 'x')]\n"
+  "  SETS = [Set.new([1, 2])]\n"
+  "  ERRS = [RuntimeError.new('boom'), RuntimeError.new('bang')]\n"
+  "  DEFAULTS = [Hash.new('none')]\n"
+  "  RANGES = [('a'..'z')]\n"
+  "  COUNTER = begin\n"
+  "    n = 0\n"
+  "    -> { n += 1 }\n"
+  "  end\n"
+  "  KEYS = { [1] => 'array key' }\n"
+  "  BIGKEYS = {}\n"
+  "  40.times { |i| BIGKEYS[[i]] = i }\n"
+  "  FROZEN = ['const'.freeze, ['inner']].freeze\n"
+  "  NAMES = ['piano', 'organ', 'harp'].freeze\n"
+  "  SHARED = ['shared']\n"
+  "  TWICE = [SHARED, [SHARED]]\n"
+  "  ANON = [Class.new { def hi = 'hi' }]\n"
+  "  BOXES = [Checkpoint::Box.new(1)]\n"
+  "  OBJSET = Set.new([[1]])\n"
+  "end\n"
+  "$ck_global = [['g']]\n";
+
+static void
+load_fixture(mrb_state *mrb)
+{
+  /* (CHECKPOINT_NO_FIXTURE: without it, to measure the baseline of mrb_open
+     alone; images of the samples then do not resume) */
+  if (getenv("CHECKPOINT_NO_FIXTURE")) return;
+  mrb_checkpoint_open(mrb);   /* (Checkpoint::Box) */
+  mrb_load_string(mrb, fixture_rb);
+  if (mrb->exc) {
+    mrb_print_error(mrb);
+    exit(2);
+  }
+}
+
 /* what both sides have before the baseline */
 static mrb_state*
 open_state(void)
@@ -234,6 +291,7 @@ open_state(void)
   mrb_state *mrb = mrb_open();
   if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); exit(2); }
   mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
+  load_fixture(mrb);
   remove_without(mrb);
 #ifdef CHECKPOINT_DRIVER_TABLE
   mrb_checkpoint_set_table(mrb, &checkpoint_driver_table);
@@ -347,6 +405,7 @@ main(int argc, char **argv)
     mrb_state *mrb = mrb_open();
     if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); return 2; }
     mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
+    load_fixture(mrb);
     mrb_checkpoint_prepare_table(mrb);
     mrb_checkpoint_baseline(mrb);
     char why[200];

@@ -1012,10 +1012,22 @@ r_patches(reader *r)
     case GP_CONTENT_SET: {
       struct RBasic *o = r_obj(r);
       uint8_t frozen = r_u8(r);
-      uint8_t kind = r_u8(r);   /* 3 String, 4 Array, 5 Hash: the object's own type */
+      uint8_t kind = r_u8(r);   /* the object's own type, as its record's kind */
       if (r->failed) break;
-      if ((kind == GK_STRING && o->tt != MRB_TT_STRING) || (kind == GK_ARRAY && o->tt != MRB_TT_ARRAY) ||
-          (kind == GK_HASH && o->tt != MRB_TT_HASH)) { rfail(r, "contents of the wrong type for a permanent object"); break; }
+      enum mrb_vtype want;
+      switch (kind) {
+      case GK_STRING: want = MRB_TT_STRING; break;
+      case GK_ARRAY: want = MRB_TT_ARRAY; break;
+      case GK_HASH: want = MRB_TT_HASH; break;
+      case GK_STRUCT: want = MRB_TT_STRUCT; break;
+      case GK_SET: want = MRB_TT_SET; break;
+      case GK_ENV: want = MRB_TT_ENV; break;
+      case GK_EXCEPTION: want = MRB_TT_EXCEPTION; break;
+      default:
+        rfail(r, "contents of type %u for a permanent object", kind);
+        return;
+      }
+      if (!o || o->tt != want) { rfail(r, "contents of the wrong type for a permanent object"); break; }
       mrb_value v = mrb_obj_value(o);
       o->frozen = 0;
       if (o->tt == MRB_TT_STRING) {
@@ -1029,24 +1041,70 @@ r_patches(reader *r)
         for (uint32_t i = 0; i < n && !r->failed; i++) mrb_ary_push(mrb, v, r_value(r));
         o->frozen = frozen;
       }
-      else if (o->tt == MRB_TT_HASH) {
-        /* emptied now, filled with the other Hashes (keys may be user objects) */
+      else if (o->tt == MRB_TT_STRUCT) {
+        /* the members are fixed by the class: the same number */
         uint32_t n = r_u32(r);
-        mrb_hash_clear(mrb, v);
+        if (n != (uint32_t)RARRAY_LEN(v)) { rfail(r, "a permanent Struct with %u members here, %u in the image", (unsigned)RARRAY_LEN(v), (unsigned)n); break; }
+        for (uint32_t i = 0; i < n && !r->failed; i++) {
+          mrb_value x = r_value(r);
+          if (r->failed) break;
+          RARRAY_PTR(v)[i] = x;
+          mrb_field_write_barrier_value(mrb, o, x);
+        }
+        o->frozen = frozen;
+      }
+      else if (o->tt == MRB_TT_ENV) {
+        struct REnv *e = (struct REnv*)o;
+        uint32_t n = r_u32(r);
+        if (MRB_ENV_ONSTACK_P(e) || n != (uint32_t)MRB_ENV_LEN(e)) { rfail(r, "a permanent env of another shape here"); break; }
+        for (uint32_t i = 0; i < n && !r->failed; i++) {
+          mrb_value x = r_value(r);
+          if (r->failed) break;
+          e->stack[i] = x;
+          mrb_field_write_barrier_value(mrb, o, x);
+        }
+      }
+      else if (o->tt == MRB_TT_EXCEPTION) {
+        mrb_value mesg = r_value(r);
+        if (r->failed) break;
+        ((struct RException*)o)->mesg = mrb_nil_p(mesg) ? NULL : mrb_basic_ptr(mesg);
+        mrb_field_write_barrier_value(mrb, o, mesg);
+        o->frozen = frozen;
+      }
+      else {
+        /* a Hash or a Set: emptied now, filled with the other Hashes and Sets
+           (keys and elements may be user objects) */
+        uint32_t n = r_u32(r);
+        if (o->tt == MRB_TT_HASH) mrb_hash_clear(mrb, v);
+        else {
+          /* Set#clear of the built-in class, whatever a subclass did */
+          struct RClass *keep = o->c;
+          o->c = mrb_class_get(mrb, "Set");
+          mrb_funcall_argv(mrb, v, mrb_intern_lit(mrb, "clear"), 0, NULL);
+          o->c = keep;
+        }
         for (uint32_t i = 0; i < n && !r->failed; i++) {
           mrb_value k = r_value(r);
-          mrb_value val = r_value(r);
+          mrb_value val = o->tt == MRB_TT_HASH ? r_value(r) : mrb_nil_value();
           if (r->nhent == r->caphent) {
             r->caphent = r->caphent ? r->caphent * 2 : 64;
             r->hents = (hent*)ck_realloc(r->G, r->hents, sizeof(hent) * r->caphent);
           }
           r->hents[r->nhent].h = o; r->hents[r->nhent].k = k; r->hents[r->nhent].v = val;
-          r->hents[r->nhent].set = 0;
+          r->hents[r->nhent].set = o->tt == MRB_TT_SET;
           r->nhent++;
         }
         if (frozen) add_frozen_later(r, o);
       }
-      else rfail(r, "contents for a permanent object that is not a String, Array or Hash");
+      break;
+    }
+    case GP_CLASS_SET: {
+      struct RBasic *o = r_obj(r);
+      struct RBasic *c = r_obj(r);
+      if (r->failed) break;
+      if (!o || !c || c->tt != MRB_TT_SCLASS) { rfail(r, "a singleton class that is not one"); break; }
+      o->c = (struct RClass*)c;
+      mrb_field_write_barrier(mrb, o, c);
       break;
     }
     case GP_CLASS_FLAGS: {

@@ -49,6 +49,11 @@ typedef struct {
   pmap taskid;
   pmap queues;      /* Task::Queue struct -> index + 1 in qobj (only when a Task waits on one) */
   struct RBasic **qobj; uint32_t nqobj, qobj_cap;
+  /* Strings of the baseline without a name, carried as new ones (in the
+     order met), how many of them their holders were looked for, and the
+     permanent objects whose contents are written (change kind 10) */
+  pmap leafset; struct RBasic **leaves; uint32_t nleaves, capleaves, leaves_done;
+  pmap emitted;
   /* the file names the line numbers (DBG0) name, in their order (for SRC0) */
   mrb_sym *dfiles; uint32_t ndfiles;
   int failed;
@@ -341,7 +346,20 @@ w_object(dumper *d, uint32_t id)
     gb_str(mrb, b, pname, strlen(pname));
     return;
   }
-  if (checkpoint_perm_heap_p(d->P, o)) {
+  if (checkpoint_perm_heap_p(d->P, o) && o->tt == MRB_TT_STRING) {
+    /* a String of the baseline without a name (an element or a value of a
+       named object, doc/format_v1.md 8.2): carried as a new String, and
+       every named object that holds it is written again with this one */
+    if (!pm_get(&d->leafset, o, NULL)) {
+      pm_put(mrb, &d->leafset, o, 1);
+      if (d->nleaves == d->capleaves) {
+        d->capleaves = d->capleaves ? d->capleaves * 2 : 16;
+        d->leaves = (struct RBasic**)ck_realloc(d->G, d->leaves, sizeof(void*) * d->capleaves);
+      }
+      d->leaves[d->nleaves++] = o;
+    }
+  }
+  else if (checkpoint_perm_heap_p(d->P, o)) {
     if (o->tt == MRB_TT_CLASS || o->tt == MRB_TT_MODULE) {
       fail(d, "object made by mrb_open has no name: %s %s (%s)",
            type_name(o->tt), class_name(mrb, (struct RClass*)o), reach);
@@ -824,6 +842,124 @@ diff_iv(dumper *d, struct RBasic *o, giv_entry *old, int nold, giv_entry *cur, i
   }
 }
 
+/* the whole contents of a permanent object the program changed (change
+   kind 10), as in its object record: the reader puts them into its own */
+static void
+w_content(dumper *d, struct RBasic *o, const char *name)
+{
+  mrb_state *mrb = d->mrb;
+  char label[200];
+  mrb_value v = mrb_obj_value(o);
+  snprintf(label, sizeof(label), "permanent %s", name);
+  if (o->tt == MRB_TT_CDATA) {
+    /* what its registered dump writes now is not what it wrote at the
+       baseline: the reader has no way to put new contents into its own C
+       data (only to make a new one) */
+    struct RData *rd = (struct RData*)o;
+    fail(d, "permanent %s (C data %s of class %s) was changed inside; C data made before the baseline "
+         "is not carried", name, rd->type ? rd->type->struct_name : "?", class_name(mrb, o->c));
+    return;
+  }
+  if (pm_get(&d->emitted, o, NULL)) return;
+  uint8_t kind;
+  switch (o->tt) {
+  case MRB_TT_STRING: kind = GK_STRING; break;
+  case MRB_TT_ARRAY: kind = GK_ARRAY; break;
+  case MRB_TT_HASH: kind = GK_HASH; break;
+  case MRB_TT_STRUCT: kind = GK_STRUCT; break;
+  case MRB_TT_SET: kind = GK_SET; break;
+  case MRB_TT_ENV: kind = GK_ENV; break;
+  case MRB_TT_EXCEPTION: kind = GK_EXCEPTION; break;
+  default: return;
+  }
+  if (o->tt == MRB_TT_ENV && MRB_ENV_ONSTACK_P((struct REnv*)o)) {
+    fail(d, "permanent %s (an env) is on a stack", name);
+    return;
+  }
+  mrb_value elems = mrb_nil_value();
+  if (o->tt == MRB_TT_SET) {
+    elems = checkpoint_set_elements(mrb, o);
+    if (!mrb_array_p(elems)) {
+      fail(d, "permanent %s (a Set) is not initialized any more", name);
+      return;
+    }
+  }
+  pm_put(mrb, &d->emitted, o, 1);
+  gb_u8(mrb, &d->patches, GP_CONTENT_SET);
+  gb_u32(mrb, &d->patches, obj_ref(d, o, label));
+  gb_u8(mrb, &d->patches, (uint8_t)o->frozen);
+  gb_u8(mrb, &d->patches, kind);
+  switch (o->tt) {
+  case MRB_TT_STRING:
+    gb_str(mrb, &d->patches, RSTRING_PTR(v), (size_t)RSTRING_LEN(v));
+    break;
+  case MRB_TT_ARRAY: case MRB_TT_STRUCT: case MRB_TT_SET: {
+    mrb_value a = o->tt == MRB_TT_SET ? elems : v;
+    gb_u32(mrb, &d->patches, (uint32_t)RARRAY_LEN(a));
+    for (mrb_int i = 0; i < RARRAY_LEN(a); i++) {
+      snprintf(label, sizeof(label), "element %d of permanent %s", (int)i, name);
+      w_value(d, &d->patches, RARRAY_PTR(a)[i], label);
+    }
+    break;
+  }
+  case MRB_TT_HASH: {
+    gb_u32(mrb, &d->patches, (uint32_t)mrb_hash_size(mrb, v));
+    hash_w hw = { d, &d->patches, 0, 0 };
+    mrb_hash_foreach(mrb, mrb_hash_ptr(v), hash_w_cb, &hw);
+    break;
+  }
+  case MRB_TT_ENV: {
+    struct REnv *e = (struct REnv*)o;
+    gb_u32(mrb, &d->patches, (uint32_t)MRB_ENV_LEN(e));
+    for (mrb_int i = 0; i < MRB_ENV_LEN(e); i++) {
+      snprintf(label, sizeof(label), "slot %d of permanent %s", (int)i, name);
+      w_value(d, &d->patches, e->stack[i], label);
+    }
+    break;
+  }
+  case MRB_TT_EXCEPTION: {
+    struct RException *e = (struct RException*)o;
+    snprintf(label, sizeof(label), "message of permanent %s", name);
+    w_value(d, &d->patches, e->mesg ? mrb_obj_value(e->mesg) : mrb_nil_value(), label);
+    break;
+  }
+  default:
+    break;
+  }
+  d->npatch++;
+}
+
+typedef struct { const pmap *changed; int found; } keys_ctx;
+
+static int
+keys_changed_cb(mrb_state *mrb, mrb_value k, mrb_value v, void *p)
+{
+  keys_ctx *x = (keys_ctx*)p;
+  (void)mrb; (void)v;
+  if (!mrb_immediate_p(k) && pm_get(x->changed, mrb_ptr(k), NULL)) {
+    x->found = 1;
+    return 1;   /* stop */
+  }
+  return 0;
+}
+
+/* whether a key of the Hash (an element of the Set) is in changed */
+static int
+keys_changed(mrb_state *mrb, struct RBasic *o, const pmap *changed)
+{
+  if (changed->n == 0) return 0;
+  keys_ctx x = { changed, 0 };
+  if (o->tt == MRB_TT_HASH) {
+    mrb_hash_foreach(mrb, (struct RHash*)o, keys_changed_cb, &x);
+    return x.found;
+  }
+  mrb_value a = checkpoint_set_elements(mrb, o);
+  for (mrb_int i = 0; mrb_array_p(a) && i < RARRAY_LEN(a) && !x.found; i++) {
+    keys_changed_cb(mrb, RARRAY_PTR(a)[i], mrb_nil_value(), &x);
+  }
+  return x.found;
+}
+
 static void
 w_patches(dumper *d)
 {
@@ -836,6 +972,16 @@ w_patches(dumper *d)
   mrb_sym gc_root = mrb_intern_lit(mrb, "_gc_root_");
   mrb_value roots = mrb_gv_get(mrb, gc_root);
   uint32_t nsnaps = checkpoint_perm_nsnaps(P);
+  /* the permanent objects whose contents changed: a permanent Hash or Set
+     that has one of them as a key or element is written again too, so the
+     reader rebuilds it with the keys' new hash values (Hash#rehash) */
+  pmap changed;
+  pm_init(&changed);
+  for (uint32_t k = 0; k < nsnaps; k++) {
+    struct RBasic *o = checkpoint_perm_snap_obj(P, k);
+    if (!o || !(checkpoint_snap_kind(o->tt) & SNAP_DIGEST) || o->tt == MRB_TT_ISTRUCT) continue;
+    if (checkpoint_content_digest(mrb, o) != checkpoint_perm_snap_digest(P, k)) pm_put(mrb, &changed, o, 1);
+  }
   for (uint32_t k = 0; k < nsnaps && !d->failed; k++) {
     struct RBasic *o = checkpoint_perm_snap_obj(P, k);
     if (!o) continue;   /* a table name this state lacks */
@@ -890,7 +1036,7 @@ w_patches(dumper *d)
       if (o->tt == MRB_TT_ICLASS) break;
     }
       /* fall through */
-    case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: {
+    case MRB_TT_OBJECT: {
       giv_entry *iv, *siv; int n;
       checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
       int sniv = checkpoint_perm_snap_iv(mrb, P, k, &siv);
@@ -914,34 +1060,14 @@ w_patches(dumper *d)
         d->npatch++;
       }
       break;
-    case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_HASH:
-      if (checkpoint_content_digest(mrb, o) != checkpoint_perm_snap_digest(P, k)) {
-        /* the whole contents again, as in the object record (and frozen) */
-        mrb_value v = mrb_obj_value(o);
-        gb_u8(mrb, &d->patches, GP_CONTENT_SET);
-        gb_u32(mrb, &d->patches, obj_ref(d, o, label));
-        gb_u8(mrb, &d->patches, (uint8_t)o->frozen);
-        gb_u8(mrb, &d->patches, o->tt == MRB_TT_STRING ? GK_STRING : o->tt == MRB_TT_ARRAY ? GK_ARRAY : GK_HASH);
-        if (o->tt == MRB_TT_STRING) {
-          gb_str(mrb, &d->patches, RSTRING_PTR(v), (size_t)RSTRING_LEN(v));
-        }
-        else if (o->tt == MRB_TT_ARRAY) {
-          gb_u32(mrb, &d->patches, (uint32_t)RARRAY_LEN(v));
-          for (mrb_int i = 0; i < RARRAY_LEN(v); i++) {
-            snprintf(label, sizeof(label), "element %d of permanent %s", (int)i, name);
-            w_value(d, &d->patches, RARRAY_PTR(v)[i], label);
-          }
-        }
-        else {
-          gb_u32(mrb, &d->patches, (uint32_t)mrb_hash_size(mrb, v));
-          hash_w hw = { d, &d->patches, 0, 0 };
-          mrb_hash_foreach(mrb, mrb_hash_ptr(v), hash_w_cb, &hw);
-        }
-        d->npatch++;
+    case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_HASH: case MRB_TT_STRUCT:
+    case MRB_TT_SET: case MRB_TT_ENV: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
+      if (pm_get(&changed, o, NULL) ||
+          ((o->tt == MRB_TT_HASH || o->tt == MRB_TT_SET) && keys_changed(mrb, o, &changed))) {
+        w_content(d, o, name);
       }
-      if (o->tt != MRB_TT_HASH) break;
-      {
-        /* a Hash's ivars (its default value) */
+      if (checkpoint_snap_kind(o->tt) & SNAP_IVARS) {
+        /* its ivars (a Hash's default value too) */
         giv_entry *iv, *siv; int n;
         checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
         int sniv = checkpoint_perm_snap_iv(mrb, P, k, &siv);
@@ -953,6 +1079,35 @@ w_patches(dumper *d)
     default:
       break;
     }
+  }
+
+  pm_free(mrb, &changed);
+
+  /* a permanent object (not a class) that got a singleton class since the
+     baseline (def obj.m, obj.extend M): its new class, in the order of the
+     names. A singleton class it had at the baseline is a named one, and its
+     changes are those of a class above. */
+  uint32_t nnames = checkpoint_perm_count(P);
+  for (uint32_t i = 0; i < nnames && !d->failed; i++) {
+    int is_func = 0;
+    if (!checkpoint_perm_name_at(P, i, &is_func) || is_func) continue;
+    struct RBasic *o = (struct RBasic*)checkpoint_perm_ref(P, i + 1);
+    if (!o) continue;
+    switch (o->tt) {
+    case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS: case MRB_TT_ICLASS:
+    case MRB_TT_ENV:   /* (its class field is the target class) */
+      continue;
+    default:
+      break;
+    }
+    if (!o->c || o->c->tt != MRB_TT_SCLASS || checkpoint_perm_heap_p(P, o->c)) continue;
+    const char *name = checkpoint_perm_name_of(P, o);
+    snprintf(label, sizeof(label), "permanent %s", name ? name : "?");
+    gb_u8(mrb, &d->patches, GP_CLASS_SET);
+    gb_u32(mrb, &d->patches, obj_ref(d, o, label));
+    snprintf(label, sizeof(label), "singleton class of permanent %s", name ? name : "?");
+    gb_u32(mrb, &d->patches, obj_ref(d, o->c, label));
+    d->npatch++;
   }
 
   /* globals */
@@ -979,6 +1134,90 @@ w_patches(dumper *d)
     d->npatch++;
   }
   checkpoint_collect_free(mrb, gv);
+}
+
+/* ---- Strings without a name ----
+
+   A String the baseline holds only as an element or a value of a named
+   object has no name (checkpoint_perm.c, "named by a path"). When the
+   image refers to one, it is carried as a new String; then every named
+   Array, Struct, Set or Hash that holds it now is written again (change
+   kind 10) with that new String, so the reader's holders and the image's
+   other references are the same object, as they are here. The holder it
+   had at the baseline holds it now, or has changed and is written anyway. */
+
+typedef struct { const pmap *set; int found; } holds_ctx;
+
+static int
+holds_cb(mrb_state *mrb, mrb_value k, mrb_value v, void *p)
+{
+  holds_ctx *x = (holds_ctx*)p;
+  (void)mrb;
+  if ((!mrb_immediate_p(k) && pm_get(x->set, mrb_ptr(k), NULL)) ||
+      (!mrb_immediate_p(v) && pm_get(x->set, mrb_ptr(v), NULL))) {
+    x->found = 1;
+    return 1;
+  }
+  return 0;
+}
+
+static int
+holds_leaf(mrb_state *mrb, struct RBasic *o, const pmap *set)
+{
+  holds_ctx x = { set, 0 };
+  mrb_value a;
+  switch (o->tt) {
+  case MRB_TT_HASH:
+    mrb_hash_foreach(mrb, (struct RHash*)o, holds_cb, &x);
+    return x.found;
+  case MRB_TT_SET:
+    a = checkpoint_set_elements(mrb, o);
+    if (!mrb_array_p(a)) return 0;
+    break;
+  case MRB_TT_ARRAY: case MRB_TT_STRUCT:
+    a = mrb_obj_value(o);
+    break;
+  default:
+    return 0;
+  }
+  for (mrb_int i = 0; i < RARRAY_LEN(a); i++) {
+    mrb_value e = RARRAY_PTR(a)[i];
+    if (!mrb_immediate_p(e) && pm_get(set, mrb_ptr(e), NULL)) return 1;
+  }
+  return 0;
+}
+
+/* the holders of the Strings carried since the last call, written again;
+   1 if any was (it may refer to more objects) */
+static int
+rewrite_holders(dumper *d)
+{
+  mrb_state *mrb = d->mrb;
+  checkpoint_perm *P = d->P;
+  if (d->leaves_done == d->nleaves) return 0;
+  pmap fresh;
+  pm_init(&fresh);
+  for (uint32_t i = d->leaves_done; i < d->nleaves; i++) pm_put(mrb, &fresh, d->leaves[i], 1);
+  d->leaves_done = d->nleaves;
+  mrb_value roots = mrb_gv_get(mrb, mrb_intern_lit(mrb, "_gc_root_"));
+  int any = 0;
+  uint32_t n = checkpoint_perm_count(P);
+  int ai = mrb_gc_arena_save(mrb);
+  for (uint32_t i = 0; i < n && !d->failed; i++) {
+    int is_func = 0;
+    const char *name = checkpoint_perm_name_at(P, i, &is_func);
+    if (!name || is_func) continue;
+    struct RBasic *o = (struct RBasic*)checkpoint_perm_ref(P, i + 1);
+    if (!o || pm_get(&d->emitted, o, NULL)) continue;
+    if (checkpoint_perm_internal_p(P, o) || (!mrb_immediate_p(roots) && o == mrb_basic_ptr(roots))) continue;
+    if (!holds_leaf(mrb, o, &fresh)) continue;
+    w_content(d, o, name);
+    any = 1;
+    mrb_gc_arena_restore(mrb, ai);
+  }
+  mrb_gc_arena_restore(mrb, ai);
+  pm_free(mrb, &fresh);
+  return any;
 }
 
 /* ---- the VM: execution contexts ---- */
@@ -1404,12 +1643,15 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
 
   w_sched(&d);
   if (!d.failed) w_patches(&d);
-  /* contexts and objects reach each other: go on until both are written */
+  /* contexts and objects reach each other: go on until both are written,
+     and the named holders of the Strings without a name met on the way */
   uint32_t nc = 1, no = 1;
-  while (!d.failed && (nc <= d.nctx || no <= d.nobj)) {
-    if (nc <= d.nctx) w_context(&d, nc++);
-    else w_object(&d, no++);
-  }
+  do {
+    while (!d.failed && (nc <= d.nctx || no <= d.nobj)) {
+      if (nc <= d.nctx) w_context(&d, nc++);
+      else w_object(&d, no++);
+    }
+  } while (!d.failed && rewrite_holders(&d));
   for (uint32_t i = 1; i <= d.nirep && !d.failed; i++) w_irep(&d, i);
   /* the method names the program's code calls (SND0), by reference into the
      symbol table: before the table is written */
@@ -1527,6 +1769,7 @@ checkpoint_dump(mrb_state *mrb, gbuf *out, char *err, size_t errlen)
   gb_free(mrb, &d.patches); gb_free(mrb, &d.ctxs); gb_free(mrb, &d.sched);
   pm_free(mrb, &d.symid); pm_free(mrb, &d.irepid); pm_free(mrb, &d.objid);
   pm_free(mrb, &d.body); pm_free(mrb, &d.ctxid); pm_free(mrb, &d.taskid); pm_free(mrb, &d.queues);
+  pm_free(mrb, &d.leafset); pm_free(mrb, &d.emitted); ck_free(d.G, d.leaves);
   for (uint32_t i = 0; i < d.nobj; i++) ck_free(d.G, d.olabel[i]);
   ck_free(d.G, d.oq); ck_free(d.G, d.olabel); ck_free(d.G, d.iq);
   ck_free(d.G, d.cq); ck_free(d.G, d.tq); ck_free(d.G, d.qobj);

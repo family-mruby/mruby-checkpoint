@@ -16,9 +16,16 @@
 **   V:<name>@<ivar>    an object held in a class's ivar or constant
 **   G:$<name>          an object held in a global variable
 **   X:nomem_err ...    preallocated objects of mrb_state
+**   <name>/<step>      an object without a name of its own, reached from a
+**                      named one: /3 (element), /{"en"} /{:sym} /{7} (the
+**                      value of that key), /k{"en"} (the key itself), /v#2
+**                      /k#2 (pair 2, other keys), /@<ivar>, /mesg, /begin,
+**                      /end, /env
 **
 ** Names are given in a fixed order (sorted by symbol name), so the same
 ** build gives the same names in every process and on every pointer width.
+** The objects reached from named ones are named last, breadth first (see
+** "named by a path" below), so they never take a name another rule gives.
 */
 
 #include <stdlib.h>
@@ -28,6 +35,7 @@
 #include <mruby/string.h>
 #include <mruby/array.h>
 #include <mruby/hash.h>
+#include <mruby/range.h>
 #include <mruby/variable.h>
 #include <mruby/irep.h>
 #include <mruby/gc.h>
@@ -195,6 +203,13 @@ val_bits(uint64_t h, mrb_value v)
   }
   case MRB_TT_SYMBOL:
     return fnv_u64(h, (uint64_t)mrb_symbol(v));
+  case MRB_TT_STRING:
+    /* a String held is part of its holder's contents: a String reached
+       only as an element or a value has no name and no snapshot of its own
+       (see "named by a path"), so a change in it shows here */
+    h = fnv_u64(h, (uint64_t)(uintptr_t)mrb_ptr(v));
+    h = fnv_bytes(h, RSTRING_PTR(v), RSTRING_LEN(v));
+    return fnv_u64(h, ((uint64_t)RSTRING_LEN(v) << 1) | mrb_frozen_p(mrb_basic_ptr(v)));
   default:
     return fnv_u64(h, (uint64_t)(uintptr_t)mrb_ptr(v));
   }
@@ -230,11 +245,97 @@ checkpoint_content_digest(mrb_state *mrb, struct RBasic *obj)
   case MRB_TT_ISTRUCT:
     h = fnv_bytes(h, mrb_istruct_ptr(v), ISTRUCT_DATA_SIZE);
     break;
+  case MRB_TT_STRUCT:   /* the members are an Array's body (mruby-struct) */
+    h = fnv_u64(h, RARRAY_LEN(v));
+    for (mrb_int i = 0; i < RARRAY_LEN(v); i++) h = val_bits(h, RARRAY_PTR(v)[i]);
+    break;
+  case MRB_TT_SET: {
+    mrb_value a = checkpoint_set_elements(mrb, obj);
+    if (!mrb_array_p(a)) { h = fnv_u64(h, UINT64_MAX); break; }
+    h = fnv_u64(h, RARRAY_LEN(a));
+    for (mrb_int i = 0; i < RARRAY_LEN(a); i++) {
+      mrb_value e = RARRAY_PTR(a)[i];
+      h = val_bits(h, e);
+      /* an element other than a String gets no name (a Set's order may
+         follow addresses: "named by a path"): its own contents count here,
+         so a change in it is seen (and refused, as it cannot be named) */
+      switch (mrb_type(e)) {
+      case MRB_TT_ARRAY: case MRB_TT_HASH: case MRB_TT_STRUCT: case MRB_TT_OBJECT: {
+        h = fnv_u64(h, checkpoint_content_digest(mrb, mrb_basic_ptr(e)));
+        giv_entry *iv; int n;
+        checkpoint_collect_iv(mrb, e, &iv, &n);
+        for (int j = 0; j < n; j++) { h = fnv_u64(h, (uint64_t)iv[j].sym); h = val_bits(h, iv[j].val); }
+        checkpoint_collect_free(mrb, iv);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    break;
+  }
+  case MRB_TT_ENV: {
+    struct REnv *e = (struct REnv*)obj;
+    if (MRB_ENV_ONSTACK_P(e)) { h = fnv_u64(h, UINT64_MAX); break; }
+    h = fnv_u64(h, MRB_ENV_LEN(e));
+    for (mrb_int i = 0; i < MRB_ENV_LEN(e); i++) h = val_bits(h, e->stack[i]);
+    break;
+  }
+  case MRB_TT_EXCEPTION: {
+    struct RException *e = (struct RException*)obj;
+    h = val_bits(h, e->mesg ? mrb_obj_value(e->mesg) : mrb_nil_value());
+    break;
+  }
+  case MRB_TT_CDATA: {
+    /* the bytes its registered dump writes (none registered: nothing) */
+    checkpoint_state *g = checkpoint_get(mrb);
+    struct RData *rd = (struct RData*)obj;
+    for (int i = 0; g && rd->type && i < g->ndata; i++) {
+      if (g->data[i].type != rd->type || !g->data[i].dump) continue;
+      gbuf b;
+      gb_init(&b);
+      int rc = g->data[i].dump(mrb, v, &b);
+      h = fnv_u64(h, (uint64_t)rc);
+      if (rc == 0) h = fnv_bytes(h, b.p, b.len);
+      gb_free(mrb, &b);
+      break;
+    }
+    break;
+  }
   default:
     break;
   }
   h = fnv_u64(h, obj->frozen);
   return h;
+}
+
+/* a Set's elements (Set#to_a), or nil while it is not initialized
+   (Set.allocate): RSet embeds a khash whose first field is its table
+   (mruby-set/src/set.c, mruby/khash.h), NULL until Set#initialize ran */
+mrb_value
+checkpoint_set_elements(mrb_state *mrb, struct RBasic *o)
+{
+  struct { MRB_OBJECT_HEADER; void *data; } *rs = (void*)o;
+  if (rs->data == NULL) return mrb_nil_value();
+  return mrb_funcall_argv(mrb, mrb_obj_value(o), mrb_intern_lit(mrb, "to_a"), 0, NULL);
+}
+
+/* what a snapshot of an object of this type holds: SNAP_DIGEST its contents
+   (checkpoint_content_digest), SNAP_IVARS its ivars (classes have their own
+   kind of snapshot) */
+int
+checkpoint_snap_kind(enum mrb_vtype tt)
+{
+  switch (tt) {
+  case MRB_TT_OBJECT: return SNAP_IVARS;
+  case MRB_TT_CDATA: case MRB_TT_EXCEPTION: case MRB_TT_HASH:
+  case MRB_TT_STRUCT: case MRB_TT_SET:
+    return SNAP_DIGEST | SNAP_IVARS;
+  case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_ENV:
+    return SNAP_DIGEST;
+  default:
+    return 0;
+  }
 }
 
 /* ---- irep content hash ---- */
@@ -337,6 +438,13 @@ typedef struct {
   char why[200];
   uint32_t *name2snap;                  /* T name -> its snapshot + 1 */
   struct RBasic **xobj; uint32_t nxobj, capxobj;   /* snapshots of the state's own */
+  /* the named objects whose contents are named by a path at the end, in
+     the order named (name_reached), and two whose contents are not the
+     program's: the hidden Array that keeps the baseline alive, the C side's
+     GC roots */
+  struct { struct RBasic *o; char *name; } *q; uint32_t nq, capq;
+  const void *noseed[2];
+  pmap leaves;                /* Strings seen once as an element or a value */
   uint32_t ndiff;                       /* table snapshots this state sees otherwise */
 } pbuild;
 
@@ -511,6 +619,7 @@ tsnap(pbuild *B, struct RBasic *o)
   pm_get(&B->obj2name, o, &idx);
   uint32_t k1 = (idx >= 1 && idx <= T->nnames) ? B->name2snap[idx - 1] : 0;
   if (k1 == 0) {
+    if (o->tt == MRB_TT_STRING && o->frozen) return;   /* (as snap_object) */
     if (B->nxobj == B->capxobj) {
       B->capxobj = B->capxobj ? B->capxobj * 2 : 16;
       B->xobj = (struct RBasic**)mrb_realloc(B->mrb, B->xobj, sizeof(void*) * B->capxobj);
@@ -520,20 +629,45 @@ tsnap(pbuild *B, struct RBasic *o)
   }
   const mrb_checkpoint_table_snap *ts = &T->snaps[k1 - 1];
   if (ts->tt != (uint8_t)o->tt) return;   /* (reconcile_snaps keeps its own) */
-  switch (o->tt) {
-  case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_HASH:
-    if (ts->slot < T->nslots) {
-      B->P->slotv[ts->slot] = checkpoint_content_digest(B->mrb, o);
-      B->P->slott[ts->slot] = 0;
-    }
-    break;
-  default:
-    break;
+  if ((checkpoint_snap_kind(o->tt) & SNAP_DIGEST) && ts->slot < T->nslots) {
+    B->P->slotv[ts->slot] = checkpoint_content_digest(B->mrb, o);
+    B->P->slott[ts->slot] = 0;
   }
 }
 
 static void snap_object(pbuild *B, struct RBasic *o);
 static void visit_class(pbuild *B, struct RClass *c, const char *path);
+
+/* a name made of two parts (mrb_malloc'ed; no length limit) */
+static char*
+cat_name(pbuild *B, const char *a, const char *b)
+{
+  size_t la = strlen(a), lb = strlen(b);
+  char *s = (char*)mrb_malloc(B->mrb, la + lb + 1);
+  memcpy(s, a, la);
+  memcpy(s + la, b, lb + 1);
+  return s;
+}
+
+/* a named object whose contents get names by a path (name_reached) */
+static void
+seed(pbuild *B, struct RBasic *o, const char *name)
+{
+  switch (o->tt) {
+  case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS: case MRB_TT_ICLASS:
+    return;   /* their contents are named by visit_class */
+  default:
+    break;
+  }
+  if ((const void*)o == B->noseed[0] || (const void*)o == B->noseed[1]) return;
+  if (B->nq == B->capq) {
+    B->capq = B->capq ? B->capq * 2 : 256;
+    B->q = mrb_realloc(B->mrb, B->q, sizeof(B->q[0]) * B->capq);
+  }
+  B->q[B->nq].o = o;
+  B->q[B->nq].name = cat_name(B, name, "");
+  B->nq++;
+}
 
 static void
 name_value(pbuild *B, mrb_value v, const char *name)
@@ -543,47 +677,36 @@ name_value(pbuild *B, mrb_value v, const char *name)
   if (named_obj(B, o)) return;
   add_name(B, name, o, 0);
   snap_object(B, o);
+  seed(B, o, name);
   /* an object's own singleton class (ENV's methods live there) */
   if (o->tt != MRB_TT_CLASS && o->tt != MRB_TT_MODULE && o->tt != MRB_TT_SCLASS &&
       o->c && o->c->tt == MRB_TT_SCLASS) {
-    char buf[512];
-    snprintf(buf, sizeof(buf), "S:%s", name);
-    visit_class(B, o->c, buf);
+    char *sname = cat_name(B, "S:", name);
+    visit_class(B, o->c, sname);
+    mrb_free(B->mrb, sname);
   }
 }
 
+/* what a permanent object (not a class) looks like at the baseline, to see
+   later what the program changed in it (the dump's change records). A
+   frozen String cannot change and has none. (A frozen Array or Hash has
+   one: the Strings it holds can change, and they show in its digest.) */
 static void
 snap_object(pbuild *B, struct RBasic *o)
 {
-  uint32_t s;
+  int kind = checkpoint_snap_kind(o->tt);
+  if (!kind) return;
+  /* the hidden Array that keeps the baseline, the C side's GC roots: not
+     the program's (the dump does not look at them) */
+  if ((const void*)o == B->noseed[0] || (const void*)o == B->noseed[1]) return;
   if (B->T) {
-    switch (o->tt) {
-    case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
-    case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_HASH:
-      tsnap(B, o);
-      break;
-    default:
-      break;
-    }
+    tsnap(B, o);
     return;
   }
-  switch (o->tt) {
-  case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
-    s = new_snap(B, o);
-    snap_iv(B, s, o);
-    break;
-  case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT:
-    s = new_snap(B, o);
-    B->snaps[s].u.digest = checkpoint_content_digest(B->mrb, o);
-    break;
-  case MRB_TT_HASH:
-    s = new_snap(B, o);
-    B->snaps[s].u.digest = checkpoint_content_digest(B->mrb, o);
-    snap_iv(B, s, o);
-    break;
-  default:
-    break;
-  }
+  if (o->tt == MRB_TT_STRING && o->frozen) return;
+  uint32_t s = new_snap(B, o);
+  if (kind & SNAP_DIGEST) B->snaps[s].u.digest = checkpoint_content_digest(B->mrb, o);
+  if (kind & SNAP_IVARS) snap_iv(B, s, o);
 }
 
 static int
@@ -650,6 +773,8 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
       if (MRB_PROC_ENV_P(p) && !named_obj(B, p->e.env)) {
         snprintf(buf, sizeof(buf), "E:%s#%s", path, mname);
         add_name(B, buf, p->e.env, 0);
+        snap_object(B, (struct RBasic*)p->e.env);
+        seed(B, (struct RBasic*)p->e.env, buf);
       }
     }
     mrb_free(B->mrb, mt);
@@ -740,6 +865,259 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
     mrb_free(B->mrb, iv);
   }
   if (civ) checkpoint_collect_free(mrb, civ);
+}
+
+/* ---- named by a path ----
+
+   An object the walk above does not name (an element of a constant's
+   Array, the value of a key in a Hash held by a constant, an ivar of such
+   an object, ...) is permanent too, and the program can change it
+   (FmrbI18n::STRINGS["en"][:word] = "..."). It is named by how it is
+   reached from the first named object that holds it: the parent's name, a
+   slash and the step. The named objects are taken in the order they were
+   named, and what they hold is named breadth first, after every other
+   name, so these names never take one of the names above.
+
+     /<i>          element i of an Array, member i of a Struct, slot i of an Env
+     /{"en"}       the value of the String key "en" of a Hash (bytes outside
+                   printable ASCII, the space and the characters " \ / { }
+                   are written \hh, two hex digits)
+     /{:name}      ... of the Symbol key :name, /{12} of the Integer key 12
+     /{#i}         ... of pair i, when the key is something else
+     /k{"en"}, /k{#i}   the key itself
+     /{"en"}, /{:name}, /{12}   an element of a Set (other elements are not
+                   named: a Set's order depends on the elements' hash values,
+                   which may be addresses)
+     /@<ivar>      an ivar (/@@count for @count, /@ifnone for a Hash's default)
+     /mesg         an Exception's message
+     /begin, /end  a Range's ends
+     /env          a Proc's env
+
+   A class or module reached this way is visited like one reached by a
+   constant, with the path as its name. Each named object has a snapshot,
+   so the dump sees what the program changed in it.
+
+   Except a String held only as an element of an Array, Struct or Set, or
+   as a key or a value of a Hash (GM_NAMES = ["Piano", ...]): it gets no
+   name and no snapshot, which would cost a pointer, an index and a slot in
+   every state. Its holder's digest covers its bytes (val_bits), and the
+   dump carries such a String as a new one and writes its holders again
+   with it (checkpoint_dump.c, "Strings without a name"). A String reached
+   a second time (held in two places) is named, so the two stay one. */
+
+typedef struct { char *p; size_t len, cap; mrb_state *mrb; } nbuf;
+
+static void
+nb_add(nbuf *b, const char *s, size_t n)
+{
+  if (b->len + n + 1 > b->cap) {
+    size_t c = b->cap ? b->cap : 64;
+    while (c < b->len + n + 1) c *= 2;
+    b->p = (char*)mrb_realloc(b->mrb, b->p, c);
+    b->cap = c;
+  }
+  memcpy(b->p + b->len, s, n);
+  b->len += n;
+  b->p[b->len] = 0;
+}
+
+static void
+nb_esc(nbuf *b, const char *s, size_t n)
+{
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c > 0x20 && c < 0x7f && c != '"' && c != '\\' && c != '/' && c != '{' && c != '}') {
+      nb_add(b, (const char*)&c, 1);
+    }
+    else {
+      char hx[4];
+      snprintf(hx, sizeof(hx), "\\%02x", c);
+      nb_add(b, hx, 3);
+    }
+  }
+}
+
+/* the step of a key: 1, or 0 when the key is not a String, Symbol or Integer */
+static int
+nb_key(mrb_state *mrb, nbuf *b, mrb_value k)
+{
+  char tmp[32];
+  switch (mrb_type(k)) {
+  case MRB_TT_STRING:
+    nb_add(b, "{\"", 2);
+    nb_esc(b, RSTRING_PTR(k), (size_t)RSTRING_LEN(k));
+    nb_add(b, "\"}", 2);
+    return 1;
+  case MRB_TT_SYMBOL: {
+    mrb_int len;
+    const char *n = mrb_sym_name_len(mrb, mrb_symbol(k), &len);
+    nb_add(b, "{:", 2);
+    nb_esc(b, n, (size_t)len);
+    nb_add(b, "}", 1);
+    return 1;
+  }
+  case MRB_TT_INTEGER:
+    snprintf(tmp, sizeof(tmp), "{%lld}", (long long)mrb_integer(k));
+    nb_add(b, tmp, strlen(tmp));
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* a value held by the named object parent: its name is parent/step. A
+   String held as an element or a value (leaf) and found only there is left
+   without a name (see above); one found a second time is named then. */
+static void
+reach(pbuild *B, mrb_value v, const char *parent, const char *step, size_t slen, int leaf)
+{
+  if (mrb_immediate_p(v)) return;
+  struct RBasic *o = mrb_basic_ptr(v);
+  if (o->tt == MRB_TT_FREE || o->tt == MRB_TT_SCLASS || o->tt == MRB_TT_ICLASS) return;
+  if (named_obj(B, o)) return;
+  if (o->tt == MRB_TT_STRING && !(o->c && o->c->tt == MRB_TT_SCLASS)) {
+    int seen = pm_get(&B->leaves, o, NULL);
+    if (leaf && !seen) {
+      pm_put(B->mrb, &B->leaves, o, 1);
+      return;
+    }
+  }
+  nbuf n = { NULL, 0, 0, B->mrb };
+  nb_add(&n, parent, strlen(parent));
+  nb_add(&n, "/", 1);
+  nb_add(&n, step, slen);
+  if (o->tt == MRB_TT_CLASS || o->tt == MRB_TT_MODULE) {
+    /* (visit_class makes names of its methods in buffers of 512 bytes) */
+    if (n.len < 400) visit_class(B, (struct RClass*)o, n.p);
+  }
+  else {
+    name_value(B, v, n.p);
+  }
+  mrb_free(B->mrb, n.p);
+}
+
+static void
+reach_i(pbuild *B, mrb_value v, const char *parent, mrb_int i, int leaf)
+{
+  char step[32];
+  snprintf(step, sizeof(step), "%d", (int)i);
+  reach(B, v, parent, step, strlen(step), leaf);
+}
+
+typedef struct { pbuild *B; const char *parent; uint32_t i; } reach_hash_ctx;
+
+static int
+reach_hash_cb(mrb_state *mrb, mrb_value k, mrb_value v, void *p)
+{
+  reach_hash_ctx *x = (reach_hash_ctx*)p;
+  nbuf st = { NULL, 0, 0, mrb };
+  if (!nb_key(mrb, &st, k)) {
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "{#%u}", (unsigned)x->i);
+    nb_add(&st, tmp, strlen(tmp));
+  }
+  reach(x->B, v, x->parent, st.p, st.len, 1);
+  {
+    /* the key: k + the same step */
+    nbuf ks = { NULL, 0, 0, mrb };
+    nb_add(&ks, "k", 1);
+    nb_add(&ks, st.p, st.len);
+    reach(x->B, k, x->parent, ks.p, ks.len, 1);
+    mrb_free(mrb, ks.p);
+  }
+  mrb_free(mrb, st.p);
+  x->i++;
+  return 0;
+}
+
+static void
+reach_contents(pbuild *B, struct RBasic *o, const char *name)
+{
+  mrb_state *mrb = B->mrb;
+  mrb_value v = mrb_obj_value(o);
+  int ai = mrb_gc_arena_save(mrb);
+  switch (o->tt) {
+  case MRB_TT_ARRAY: case MRB_TT_STRUCT:
+    for (mrb_int i = 0; i < RARRAY_LEN(v); i++) reach_i(B, RARRAY_PTR(v)[i], name, i, 1);
+    break;
+  case MRB_TT_HASH: {
+    reach_hash_ctx x = { B, name, 0 };
+    mrb_hash_foreach(mrb, mrb_hash_ptr(v), reach_hash_cb, &x);
+    break;
+  }
+  case MRB_TT_SET: {
+    mrb_value a = checkpoint_set_elements(mrb, o);
+    for (mrb_int i = 0; mrb_array_p(a) && i < RARRAY_LEN(a); i++) {
+      nbuf st = { NULL, 0, 0, mrb };
+      if (nb_key(mrb, &st, RARRAY_PTR(a)[i])) reach(B, RARRAY_PTR(a)[i], name, st.p, st.len, 1);
+      mrb_free(mrb, st.p);
+    }
+    break;
+  }
+  case MRB_TT_RANGE:
+    if (o->flags & 1) {   /* RANGE_INITIALIZED_FLAG (range.c) */
+      reach(B, RANGE_BEG((struct RRange*)o), name, "begin", 5, 0);
+      reach(B, RANGE_END((struct RRange*)o), name, "end", 3, 0);
+    }
+    break;
+  case MRB_TT_EXCEPTION: {
+    struct RException *e = (struct RException*)o;
+    if (e->mesg) reach(B, mrb_obj_value(e->mesg), name, "mesg", 4, 0);
+    break;
+  }
+  case MRB_TT_PROC: {
+    struct RProc *p = (struct RProc*)o;
+    if (MRB_PROC_ENV_P(p) && p->e.env) reach(B, mrb_obj_value(p->e.env), name, "env", 3, 0);
+    break;
+  }
+  case MRB_TT_ENV: {
+    struct REnv *e = (struct REnv*)o;
+    if (!MRB_ENV_ONSTACK_P(e)) {
+      for (mrb_int i = 0; i < MRB_ENV_LEN(e); i++) reach_i(B, e->stack[i], name, i, 0);
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  if (o->tt == MRB_TT_OBJECT || (checkpoint_snap_kind(o->tt) & SNAP_IVARS)) {
+    giv_entry *iv; int n;
+    checkpoint_collect_iv(mrb, v, &iv, &n);
+    if (n > 0) {
+      giv_entry *s = (giv_entry*)mrb_malloc(mrb, sizeof(giv_entry) * n);
+      memcpy(s, iv, sizeof(giv_entry) * n);
+      sort_by_name(mrb, s, (size_t)n, sizeof(giv_entry), cmp_iv);
+      for (int i = 0; i < n; i++) {
+        mrb_int len;
+        const char *ivn = mrb_sym_name_len(mrb, s[i].sym, &len);
+        nbuf st = { NULL, 0, 0, mrb };
+        nb_add(&st, "@", 1);
+        nb_esc(&st, ivn, (size_t)len);
+        reach(B, s[i].val, name, st.p, st.len, 0);
+        mrb_free(mrb, st.p);
+      }
+      mrb_free(mrb, s);
+    }
+    checkpoint_collect_free(mrb, iv);
+  }
+  mrb_gc_arena_restore(mrb, ai);
+}
+
+/* names for what the named objects hold, breadth first (the queue grows
+   while it is read: each object named here is taken in turn) */
+static void
+name_reached(pbuild *B)
+{
+  pm_init(&B->leaves);
+  for (uint32_t i = 0; i < B->nq; i++) {
+    struct RBasic *o = B->q[i].o;
+    char *name = B->q[i].name;
+    reach_contents(B, o, name);
+  }
+  for (uint32_t i = 0; i < B->nq; i++) mrb_free(B->mrb, B->q[i].name);
+  mrb_free(B->mrb, B->q);
+  B->q = NULL; B->nq = B->capq = 0;
+  pm_free(B->mrb, &B->leaves);
 }
 
 /* ---- the flat tables that stay ---- */
@@ -1036,9 +1414,7 @@ snap_matches(pbuild *B, uint32_t k, struct RBasic *o)
     checkpoint_collect_free(mrb, mt);
     if (!ok) return 0;
   }
-  switch (o->tt) {
-  case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS:
-  case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA: case MRB_TT_HASH: {
+  if (cls || (checkpoint_snap_kind(o->tt) & SNAP_IVARS)) {
     giv_entry *iv; int n;
     checkpoint_collect_iv(mrb, mrb_obj_value(o), &iv, &n);
     sort_by_name(mrb, iv, (size_t)n, sizeof(giv_entry), cmp_iv);
@@ -1066,9 +1442,7 @@ snap_matches(pbuild *B, uint32_t k, struct RBasic *o)
     checkpoint_collect_free(mrb, iv);
     return ok;
   }
-  default:
-    return ts->nmt == 0 && ts->niv == 0;
-  }
+  return ts->nmt == 0 && ts->niv == 0;
 }
 
 /* a snapshot of o as without a table (in B->snaps, B->mt, B->iv): one the
@@ -1104,18 +1478,12 @@ own_snap(pbuild *B, struct RBasic *o)
   case MRB_TT_ICLASS:
     B->snaps[s].u.super = ((struct RClass*)o)->super;
     break;
-  case MRB_TT_OBJECT: case MRB_TT_EXCEPTION: case MRB_TT_CDATA:
-    snap_iv(B, s, o);
+  default: {
+    int kind = checkpoint_snap_kind(o->tt);
+    if (kind & SNAP_DIGEST) B->snaps[s].u.digest = checkpoint_content_digest(mrb, o);
+    if (kind & SNAP_IVARS) snap_iv(B, s, o);
     break;
-  case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT:
-    B->snaps[s].u.digest = checkpoint_content_digest(mrb, o);
-    break;
-  case MRB_TT_HASH:
-    B->snaps[s].u.digest = checkpoint_content_digest(mrb, o);
-    snap_iv(B, s, o);
-    break;
-  default:
-    break;
+  }
   }
   return s;
 }
@@ -1284,10 +1652,16 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
       mrb_free(mrb, h.a);
       mrb_obj_ptr(keep)->c = NULL;   /* hidden from ObjectSpace, like the GC roots */
       P->keep = mrb_ary_ptr(keep);
+      B->noseed[0] = P->keep;
       struct RClass *ck = mrb_module_get(mrb, "Checkpoint");
       mrb_obj_iv_set(mrb, (struct RObject*)ck, mrb_intern_lit(mrb, "__checkpoint_keep__"), keep);
       mrb_gc_arena_restore(mrb, ai);
     }
+  }
+
+  {
+    mrb_value roots = mrb_gv_get(mrb, mrb_intern_lit(mrb, "_gc_root_"));
+    if (!mrb_immediate_p(roots)) B->noseed[1] = mrb_ptr(roots);
   }
 
   /* C functions the core puts in closures */
@@ -1299,12 +1673,21 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
 
   add_name(B, "T", mrb->top_self, 0);
   snap_object(B, (struct RBasic*)mrb->top_self);
+  seed(B, (struct RBasic*)mrb->top_self, "T");
   visit_class(B, mrb->object_class, "Object");
   if (mrb->top_self->c && mrb->top_self->c->tt == MRB_TT_SCLASS) {
     visit_class(B, mrb->top_self->c, "S:T");
   }
-  if (mrb->nomem_err) add_name(B, "X:nomem_err", mrb->nomem_err, 0);
-  if (mrb->stack_err) add_name(B, "X:stack_err", mrb->stack_err, 0);
+  if (mrb->nomem_err) {
+    add_name(B, "X:nomem_err", mrb->nomem_err, 0);
+    snap_object(B, (struct RBasic*)mrb->nomem_err);
+    seed(B, (struct RBasic*)mrb->nomem_err, "X:nomem_err");
+  }
+  if (mrb->stack_err) {
+    add_name(B, "X:stack_err", mrb->stack_err, 0);
+    snap_object(B, (struct RBasic*)mrb->stack_err);
+    seed(B, (struct RBasic*)mrb->stack_err, "X:stack_err");
+  }
 
   /* globals */
   giv_entry *gv; int ngv;
@@ -1340,6 +1723,9 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
       add_name(B, g->fnames[i], (const void*)g->funcs[i], 1);
     }
   }
+
+  /* last, what the named objects hold */
+  name_reached(B);
 
   checkpoint_gc_settings(mrb, &P->gc);
   if (T) {
@@ -1504,6 +1890,12 @@ checkpoint_perm_heap_p(checkpoint_perm *P, const void *obj)
     else hi = mid;
   }
   return 0;
+}
+
+int
+checkpoint_perm_internal_p(checkpoint_perm *P, const void *obj)
+{
+  return obj && obj == (const void*)P->keep;
 }
 
 const void*
@@ -1859,10 +2251,8 @@ table_from_perm(mrb_state *mrb, checkpoint_state *G, checkpoint_perm *P, tbuild 
       ts->cflags = s->obj->tt == MRB_TT_ICLASS ? 0 : s->cflags;
       break;
     }
-    case MRB_TT_STRING: case MRB_TT_ARRAY: case MRB_TT_ISTRUCT: case MRB_TT_HASH:
-      ts->slot = nslots++;
-      break;
     default:
+      if (checkpoint_snap_kind(s->obj->tt) & SNAP_DIGEST) ts->slot = nslots++;
       break;
     }
     /* methods, in name order */
@@ -1965,14 +2355,20 @@ em(emitter *e, const char *fmt, ...)
   e->len += (size_t)n;
 }
 
-/* a C string literal of s (one name), with its NUL */
+/* a C string literal of s (one name), with its NUL; a long name in pieces
+   (names made of paths have no length limit) */
 static void
 em_cstr(emitter *e, const char *s)
 {
-  char out[600];
+  char out[300];
   size_t o = 0;
   out[o++] = '"';
-  for (const unsigned char *p = (const unsigned char*)s; *p && o < sizeof(out) - 8; p++) {
+  for (const unsigned char *p = (const unsigned char*)s; *p; p++) {
+    if (o > sizeof(out) - 16) {
+      out[o] = 0;
+      em(e, "%s", out);
+      o = 0;
+    }
     if (*p == '"' || *p == '\\' || *p == '?') { out[o++] = '\\'; out[o++] = (char)*p; }
     else if (*p < 0x20 || *p >= 0x7f) o += (size_t)snprintf(out + o, sizeof(out) - o, "\\%03o", *p);
     else out[o++] = (char)*p;

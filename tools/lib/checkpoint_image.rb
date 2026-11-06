@@ -136,7 +136,7 @@ module CheckpointImage
   CHANGE_KINDS = {
     1 => 'define_method', 2 => 'remove_method', 3 => 'set_variable', 4 => 'remove_variable',
     5 => 'set_superclass', 6 => 'set_global', 7 => 'remove_global', 8 => 'random_state',
-    9 => 'class_flags', 10 => 'contents',
+    9 => 'class_flags', 10 => 'contents', 11 => 'set_class',
   }.freeze
   NONE32 = 0xffffffff
   CLASSY = %w(permanent class module singleton_class iclass origin).freeze
@@ -632,8 +632,13 @@ module CheckpointImage
         when 3 then c['type'] = 'string'; c.merge!(CheckpointImage.json_bytes(r.str))
         when 4 then c['type'] = 'array'; c['items'] = Array.new(count('items')) { value }
         when 5 then c['type'] = 'hash'; c['pairs'] = Array.new(count('pairs')) { [value, value] }
+        when 7 then c['type'] = 'exception'; c['message'] = value
+        when 13 then c['type'] = 'env'; c['items'] = Array.new(count('slots')) { value }
+        when 17 then c['type'] = 'struct'; c['items'] = Array.new(count('members')) { value }
+        when 18 then c['type'] = 'set'; c['items'] = Array.new(count('elements')) { value }
         else r.fail!("unknown contents type #{t}", at)
         end
+      when 11 then c['target'] = obj_ref(%w(permanent)); c['class'] = obj_ref(CLASSY)
       end
       c
     end

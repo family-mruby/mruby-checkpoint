@@ -1,0 +1,34 @@
+changed
+{"en" => {hello: "hello", bye: "bye"}, "ja" => {hello: "konnichiwa!"}}
+[[1, 2, 3], ["az", "b"]]
+{n: 5}
+[1, 2]
+"e"
+[#<struct CkBase::Pair a=2, b="xy">]
+[Set[1, 2, 3]]
+["boom?", "bong"]
+"none!"
+["aa".."z"]
+3
+"array key"
+5
+nil
+["const", ["inner", "more"]]
+[["shared", "twice", "piano"], [["shared", "twice", "piano"]]]
+"bye"
+"tagged"
+[["g", "h"]]
+true
+true
+true
+true
+true
+["piano", "organ!", "harp"]
+true
+true
+true
+["piano", "organ!", "harps"]
+again
+{hello: "hello", bye: "bye", later: "later"}
+[1, 2, 3, 4]
+true

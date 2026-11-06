@@ -1,0 +1,3 @@
+refused: permanent V:CkBase@BOXES/0 (C data Checkpoint::Box of class Checkpoint::Box) was changed inside; C data made before the baseline is not carried
+refused: object made by mrb_open has no name: Array of class Array (element 0 of permanent V:CkBase@OBJSET)
+now 1 Set[[1, 2]]

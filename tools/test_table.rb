@@ -80,13 +80,14 @@ Dir.mktmpdir('checkpoint-table') do |dir|
   i = img.index("TBL0\x00\x00\x00\x0c".b)
   check('TBL0 found', i)
   if i
-    # another version of the table rules: refused, with the reason
+    # another version of the table rules (the next one): refused, with the reason
+    other = img[i + 8, 4].unpack1('N') + 1
     bad = img.dup
-    bad[i + 8, 4] = [2].pack('N')
+    bad[i + 8, 4] = [other].pack('N')
     File.binwrite(File.join(dir, 'bad.ckpt'), bad)
     TABLED.merge('plain' => PLAIN['64']).each do |arch, bin|
       _, err, st = Open3.capture3(bin, 'resume', 'bad.ckpt', chdir: dir)
-      check("table rules v2 refused (#{arch})", st.exitstatus == 3 && err.include?('table version 2'), err)
+      check("table rules v#{other} refused (#{arch})", st.exitstatus == 3 && err.include?("table version #{other}"), err)
     end
     # the same image as it was: resumed
     out, err, st = Open3.capture3(TABLED['32'], 'resume', 'c.ckpt', chdir: dir)

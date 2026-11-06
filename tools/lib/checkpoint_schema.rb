@@ -66,11 +66,11 @@ module CheckpointSchema
            'iseq?' => String }
 
   CHANGE = { 'kind' => [:enum, 'define_method', 'remove_method', 'set_variable', 'remove_variable', 'set_superclass',
-                        'set_global', 'remove_global', 'random_state', 'class_flags', 'contents'],
+                        'set_global', 'remove_global', 'random_state', 'class_flags', 'contents', 'set_class'],
              'kind_code' => Integer, 'target?' => REF, 'method?' => METHOD, 'name?' => [:opt, String], 'value?' => :value,
              'superclass?' => REF, 'state?' => String, 'seed?' => Integer, 'prepended?' => :bool, 'frozen?' => :bool,
-             'type?' => [:enum, 'string', 'array', 'hash'], 'text?' => String, 'hex?' => String,
-             'items?' => ARR.(:value), 'pairs?' => ARR.([:tuple, :value, :value]) }
+             'type?' => [:enum, 'string', 'array', 'hash', 'exception', 'env', 'struct', 'set'], 'text?' => String, 'hex?' => String,
+             'items?' => ARR.(:value), 'pairs?' => ARR.([:tuple, :value, :value]), 'message?' => :value, 'class?' => REF }
 
   VAR = { 'name' => [:opt, String], 'value' => :value }
   FRAME = { 'index' => Integer, 'kind' => [:enum, 'ruby', 'cfunc'], 'method' => [:opt, String], 'proc' => REF,

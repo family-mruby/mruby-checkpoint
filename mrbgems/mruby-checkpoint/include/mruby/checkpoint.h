@@ -81,13 +81,15 @@ MRB_API void mrb_checkpoint_each_name(mrb_state *mrb, mrb_checkpoint_name_fn fn,
    wrong object, whatever table is given; the table only saves memory where
    it matches (mrb_checkpoint_table_status says how well). */
 
-#define MRB_CHECKPOINT_TABLE_VERSION 1   /* the layout below and the naming rules */
+#define MRB_CHECKPOINT_TABLE_VERSION 2   /* the layout below and the naming rules (2: objects
+                                            reached from named ones are named by a path) */
 
 typedef struct mrb_checkpoint_table_snap {
   uint32_t name;      /* the object: index of its name */
   uint32_t super;     /* class-likes: name index + 1 of its superclass (0: none) */
   uint32_t mt, iv;    /* the first of its entries in mt[] / iv[] */
-  uint32_t slot;      /* String/Array/Hash/inline struct: the slot of its contents digest */
+  uint32_t slot;      /* String, Array, Hash, Struct, Set, Env, Exception, C data, inline
+                         struct: the slot of its contents digest */
   uint16_t nmt, niv;
   uint8_t tt;         /* its mrb_vtype */
   uint8_t cflags;     /* classes: 1 if prepended */

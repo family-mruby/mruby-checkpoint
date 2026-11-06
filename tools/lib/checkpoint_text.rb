@@ -160,10 +160,13 @@ module CheckpointText
     when 'remove_global' then "remove global #{c['name']}"
     when 'random_state' then "Random #{tn} state=#{c['state']} seed=#{c['seed']}"
     when 'class_flags' then "class flags #{tn} prepended=#{c['prepended'] ? 1 : 0}"
+    when 'set_class' then "singleton class #{tn} = #{ref(c['class'])}"
     when 'contents'
       body = case c['type']
              when 'string' then bytes(c)
-             when 'array' then "[#{c['items'].map { |x| v(doc, x, 30) }.join(', ')}]"
+             when 'array', 'struct', 'env' then "#{c['type'] == 'array' ? '' : c['type'] + ' '}[#{c['items'].map { |x| v(doc, x, 30) }.join(', ')}]"
+             when 'set' then "set {#{c['items'].map { |x| v(doc, x, 30) }.join(', ')}}"
+             when 'exception' then "message=#{v(doc, c['message'], 30)}"
              else "{#{c['pairs'].map { |k, x| "#{v(doc, k, 30)}=>#{v(doc, x, 30)}" }.join(', ')}}"
              end
       "contents #{tn} frozen=#{c['frozen'] ? 1 : 0} #{body}"
