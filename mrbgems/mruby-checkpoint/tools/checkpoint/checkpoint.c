@@ -33,7 +33,9 @@
 **       file (SYMBOL checkpoint_driver_table) and gives it to every state;
 **       with CHECKPOINT_TABLE_STATUS set in the environment it prints
 **       whether the baseline uses it. CHECKPOINT_BASELINE_SIZE prints what
-**       the baseline keeps, by part.
+**       the baseline keeps, by part, and what the state's allocator gave
+**       for it: kept, and more at the highest point while it was made (the
+**       state then counts its allocations, as a pool would).
 **
 ** Every state loads a small library before its baseline (the module CkBase,
 ** fixture_rb below), as an embedder's mrblib would; CHECKPOINT_NO_FIXTURE
@@ -284,10 +286,45 @@ load_fixture(mrb_state *mrb)
   }
 }
 
+/* CHECKPOINT_BASELINE_SIZE: the allocations counted (a size in front of
+   each block, 16 bytes to keep the alignment), the bytes in use and their
+   highest point. mruby allocates through mrb_basic_alloc_func, defined
+   here in place of libmruby's; without the variable it is plain realloc. */
+static int counting = -1;
+static size_t count_used, count_peak;
+
+typedef struct { size_t n; char pad_[16 - sizeof(size_t)]; } count_head;
+
+void*
+mrb_basic_alloc_func(void *p, size_t size)
+{
+  if (counting < 0) counting = getenv("CHECKPOINT_BASELINE_SIZE") != NULL;
+  if (!counting) {
+    if (size == 0) { free(p); return NULL; }
+    return realloc(p, size);
+  }
+  count_head *h = p ? (count_head*)p - 1 : NULL;
+  if (h) count_used -= h->n;
+  if (size == 0) {
+    free(h);
+    return NULL;
+  }
+  count_head *q = (count_head*)realloc(h, sizeof(count_head) + size);
+  if (!q) {
+    if (h) count_used += h->n;
+    return NULL;
+  }
+  q->n = size;
+  count_used += size;
+  if (count_used > count_peak) count_peak = count_used;
+  return q + 1;
+}
+
 /* what both sides have before the baseline */
 static mrb_state*
 open_state(void)
 {
+  int measure = getenv("CHECKPOINT_BASELINE_SIZE") != NULL;
   mrb_state *mrb = mrb_open();
   if (!mrb) { fprintf(stderr, "checkpoint: mrb_open failed\n"); exit(2); }
   mrb_define_global_const(mrb, "ARGV", mrb_ary_new(mrb));
@@ -296,10 +333,14 @@ open_state(void)
 #ifdef CHECKPOINT_DRIVER_TABLE
   mrb_checkpoint_set_table(mrb, &checkpoint_driver_table);
 #endif
+  size_t used0 = count_used;
+  count_peak = count_used;
   mrb_checkpoint_baseline(mrb);
-  if (getenv("CHECKPOINT_BASELINE_SIZE")) {
+  if (measure) {
     size_t total = mrb_checkpoint_baseline_size(mrb, print_size, NULL);
     fprintf(stderr, "checkpoint: baseline %zu bytes\n", total);
+    fprintf(stderr, "checkpoint: baseline took %zu bytes of the allocator (%zu more while it was made)\n",
+            count_used - used0, count_peak - count_used);
   }
   if (getenv("CHECKPOINT_TABLE_STATUS")) {
     const char *why = mrb_checkpoint_table_status(mrb);

@@ -185,11 +185,6 @@ typedef struct {
   uint8_t cflags;         /* classes only: 1 if MRB_FL_CLASS_IS_PREPENDED */
 } gsnap;
 
-typedef struct {
-  const mrb_irep *irep;
-  uint64_t hash;
-} girep_perm;
-
 /* the settings of the GC a program can change (GC.disable, GC.interval_ratio=, ...) */
 typedef struct {
   uint8_t flags;              /* bit0 disabled, bit1 generational, bit2 auto_step, bit3 sched_driven */
@@ -206,8 +201,14 @@ void checkpoint_gc_settings(mrb_state *mrb, gc_settings *out);
    snapshots' methods and ivars and the irep hashes are the table's: the
    state keeps the address of each name (ptrs), the objects alive at the
    baseline (keepp), the mrblib ireps (irepp) and the values that are not
-   names (slots). names, name_off, is_func, ireps, snaps, mt and iv are then
-   NULL. */
+   names (slots). names, name_off, is_func, ireph, snaps, mt and iv are then
+   NULL (or hold only what the state has of its own).
+
+   The sorted indices (obj_idx, func_idx, irep_idx) have 16-bit entries
+   while every name and irep index fits (idx16), 32-bit ones otherwise. */
+typedef struct { uint32_t k, s; } gsnap_over;   /* table snapshot k: snaps[s] */
+typedef struct { uint32_t i; uint64_t h; } girep_own;   /* irep i: its hash */
+
 typedef struct checkpoint_perm {
   /* named permanent things (objects and C functions), in the order named */
   char *names;            /* the names, NUL-terminated, one after another */
@@ -215,16 +216,25 @@ typedef struct checkpoint_perm {
   const void **ptrs;      /* the object or C function of name i */
   uint8_t *is_func;       /* bit i: name i is a C function */
   uint32_t n;
-  uint32_t *obj_idx; uint32_t nobj;     /* names of objects, sorted by pointer */
-  uint32_t *func_idx; uint32_t nfunc;   /* names of C functions, sorted by pointer */
+  void *obj_idx; uint32_t nobj;     /* names of objects, sorted by pointer */
+  void *func_idx; uint32_t nfunc;   /* names of C functions, sorted by pointer */
+  uint8_t idx16;                    /* the three indices have 16-bit entries */
 
   struct RArray *keep;    /* every heap object alive at baseline, sorted by address */
   /* ... or, with a table (and for writing one), the same as addresses, kept
      from the GC by checkpoint_perm_mark */
   uintptr_t *keepp; uint32_t nkeep;
 
-  girep_perm *ireps; uint32_t nireps;   /* in the order found */
-  uint32_t *irep_idx;                   /* the same, sorted by irep pointer */
+  /* the mrblib ireps, in the order found, and the same sorted by pointer */
+  const mrb_irep **irepp; uint32_t nireps;
+  void *irep_idx;
+  /* their content hashes: without a table each one's (ireph); with a table
+     T->irep_hash[i], or, when this state's ireps differ from the table's,
+     the table's entry of the same hash (irep_tix, 0xffff: none) and the
+     hashes of the rest (irep_own, sorted by irep) */
+  uint64_t *ireph;
+  uint16_t *irep_tix;
+  girep_own *irep_own; uint32_t nirep_own;
 
   gsnap *snaps; uint32_t nsnaps;
   gsnap_mt *mt; uint32_t nmt;           /* the snapshots' methods */
@@ -239,11 +249,9 @@ typedef struct checkpoint_perm {
      are kept as without a table, in snaps / mt / iv. */
   const mrb_checkpoint_table *T;
   uint32_t nx;                          /* names of the state's own */
-  uint32_t *snap_over;                  /* table snapshot k: index + 1 into snaps, or 0 */
+  gsnap_over *snap_over; uint32_t nsnap_over;   /* table snapshots seen otherwise, by k */
   uint32_t *xsnap; uint32_t nxsnap;     /* the snapshots of the state's own names */
   uint32_t nmissing;                    /* table names this state lacks */
-  const mrb_irep **irepp;               /* the ireps of T->irep_hash, in its order
-                                           (NULL: they differ; ireps above then) */
   uint64_t *slotv; uint8_t *slott;      /* the values of the slots (T->nslots) */
   /* the digest of the names and snapshots (TBL0), once computed */
   uint64_t stamp; int stamp_set;

@@ -85,10 +85,22 @@ mt_cb(mrb_state *mrb, mrb_sym sym, mrb_method_t m, void *p)
   return 0;
 }
 
+static int
+mt_count_cb(mrb_state *mrb, mrb_sym sym, mrb_method_t m, void *p)
+{
+  (void)mrb; (void)sym; (void)m;
+  (*(int*)p)++;
+  return 0;
+}
+
 void
 checkpoint_collect_mt(mrb_state *mrb, struct RClass *c, gmt_entry **out, int *n)
 {
+  /* counted first: the array is taken at its size (a class of the baseline
+     can have a few hundred methods) */
   mt_acc acc = { NULL, 0, 0, mrb };
+  mrb_mt_foreach(mrb, c, mt_count_cb, &acc.cap);
+  if (acc.cap > 0) acc.a = (gmt_entry*)coll_realloc(mrb, NULL, sizeof(gmt_entry) * acc.cap);
   mrb_mt_foreach(mrb, c, mt_cb, &acc);
   *out = acc.a; *n = acc.n;
 }
@@ -132,8 +144,10 @@ checkpoint_collect_gv(mrb_state *mrb, giv_entry **out, int *n)
 /* ---- sorting by symbol name ----
 
    qsort() has no argument for the comparison's context, and the names belong
-   to one mrb_state: a merge sort that carries it (no static, so that several
-   states can build their baselines at once, on several threads). Stable. */
+   to one mrb_state: a heap sort that carries it (no static, so that several
+   states can build their baselines at once, on several threads) and needs
+   no room beside the array. Not stable: the names sorted are distinct (the
+   methods or ivars of one object, the globals). */
 
 typedef int (*sym_cmp_fn)(mrb_state *mrb, const void *a, const void *b);
 
@@ -153,25 +167,37 @@ sym_cmp(mrb_state *mrb, mrb_sym a, mrb_sym b)
 }
 
 static void
+swap_bytes(uint8_t *x, uint8_t *y, size_t size)
+{
+  while (size-- > 0) {
+    uint8_t t = *x;
+    *x++ = *y;
+    *y++ = t;
+  }
+}
+
+static void
 sort_by_name(mrb_state *mrb, void *base, size_t n, size_t size, sym_cmp_fn cmp)
 {
   if (n < 2) return;
   uint8_t *a = (uint8_t*)base;
-  uint8_t *tmp = (uint8_t*)coll_realloc(mrb, NULL, n * size);
-  for (size_t w = 1; w < n; w *= 2) {
-    for (size_t lo = 0; lo < n - w; lo += 2 * w) {
-      size_t mid = lo + w, hi = lo + 2 * w < n ? lo + 2 * w : n;
-      size_t i = lo, j = mid, k = 0;
-      while (i < mid && j < hi) {
-        if (cmp(mrb, a + j * size, a + i * size) < 0) { memcpy(tmp + k++ * size, a + j++ * size, size); }
-        else { memcpy(tmp + k++ * size, a + i++ * size, size); }
-      }
-      while (i < mid) memcpy(tmp + k++ * size, a + i++ * size, size);
-      while (j < hi) memcpy(tmp + k++ * size, a + j++ * size, size);
-      memcpy(a + lo * size, tmp, k * size);
+  for (size_t start = n / 2, end = n; end > 1;) {
+    size_t root;
+    if (start > 0) root = --start;
+    else {
+      end--;
+      swap_bytes(a, a + end * size, size);
+      root = 0;
+    }
+    for (;;) {
+      size_t c = 2 * root + 1;
+      if (c >= end) break;
+      if (c + 1 < end && cmp(mrb, a + c * size, a + (c + 1) * size) < 0) c++;
+      if (cmp(mrb, a + root * size, a + c * size) >= 0) break;
+      swap_bytes(a + root * size, a + c * size, size);
+      root = c;
     }
   }
-  checkpoint_collect_free(mrb, tmp);
 }
 
 static int
@@ -393,6 +419,15 @@ checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep)
    the tables are cut to the size they need (finish_perm): what stays is a
    few flat arrays, with no hash table and no spare room.
 
+   What the building needs for a while is kept small, since it comes on top
+   of what stays, in the same pool, when a VM opens (Family mruby's S3 has
+   500 KB for an app): the hash tables hold only the name's (irep's) index,
+   16 bits while it fits, and find the pointer through the table of names;
+   with a fixed table they are made at their size at once (the table says
+   how many names and ireps to expect); the names of the objects whose
+   contents are named last are their name indices, not copies; the sorted
+   indices are sorted in place.
+
    What stays (checkpoint_internal.h, struct checkpoint_perm):
      names     every name, NUL-terminated, one after another in the order
                given, and name_off[i] where name i starts (name_off[n] is
@@ -406,23 +441,40 @@ checkpoint_irep_hash(mrb_state *mrb, const mrb_irep *irep)
      keep      the hidden Array that keeps every object alive at the
                baseline, sorted by address: it is also the set of those
                objects (a binary search)
-     ireps, irep_idx
-               the mrblib ireps with their content hashes, in the order
+     irepp, ireph, irep_idx
+               the mrblib ireps and their content hashes, in the order
                found, and the same sorted by address
      snaps, mt, iv
                what each permanent object looked like; a snapshot's methods
                and ivars are ranges of the shared arrays mt and iv. A method
                refers to its Proc or C function by name index, not address. */
 
+/* a hash table of indices (index + 1; 0: empty) into a table of pointers
+   the caller keeps: the key of an entry is read from there (imap_key). The
+   entries are 16 bits while every index fits, open addressing, at most 3/4
+   full, any size (no power of two). */
+typedef struct {
+  void *s;
+  uint32_t cap, n;
+  uint8_t w16;
+  uint8_t kind;               /* IMAP_NAMES or IMAP_IREPS (imap_key) */
+} imap;
+enum { IMAP_NAMES = 0, IMAP_IREPS = 1 };
+
+/* a set of pointers, open addressing, at most 3/4 full */
+typedef struct { uintptr_t *k; uint32_t cap, n; } pset;
+
 typedef struct {
   mrb_state *mrb;
   /* names */
   char *blob; uint32_t blen, bcap;
   uint32_t *off; const void **ptrs; uint8_t *isf; uint32_t n, cap;
-  pmap obj2name, func2name;   /* pointer -> name index + 1 */
-  /* ireps */
-  girep_perm *ireps; uint32_t nireps, capireps;
-  pmap irep2idx;              /* irep pointer -> index + 1 */
+  imap names2;                /* pointer (and whether a C function) -> name index + 1 */
+  /* ireps (ireph: their hashes, without a table; with one, each is compared
+     with the table's as it is found) */
+  const mrb_irep **irepv; uint64_t *ireph; uint32_t nireps, capireps;
+  int irep_diff;              /* (with a table) they differ from the table's */
+  imap irep2idx;              /* irep pointer -> index + 1 */
   /* snapshots */
   gsnap *snaps; uint32_t nsnaps, capsnaps;
   gsnap_mt *mt; uint32_t nmt, capmt;
@@ -436,15 +488,16 @@ typedef struct {
   checkpoint_perm *P;
   int failed;
   char why[200];
-  uint32_t *name2snap;                  /* T name -> its snapshot + 1 */
+  uint32_t *name2snap;                  /* T name -> its snapshot + 1, when the table's
+                                           snapshots are not in name order (else a search) */
   struct RBasic **xobj; uint32_t nxobj, capxobj;   /* snapshots of the state's own */
   /* the named objects whose contents are named by a path at the end, in
      the order named (name_reached), and two whose contents are not the
      program's: the hidden Array that keeps the baseline alive, the C side's
      GC roots */
-  struct { struct RBasic *o; char *name; } *q; uint32_t nq, capq;
+  struct { struct RBasic *o; uint32_t name; } *q; uint32_t nq, capq;
   const void *noseed[2];
-  pmap leaves;                /* Strings seen once as an element or a value */
+  pset leaves;                /* Strings seen once as an element or a value */
   uint32_t ndiff;                       /* table snapshots this state sees otherwise */
 } pbuild;
 
@@ -483,7 +536,168 @@ grow(pbuild *B, void *p, uint32_t *cap, uint32_t need, size_t size, uint32_t fir
   return p;
 }
 
+/* ---- the hash tables of the building ---- */
+
+static uint32_t
+slot_of(uintptr_t k, uint32_t cap)
+{
+  uint64_t h = (uint64_t)k * 0x9e3779b97f4a7c15ULL;
+  return (uint32_t)(((h >> 32) * (uint64_t)cap) >> 32);
+}
+
+/* the pointer of name i (the table's, then the state's own) */
+static const void*
+b_ptr(pbuild *B, uint32_t i)
+{
+  if (B->T) {
+    if (i < B->T->nnames) return B->P->ptrs[i];
+    i -= B->T->nnames;
+  }
+  return B->ptrs[i];
+}
+
+static int
+b_isf(pbuild *B, uint32_t i)
+{
+  if (B->T) {
+    if (i < B->T->nnames) return tbit(B->T->is_func, i);
+    i -= B->T->nnames;
+  }
+  return B->isf[i];
+}
+
+static uintptr_t
+imap_key(pbuild *B, const imap *m, uint32_t i)
+{
+  return m->kind == IMAP_IREPS ? (uintptr_t)B->irepv[i] : (uintptr_t)b_ptr(B, i);
+}
+
+static uint32_t
+imap_at(const imap *m, uint32_t i)
+{
+  return m->w16 ? ((const uint16_t*)m->s)[i] : ((const uint32_t*)m->s)[i];
+}
+
+/* the entry (index + 1) of key k, or 0. For names, isf is whether a C
+   function is looked for (an object and a C function are named apart). */
+static uint32_t
+imap_get(pbuild *B, const imap *m, const void *k, int isf)
+{
+  if (m->cap == 0 || !k) return 0;
+  uint32_t i = slot_of((uintptr_t)k, m->cap);
+  for (;;) {
+    uint32_t v = imap_at(m, i);
+    if (v == 0) return 0;
+    if (imap_key(B, m, v - 1) == (uintptr_t)k && (m->kind == IMAP_IREPS || b_isf(B, v - 1) == isf)) return v;
+    if (++i == m->cap) i = 0;
+  }
+}
+
+/* into the empty slot of key k, or over the entry of the same key */
 static void
+imap_place(pbuild *B, imap *m, uint32_t v)
+{
+  uintptr_t k = imap_key(B, m, v - 1);
+  int isf = m->kind == IMAP_NAMES ? b_isf(B, v - 1) : 0;
+  uint32_t i = slot_of(k, m->cap);
+  for (;;) {
+    uint32_t w = imap_at(m, i);
+    if (w == 0) { m->n++; break; }
+    if (imap_key(B, m, w - 1) == k && (m->kind == IMAP_IREPS || b_isf(B, w - 1) == isf)) break;
+    if (++i == m->cap) i = 0;
+  }
+  if (m->w16) ((uint16_t*)m->s)[i] = (uint16_t)v;
+  else ((uint32_t*)m->s)[i] = v;
+}
+
+/* room for n entries, and for the index + 1 v */
+static void
+imap_reserve(pbuild *B, imap *m, uint32_t n, uint32_t v)
+{
+  int w16 = (m->cap == 0 || m->w16) && v <= UINT16_MAX;
+  if (n * 4 <= m->cap * 3 && w16 == m->w16 && m->cap > 0) return;
+  uint32_t cap = m->cap;
+  if (n * 4 > cap * 3) cap = n + n / 3 + 1;
+  if (m->cap > 0 && cap < m->cap * 2 && n * 4 > m->cap * 3) cap = m->cap * 2;   /* (growing) */
+  if (cap < 64) cap = 64;
+  imap old = *m;
+  m->w16 = (uint8_t)w16;
+  m->cap = cap;
+  m->n = 0;
+  m->s = mrb_calloc(B->mrb, cap, w16 ? 2 : 4);
+  for (uint32_t i = 0; i < old.cap; i++) {
+    uint32_t w = imap_at(&old, i);
+    if (w) imap_place(B, m, w);
+  }
+  mrb_free(B->mrb, old.s);
+}
+
+static void
+imap_put(pbuild *B, imap *m, uint32_t v)
+{
+  imap_reserve(B, m, m->n + 1, v);
+  imap_place(B, m, v);
+}
+
+static void
+imap_free(mrb_state *mrb, imap *m)
+{
+  mrb_free(mrb, m->s);
+  m->s = NULL; m->cap = m->n = 0;
+}
+
+static int
+pset_has(const pset *t, const void *p)
+{
+  if (t->cap == 0) return 0;
+  uintptr_t k = (uintptr_t)p;
+  for (uint32_t i = slot_of(k, t->cap); t->k[i]; i = i + 1 == t->cap ? 0 : i + 1) {
+    if (t->k[i] == k) return 1;
+  }
+  return 0;
+}
+
+static void
+pset_add(mrb_state *mrb, pset *t, const void *p)
+{
+  if ((t->n + 1) * 4 > t->cap * 3) {
+    pset old = *t;
+    t->cap = old.cap ? old.cap * 2 : 64;
+    t->n = 0;
+    t->k = (uintptr_t*)mrb_calloc(mrb, t->cap, sizeof(uintptr_t));
+    for (uint32_t i = 0; i < old.cap; i++) if (old.k[i]) pset_add(mrb, t, (const void*)old.k[i]);
+    mrb_free(mrb, old.k);
+  }
+  uintptr_t k = (uintptr_t)p;
+  uint32_t i = slot_of(k, t->cap);
+  while (t->k[i]) {
+    if (t->k[i] == k) return;
+    i = i + 1 == t->cap ? 0 : i + 1;
+  }
+  t->k[i] = k;
+  t->n++;
+}
+
+static void
+pset_free(mrb_state *mrb, pset *t)
+{
+  mrb_free(mrb, t->k);
+  t->k = NULL; t->cap = t->n = 0;
+}
+
+/* the name i as a string (the table's or the state's own) */
+static const char*
+b_name(pbuild *B, uint32_t i)
+{
+  if (B->T) {
+    if (i < B->T->nnames) return tname(B->T, i);
+    i -= B->T->nnames;
+  }
+  return B->blob + B->off[i];
+}
+
+/* gives ptr the name; returns its index */
+static uint32_t
 add_name(pbuild *B, const char *name, const void *ptr, int is_func)
 {
   if (B->T) {
@@ -502,13 +716,12 @@ add_name(pbuild *B, const char *name, const void *ptr, int is_func)
       uint32_t t = T->by_name[lo];
       if (tbit(T->is_func, t) == is_func && !B->P->ptrs[t]) {
         B->P->ptrs[t] = ptr;
-        pm_put(B->mrb, is_func ? &B->func2name : &B->obj2name, ptr, t + 1);
-        return;
+        imap_put(B, &B->names2, t + 1);
+        return t;
       }
     }
     mismatch(B, "%s%s is not in the table", is_func ? "C function " : "", name);
     uint32_t idx = T->nnames + B->n;   /* (B->n counts the state's own here) */
-    pm_put(B->mrb, is_func ? &B->func2name : &B->obj2name, ptr, idx + 1);
     /* kept as without a table (finish_table moves them after the table's) */
     uint32_t len = (uint32_t)strlen(name) + 1;
     if (B->blen + len > B->bcap) {
@@ -530,7 +743,8 @@ add_name(pbuild *B, const char *name, const void *ptr, int is_func)
     B->ptrs[B->n] = ptr;
     B->isf[B->n] = (uint8_t)is_func;
     B->n++;
-    return;
+    imap_put(B, &B->names2, idx + 1);
+    return idx;
   }
   uint32_t len = (uint32_t)strlen(name) + 1;
   if (B->blen + len > B->bcap) {
@@ -552,13 +766,28 @@ add_name(pbuild *B, const char *name, const void *ptr, int is_func)
   B->ptrs[B->n] = ptr;
   B->isf[B->n] = (uint8_t)is_func;
   B->n++;
-  pm_put(B->mrb, is_func ? &B->func2name : &B->obj2name, ptr, B->n);
+  imap_put(B, &B->names2, B->n);
+  return B->n - 1;
 }
 
 static int
 named_obj(pbuild *B, const void *p)
 {
-  return pm_get(&B->obj2name, p, NULL);
+  return imap_get(B, &B->names2, p, 0) != 0;
+}
+
+/* the name index + 1 of a C function, or 0 */
+static uint32_t
+named_func(pbuild *B, const void *f)
+{
+  return imap_get(B, &B->names2, f, 1);
+}
+
+/* the name index + 1 of an object or C function (a method's), or 0 */
+static uint32_t
+name_ref(pbuild *B, const void *p, int is_func)
+{
+  return imap_get(B, &B->names2, p, is_func);
 }
 
 static uint32_t
@@ -598,13 +827,43 @@ snap_iv(pbuild *B, uint32_t sidx, struct RBasic *o)
 static void
 add_irep(pbuild *B, const mrb_irep *irep)
 {
-  if (!irep || pm_get(&B->irep2idx, irep, NULL)) return;
-  B->ireps = (girep_perm*)grow(B, B->ireps, &B->capireps, B->nireps + 1, sizeof(girep_perm), 256);
-  B->ireps[B->nireps].irep = irep;
-  B->ireps[B->nireps].hash = checkpoint_irep_hash(B->mrb, irep);
+  if (!irep || imap_get(B, &B->irep2idx, irep, 0)) return;
+  uint32_t i = B->nireps;
+  if (i == B->capireps) {
+    uint32_t c = B->capireps ? B->capireps * 2 : 256;
+    B->irepv = (const mrb_irep**)mrb_realloc(B->mrb, (void*)B->irepv, sizeof(void*) * c);
+    if (!B->T) B->ireph = (uint64_t*)mrb_realloc(B->mrb, B->ireph, sizeof(uint64_t) * c);
+    B->capireps = c;
+  }
+  uint64_t h = checkpoint_irep_hash(B->mrb, irep);
+  if (B->T) {
+    /* (with a table: compared now, kept only when they differ, at the end) */
+    if (i >= B->T->nireps || B->T->irep_hash[i] != h) B->irep_diff = 1;
+  }
+  else {
+    B->ireph[i] = h;
+  }
+  B->irepv[i] = irep;
   B->nireps++;
-  pm_put(B->mrb, &B->irep2idx, irep, B->nireps);
-  for (int i = 0; irep->reps && i < irep->rlen; i++) add_irep(B, irep->reps[i]);
+  imap_put(B, &B->irep2idx, B->nireps);
+  for (int k = 0; irep->reps && k < irep->rlen; k++) add_irep(B, irep->reps[k]);
+}
+
+/* (with a table) the snapshot + 1 of table name i, or 0 */
+static uint32_t
+tsnap_of(pbuild *B, uint32_t i)
+{
+  const mrb_checkpoint_table *T = B->T;
+  if (B->name2snap) return B->name2snap[i];
+  uint32_t lo = 0, hi = T->nsnaps;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    uint32_t n = T->snaps[mid].name;
+    if (n == i) return mid + 1;
+    if (n < i) lo = mid + 1;
+    else hi = mid;
+  }
+  return 0;
 }
 
 /* with a table: the snapshot of a table name is the table's (compared at
@@ -615,9 +874,8 @@ static void
 tsnap(pbuild *B, struct RBasic *o)
 {
   const mrb_checkpoint_table *T = B->T;
-  uint32_t idx = 0;
-  pm_get(&B->obj2name, o, &idx);
-  uint32_t k1 = (idx >= 1 && idx <= T->nnames) ? B->name2snap[idx - 1] : 0;
+  uint32_t idx = imap_get(B, &B->names2, o, 0);
+  uint32_t k1 = (idx >= 1 && idx <= T->nnames) ? tsnap_of(B, idx - 1) : 0;
   if (k1 == 0) {
     if (o->tt == MRB_TT_STRING && o->frozen) return;   /* (as snap_object) */
     if (B->nxobj == B->capxobj) {
@@ -651,7 +909,7 @@ cat_name(pbuild *B, const char *a, const char *b)
 
 /* a named object whose contents get names by a path (name_reached) */
 static void
-seed(pbuild *B, struct RBasic *o, const char *name)
+seed(pbuild *B, struct RBasic *o, uint32_t name)
 {
   switch (o->tt) {
   case MRB_TT_CLASS: case MRB_TT_MODULE: case MRB_TT_SCLASS: case MRB_TT_ICLASS:
@@ -665,7 +923,7 @@ seed(pbuild *B, struct RBasic *o, const char *name)
     B->q = mrb_realloc(B->mrb, B->q, sizeof(B->q[0]) * B->capq);
   }
   B->q[B->nq].o = o;
-  B->q[B->nq].name = cat_name(B, name, "");
+  B->q[B->nq].name = name;
   B->nq++;
 }
 
@@ -675,9 +933,9 @@ name_value(pbuild *B, mrb_value v, const char *name)
   if (mrb_immediate_p(v)) return;
   struct RBasic *o = mrb_basic_ptr(v);
   if (named_obj(B, o)) return;
-  add_name(B, name, o, 0);
+  uint32_t idx = add_name(B, name, o, 0);
   snap_object(B, o);
-  seed(B, o, name);
+  seed(B, o, idx);
   /* an object's own singleton class (ENV's methods live there) */
   if (o->tt != MRB_TT_CLASS && o->tt != MRB_TT_MODULE && o->tt != MRB_TT_SCLASS &&
       o->c && o->c->tt == MRB_TT_SCLASS) {
@@ -716,6 +974,31 @@ const_name_p(mrb_state *mrb, mrb_sym sym)
   return s && s[0] >= 'A' && s[0] <= 'Z';
 }
 
+/* the path of class c into buf, as mrb_class_path gives it (0: none). A
+   class that has its name already gives it without a new String: the
+   building visits every class, and the garbage would take a heap page. */
+static int
+class_path_to(mrb_state *mrb, struct RClass *c, char *buf, size_t size)
+{
+  mrb_value path = mrb_obj_iv_get(mrb, (struct RObject*)c, mrb_intern_lit(mrb, "__classname__"));
+  if (mrb_symbol_p(path)) {
+    mrb_int len;
+    const char *s = mrb_sym_name_len(mrb, mrb_symbol(path), &len);
+    snprintf(buf, size, "%.*s", (int)len, s);
+    return 1;
+  }
+  if (mrb_string_p(path)) {
+    snprintf(buf, size, "%.*s", (int)RSTRING_LEN(path), RSTRING_PTR(path));
+    return 1;
+  }
+  int ai = mrb_gc_arena_save(mrb);
+  mrb_value cp = mrb_class_path(mrb, c);
+  int ok = mrb_string_p(cp);
+  if (ok) snprintf(buf, size, "%.*s", (int)RSTRING_LEN(cp), RSTRING_PTR(cp));
+  mrb_gc_arena_restore(mrb, ai);
+  return ok;
+}
+
 static void
 visit_class(pbuild *B, struct RClass *c, const char *path)
 {
@@ -743,14 +1026,19 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
 
   /* methods, in name order */
   if (nmt > 0) {
-    gmt_entry *mt = (gmt_entry*)mrb_malloc(B->mrb, sizeof(gmt_entry) * nmt);
-    memcpy(mt, mt0, sizeof(gmt_entry) * nmt);
+    /* (with a table the collected methods are sorted where they are: the
+       snapshot is the table's; without one it keeps their own order) */
+    gmt_entry *mt = mt0;
+    if (!B->T) {
+      mt = (gmt_entry*)mrb_malloc(B->mrb, sizeof(gmt_entry) * nmt);
+      memcpy(mt, mt0, sizeof(gmt_entry) * nmt);
+    }
     sort_by_name(mrb, mt, nmt, sizeof(gmt_entry), cmp_mt);
     for (int i = 0; i < nmt; i++) {
       const char *mname = mrb_sym_name(mrb, mt[i].sym);
       if (mt[i].ptr == NULL) continue; /* undef */
       if (mt[i].flags & MRB_METHOD_FUNC_FL) {
-        if (!pm_get(&B->func2name, mt[i].ptr, NULL)) {
+        if (!named_func(B, mt[i].ptr)) {
           snprintf(buf, sizeof(buf), "F:%s#%s", path, mname);
           add_name(B, buf, mt[i].ptr, 1);
         }
@@ -762,7 +1050,7 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
         add_name(B, buf, p, 0);
       }
       if (MRB_PROC_CFUNC_P(p)) {
-        if (!pm_get(&B->func2name, (const void*)p->body.func, NULL)) {
+        if (!named_func(B, (const void*)p->body.func)) {
           snprintf(buf, sizeof(buf), "F:%s#%s", path, mname);
           add_name(B, buf, (const void*)p->body.func, 1);
         }
@@ -772,12 +1060,12 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
       }
       if (MRB_PROC_ENV_P(p) && !named_obj(B, p->e.env)) {
         snprintf(buf, sizeof(buf), "E:%s#%s", path, mname);
-        add_name(B, buf, p->e.env, 0);
+        uint32_t ei = add_name(B, buf, p->e.env, 0);
         snap_object(B, (struct RBasic*)p->e.env);
-        seed(B, (struct RBasic*)p->e.env, buf);
+        seed(B, (struct RBasic*)p->e.env, ei);
       }
     }
-    mrb_free(B->mrb, mt);
+    if (mt != mt0) mrb_free(B->mrb, mt);
   }
   /* the snapshot of the methods, in the table's own order, each referring
      to its Proc or C function by name (every one has a name by now) */
@@ -791,7 +1079,7 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
     gsnap_mt *e = &B->mt[B->nmt++];
     uint32_t ref = 0;
     if (mt0[i].ptr) {
-      pm_get((mt0[i].flags & MRB_METHOD_FUNC_FL) ? &B->func2name : &B->obj2name, mt0[i].ptr, &ref);
+      ref = name_ref(B, mt0[i].ptr, (mt0[i].flags & MRB_METHOD_FUNC_FL) ? 1 : 0);
     }
     e->sym = mt0[i].sym;
     e->flags = mt0[i].flags;
@@ -825,19 +1113,20 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
     struct RClass *sup = c->super;
     while (sup && sup->tt == MRB_TT_ICLASS) sup = sup->super;
     if (sup && sup->tt == MRB_TT_CLASS && !named_obj(B, sup)) {
-      mrb_value cp = mrb_class_path(mrb, sup);
-      if (mrb_string_p(cp)) {
-        snprintf(buf, sizeof(buf), "%.*s", (int)RSTRING_LEN(cp), RSTRING_PTR(cp));
-        visit_class(B, sup, buf);
-      }
+      if (class_path_to(mrb, sup, buf, sizeof(buf))) visit_class(B, sup, buf);
     }
   }
 
   /* ivars and constants, in name order */
   int niv = B->T ? nciv : B->snaps[sidx].niv;
   if (niv > 0) {
-    giv_entry *iv = (giv_entry*)mrb_malloc(B->mrb, sizeof(giv_entry) * niv);
-    memcpy(iv, B->T ? civ : B->iv + B->snaps[sidx].iv, sizeof(giv_entry) * niv);
+    /* (with a table, the collected ivars are sorted where they are; the
+       snapshot's are kept in their order) */
+    giv_entry *iv = civ;
+    if (!B->T) {
+      iv = (giv_entry*)mrb_malloc(B->mrb, sizeof(giv_entry) * niv);
+      memcpy(iv, B->iv + B->snaps[sidx].iv, sizeof(giv_entry) * niv);
+    }
     sort_by_name(mrb, iv, niv, sizeof(giv_entry), cmp_iv);
     /* plain values first, so a class reached by two constants is named
        by the first one in a stable order */
@@ -845,24 +1134,24 @@ visit_class(pbuild *B, struct RClass *c, const char *path)
       mrb_value v = iv[i].val;
       if (mrb_immediate_p(v)) continue;
       enum mrb_vtype t = mrb_type(v);
-      const char *ivname = mrb_sym_name(mrb, iv[i].sym);
       if ((t == MRB_TT_CLASS || t == MRB_TT_MODULE) && const_name_p(mrb, iv[i].sym)) {
         /* prefer the class's own name (Integer, not its alias Fixnum) */
-        mrb_value cp = mrb_class_path(mrb, mrb_class_ptr(v));
-        if (mrb_string_p(cp)) snprintf(buf, sizeof(buf), "%.*s", (int)RSTRING_LEN(cp), RSTRING_PTR(cp));
-        else if (strcmp(path, "Object") == 0) snprintf(buf, sizeof(buf), "%s", ivname);
-        else snprintf(buf, sizeof(buf), "%s::%s", path, ivname);
+        if (!class_path_to(mrb, mrb_class_ptr(v), buf, sizeof(buf))) {
+          const char *ivname = mrb_sym_name(mrb, iv[i].sym);
+          if (strcmp(path, "Object") == 0) snprintf(buf, sizeof(buf), "%s", ivname);
+          else snprintf(buf, sizeof(buf), "%s::%s", path, ivname);
+        }
         visit_class(B, mrb_class_ptr(v), buf);
       }
       else if (t == MRB_TT_CLASS || t == MRB_TT_MODULE || t == MRB_TT_SCLASS) {
         /* e.g. __attached__: named elsewhere */
       }
       else {
-        snprintf(buf, sizeof(buf), "V:%s@%s", path, ivname);
+        snprintf(buf, sizeof(buf), "V:%s@%s", path, mrb_sym_name(mrb, iv[i].sym));
         name_value(B, v, buf);
       }
     }
-    mrb_free(B->mrb, iv);
+    if (iv != civ) mrb_free(B->mrb, iv);
   }
   if (civ) checkpoint_collect_free(mrb, civ);
 }
@@ -976,9 +1265,9 @@ reach(pbuild *B, mrb_value v, const char *parent, const char *step, size_t slen,
   if (o->tt == MRB_TT_FREE || o->tt == MRB_TT_SCLASS || o->tt == MRB_TT_ICLASS) return;
   if (named_obj(B, o)) return;
   if (o->tt == MRB_TT_STRING && !(o->c && o->c->tt == MRB_TT_SCLASS)) {
-    int seen = pm_get(&B->leaves, o, NULL);
+    int seen = pset_has(&B->leaves, o);
     if (leaf && !seen) {
-      pm_put(B->mrb, &B->leaves, o, 1);
+      pset_add(B->mrb, &B->leaves, o);
       return;
     }
   }
@@ -1108,28 +1397,22 @@ reach_contents(pbuild *B, struct RBasic *o, const char *name)
 static void
 name_reached(pbuild *B)
 {
-  pm_init(&B->leaves);
+  /* the name, copied: naming what it holds may move the state's own names */
+  nbuf nm = { NULL, 0, 0, B->mrb };
   for (uint32_t i = 0; i < B->nq; i++) {
     struct RBasic *o = B->q[i].o;
-    char *name = B->q[i].name;
-    reach_contents(B, o, name);
+    const char *name = b_name(B, B->q[i].name);
+    nm.len = 0;
+    nb_add(&nm, name, strlen(name));
+    reach_contents(B, o, nm.p);
   }
-  for (uint32_t i = 0; i < B->nq; i++) mrb_free(B->mrb, B->q[i].name);
+  mrb_free(B->mrb, nm.p);
   mrb_free(B->mrb, B->q);
   B->q = NULL; B->nq = B->capq = 0;
-  pm_free(B->mrb, &B->leaves);
+  pset_free(B->mrb, &B->leaves);
 }
 
 /* ---- the flat tables that stay ---- */
-
-typedef struct { uintptr_t key; uint32_t idx; } keyed;
-
-static int
-cmp_keyed(const void *a, const void *b)
-{
-  uintptr_t x = ((const keyed*)a)->key, y = ((const keyed*)b)->key;
-  return x < y ? -1 : x > y ? 1 : 0;
-}
 
 static int
 cmp_uintptr(const void *a, const void *b)
@@ -1138,35 +1421,122 @@ cmp_uintptr(const void *a, const void *b)
   return x < y ? -1 : x > y ? 1 : 0;
 }
 
-/* the indices 0..n-1 that pick takes (all without it), sorted by key (NULL
-   when none) */
-static uint32_t*
-sorted_index(pbuild *B, uint32_t n, uintptr_t (*key)(pbuild*, uint32_t), int (*pick)(pbuild*, uint32_t),
-             uint32_t *count)
+/* index arrays: 16-bit entries when w16, 32-bit otherwise */
+static uint32_t
+ix_get(const void *a, int w16, uint32_t i)
+{
+  return w16 ? ((const uint16_t*)a)[i] : ((const uint32_t*)a)[i];
+}
+
+static void
+ix_set(void *a, int w16, uint32_t i, uint32_t v)
+{
+  if (w16) ((uint16_t*)a)[i] = (uint16_t)v;
+  else ((uint32_t*)a)[i] = v;
+}
+
+/* the key of index i (a pointer, or an irep hash) */
+typedef uint64_t (*ix_key_fn)(const void *ctx, uint32_t i);
+
+static int
+ix_less(ix_key_fn key, const void *ctx, uint32_t x, uint32_t y)
+{
+  uint64_t kx = key(ctx, x), ky = key(ctx, y);
+  return kx < ky || (kx == ky && x < y);
+}
+
+static void
+ix_sift(void *a, int w16, uint32_t root, uint32_t n, ix_key_fn key, const void *ctx)
+{
+  for (;;) {
+    uint32_t c = 2 * root + 1;
+    if (c >= n) return;
+    if (c + 1 < n && ix_less(key, ctx, ix_get(a, w16, c), ix_get(a, w16, c + 1))) c++;
+    uint32_t r = ix_get(a, w16, root), v = ix_get(a, w16, c);
+    if (!ix_less(key, ctx, r, v)) return;
+    ix_set(a, w16, root, v);
+    ix_set(a, w16, c, r);
+    root = c;
+  }
+}
+
+/* sorts the indices a[0..n) by key, then by index, in place (a heap sort:
+   no room beside them, no static context) */
+static void
+ix_sort(void *a, int w16, uint32_t n, ix_key_fn key, const void *ctx)
+{
+  if (n < 2) return;
+  for (uint32_t i = n / 2; i-- > 0;) ix_sift(a, w16, i, n, key, ctx);
+  for (uint32_t end = n - 1; end > 0; end--) {
+    uint32_t t = ix_get(a, w16, 0);
+    ix_set(a, w16, 0, ix_get(a, w16, end));
+    ix_set(a, w16, end, t);
+    ix_sift(a, w16, 0, end, key, ctx);
+  }
+}
+
+/* the entry of the sorted idx[0..n) whose key is k, or -1 */
+static int64_t
+ix_find(const void *idx, int w16, uint32_t n, ix_key_fn key, const void *ctx, uint64_t k)
+{
+  uint32_t lo = 0, hi = n;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    uint32_t i = ix_get(idx, w16, mid);
+    uint64_t m = key(ctx, i);
+    if (m == k) return i;
+    if (m < k) lo = mid + 1;
+    else hi = mid;
+  }
+  return -1;
+}
+
+static uint64_t
+name_key(const void *ctx, uint32_t i)
+{
+  return (uint64_t)(uintptr_t)((const checkpoint_perm*)ctx)->ptrs[i];
+}
+
+static uint64_t
+irep_key(const void *ctx, uint32_t i)
+{
+  return (uint64_t)(uintptr_t)((const checkpoint_perm*)ctx)->irepp[i];
+}
+
+static int name_is_func(checkpoint_perm *P, uint32_t i);
+
+/* the names of objects / of C functions that have an address, sorted by it
+   (NULL when none) */
+static void*
+names_sorted(mrb_state *mrb, checkpoint_perm *P, int funcs, uint32_t *count)
 {
   uint32_t m = 0;
-  for (uint32_t i = 0; i < n; i++) if (!pick || pick(B, i)) m++;
+  for (uint32_t i = 0; i < P->n; i++) if (P->ptrs[i] && name_is_func(P, i) == funcs) m++;
   *count = m;
   if (m == 0) return NULL;
-  keyed *k = (keyed*)mrb_malloc(B->mrb, sizeof(keyed) * m);
+  void *idx = mrb_malloc(mrb, (size_t)m * (P->idx16 ? 2 : 4));
   m = 0;
-  for (uint32_t i = 0; i < n; i++) {
-    if (pick && !pick(B, i)) continue;
-    k[m].key = key(B, i);
-    k[m].idx = i;
-    m++;
+  for (uint32_t i = 0; i < P->n; i++) {
+    if (P->ptrs[i] && name_is_func(P, i) == funcs) ix_set(idx, P->idx16, m++, i);
   }
-  qsort(k, m, sizeof(keyed), cmp_keyed);
-  uint32_t *idx = (uint32_t*)mrb_malloc(B->mrb, sizeof(uint32_t) * m);
-  for (uint32_t i = 0; i < m; i++) idx[i] = k[i].idx;
-  mrb_free(B->mrb, k);
+  ix_sort(idx, P->idx16, m, name_key, P);
   return idx;
 }
 
-static uintptr_t name_key(pbuild *B, uint32_t i) { return (uintptr_t)B->ptrs[i]; }
-static int pick_obj(pbuild *B, uint32_t i) { return !B->isf[i]; }
-static int pick_func(pbuild *B, uint32_t i) { return B->isf[i]; }
-static uintptr_t irep_key(pbuild *B, uint32_t i) { return (uintptr_t)B->ireps[i].irep; }
+/* the sorted indices of the names and the ireps (P->n, ptrs, is_func and
+   irepp set) */
+static void
+make_indices(mrb_state *mrb, checkpoint_perm *P)
+{
+  P->idx16 = P->n <= UINT16_MAX && P->nireps <= UINT16_MAX;
+  P->obj_idx = names_sorted(mrb, P, 0, &P->nobj);
+  P->func_idx = names_sorted(mrb, P, 1, &P->nfunc);
+  if (P->nireps > 0) {
+    P->irep_idx = mrb_malloc(mrb, (size_t)P->nireps * (P->idx16 ? 2 : 4));
+    for (uint32_t i = 0; i < P->nireps; i++) ix_set(P->irep_idx, P->idx16, i, i);
+    ix_sort(P->irep_idx, P->idx16, P->nireps, irep_key, P);
+  }
+}
 
 /* a copy of n bytes (NULL for none) */
 static void*
@@ -1196,26 +1566,25 @@ finish_perm(pbuild *B, checkpoint_perm *P)
   mrb_state *mrb = B->mrb;
 
   /* the hash tables first, so that the indices below can take their room */
-  pm_free(mrb, &B->obj2name); pm_free(mrb, &B->func2name); pm_free(mrb, &B->irep2idx);
+  imap_free(mrb, &B->names2); imap_free(mrb, &B->irep2idx);
 
   P->n = B->n;
   P->names = (char*)shrink(mrb, B->blob, B->blen);
   P->name_off = (uint32_t*)mrb_realloc(mrb, B->off, sizeof(uint32_t) * (B->n + 1));
   P->name_off[B->n] = B->blen;
-  P->ptrs = (const void**)shrink(mrb, B->ptrs, sizeof(void*) * B->n);
-  B->ptrs = P->ptrs;   /* (name_key reads it) */
+  P->ptrs = (const void**)shrink(mrb, (void*)B->ptrs, sizeof(void*) * B->n);
   P->is_func = (uint8_t*)mrb_calloc(mrb, (B->n + 7) / 8 + 1, 1);
   for (uint32_t i = 0; i < B->n; i++) {
     if (B->isf[i]) P->is_func[i / 8] |= (uint8_t)(1 << (i % 8));
   }
-  P->obj_idx = sorted_index(B, B->n, name_key, pick_obj, &P->nobj);
-  P->func_idx = sorted_index(B, B->n, name_key, pick_func, &P->nfunc);
   mrb_free(mrb, B->isf);
+  B->blob = NULL; B->off = NULL; B->ptrs = NULL; B->isf = NULL;
 
   P->nireps = B->nireps;
-  P->ireps = (girep_perm*)shrink(mrb, B->ireps, sizeof(girep_perm) * B->nireps);
-  B->ireps = P->ireps;   /* (irep_key reads it) */
-  P->irep_idx = sorted_index(B, B->nireps, irep_key, NULL, &P->nireps);
+  P->irepp = (const mrb_irep**)shrink(mrb, (void*)B->irepv, sizeof(void*) * B->nireps);
+  P->ireph = (uint64_t*)shrink(mrb, B->ireph, sizeof(uint64_t) * B->nireps);
+  B->irepv = NULL; B->ireph = NULL;
+  make_indices(mrb, P);
 
   P->nsnaps = B->nsnaps;
   P->snaps = (gsnap*)shrink(mrb, B->snaps, sizeof(gsnap) * B->nsnaps);
@@ -1301,6 +1670,14 @@ find_closures(mrb_state *mrb, void *ud)
   return mrb_nil_value();
 }
 typedef struct { pbuild *B; uintptr_t *a; uint32_t n, cap; } heap_acc;
+
+static int
+heap_count_cb(mrb_state *mrb, struct RBasic *obj, void *data)
+{
+  (void)mrb;
+  if (obj->tt != MRB_TT_FREE) (*(uint32_t*)data)++;
+  return MRB_EACH_OBJ_OK;
+}
 
 static int
 heap_cb(mrb_state *mrb, struct RBasic *obj, void *data)
@@ -1466,7 +1843,7 @@ own_snap(pbuild *B, struct RBasic *o)
     for (int i = 0; i < n; i++) {
       gsnap_mt *e = &B->mt[B->nmt++];
       uint32_t ref = 0;
-      if (mt[i].ptr) pm_get((mt[i].flags & MRB_METHOD_FUNC_FL) ? &B->func2name : &B->obj2name, mt[i].ptr, &ref);
+      if (mt[i].ptr) ref = name_ref(B, mt[i].ptr, (mt[i].flags & MRB_METHOD_FUNC_FL) ? 1 : 0);
       e->sym = mt[i].sym;
       e->flags = mt[i].flags;
       e->ref = ref;
@@ -1498,8 +1875,11 @@ reconcile_snaps(pbuild *B)
   for (uint32_t k = 0; k < T->nsnaps; k++) {
     struct RBasic *o = (struct RBasic*)P->ptrs[T->snaps[k].name];
     if (!o || snap_matches(B, k, o)) continue;   /* (absent: the name is missing) */
-    if (!P->snap_over) P->snap_over = (uint32_t*)mrb_calloc(B->mrb, T->nsnaps, sizeof(uint32_t));
-    P->snap_over[k] = own_snap(B, o) + 1;
+    /* (in the order of k: own_of searches them) */
+    P->snap_over = (gsnap_over*)mrb_realloc(B->mrb, P->snap_over, sizeof(gsnap_over) * (P->nsnap_over + 1));
+    P->snap_over[P->nsnap_over].k = k;
+    P->snap_over[P->nsnap_over].s = own_snap(B, o);
+    P->nsnap_over++;
     B->ndiff++;
   }
   if (B->nxobj > 0) {
@@ -1512,29 +1892,42 @@ reconcile_snaps(pbuild *B)
 static const char *name_str(checkpoint_perm *P, uint32_t i);
 static int name_is_func(checkpoint_perm *P, uint32_t i);
 
-/* the names of objects / of C functions, sorted by address (with a table:
-   the table's that this state has, then its own) */
-static uint32_t*
-table_sorted_index(mrb_state *mrb, checkpoint_perm *P, int funcs, uint32_t *count)
+static uint64_t
+thash_key(const void *ctx, uint32_t i)
 {
-  uint32_t total = P->T->nnames + P->nx;
-  uint32_t m = 0;
-  for (uint32_t i = 0; i < total; i++) if (P->ptrs[i] && name_is_func(P, i) == funcs) m++;
-  *count = m;
-  if (m == 0) return NULL;
-  keyed *k = (keyed*)mrb_malloc(mrb, sizeof(keyed) * m);
-  m = 0;
-  for (uint32_t i = 0; i < total; i++) {
-    if (!P->ptrs[i] || name_is_func(P, i) != funcs) continue;
-    k[m].key = (uintptr_t)P->ptrs[i];
-    k[m].idx = i;
-    m++;
+  return ((const mrb_checkpoint_table*)ctx)->irep_hash[i];
+}
+
+/* with a table whose mrblib ireps are not this state's in the same order:
+   each irep's hash as the table's entry of the same hash, or kept */
+static void
+irep_link_table(mrb_state *mrb, checkpoint_perm *P, const mrb_checkpoint_table *T)
+{
+  if (T->nireps >= UINT16_MAX) {
+    /* (no room for the entry in 16 bits: every hash kept) */
+    P->ireph = (uint64_t*)mrb_malloc(mrb, sizeof(uint64_t) * (P->nireps ? P->nireps : 1));
+    for (uint32_t i = 0; i < P->nireps; i++) P->ireph[i] = checkpoint_irep_hash(mrb, P->irepp[i]);
+    return;
   }
-  qsort(k, m, sizeof(keyed), cmp_keyed);
-  uint32_t *idx = (uint32_t*)mrb_malloc(mrb, sizeof(uint32_t) * m);
-  for (uint32_t i = 0; i < m; i++) idx[i] = k[i].idx;
-  mrb_free(mrb, k);
-  return idx;
+  /* the table's hashes sorted (for a while) */
+  uint16_t *by = (uint16_t*)mrb_malloc(mrb, sizeof(uint16_t) * (T->nireps ? T->nireps : 1));
+  for (uint32_t i = 0; i < T->nireps; i++) by[i] = (uint16_t)i;
+  ix_sort(by, 1, T->nireps, thash_key, T);
+  P->irep_tix = (uint16_t*)mrb_malloc(mrb, sizeof(uint16_t) * (P->nireps ? P->nireps : 1));
+  for (uint32_t i = 0; i < P->nireps; i++) {
+    uint64_t h = checkpoint_irep_hash(mrb, P->irepp[i]);
+    int64_t t = ix_find(by, 1, T->nireps, thash_key, T, h);
+    if (t >= 0) {
+      P->irep_tix[i] = (uint16_t)t;
+      continue;
+    }
+    P->irep_tix[i] = UINT16_MAX;
+    P->irep_own = (girep_own*)mrb_realloc(mrb, P->irep_own, sizeof(girep_own) * (P->nirep_own + 1));
+    P->irep_own[P->nirep_own].i = i;
+    P->irep_own[P->nirep_own].h = h;
+    P->nirep_own++;
+  }
+  mrb_free(mrb, by);
 }
 
 static void
@@ -1543,6 +1936,10 @@ finish_table(pbuild *B, checkpoint_perm *P)
   mrb_state *mrb = B->mrb;
   const mrb_checkpoint_table *T = B->T;
   P->T = T;
+  /* the hash tables first, so that what follows can take their room */
+  imap_free(mrb, &B->names2); imap_free(mrb, &B->irep2idx);
+  mrb_free(mrb, B->name2snap);
+  B->name2snap = NULL;
   /* the names of the state's own, after the table's */
   P->nx = B->n;
   P->n = T->nnames + B->n;
@@ -1570,42 +1967,22 @@ finish_table(pbuild *B, checkpoint_perm *P)
   P->niv = B->niv;
   B->snaps = NULL; B->mt = NULL; B->iv = NULL;
   /* the mrblib ireps: the table's hashes when they are the same code in the
-     same order, the state's own (as without a table) otherwise */
-  int same = B->nireps == T->nireps;
-  for (uint32_t i = 0; same && i < T->nireps; i++) same = B->ireps[i].hash == T->irep_hash[i];
+     same order (add_irep compared them), else linked by their hashes */
   P->nireps = B->nireps;
-  if (same) {
-    P->irepp = (const mrb_irep**)mrb_malloc(mrb, sizeof(void*) * (B->nireps ? B->nireps : 1));
-    for (uint32_t i = 0; i < B->nireps; i++) P->irepp[i] = B->ireps[i].irep;
-    mrb_free(mrb, B->ireps);
-  }
-  else {
+  P->irepp = (const mrb_irep**)shrink(mrb, (void*)B->irepv, sizeof(void*) * B->nireps);
+  B->irepv = NULL;
+  if (B->irep_diff || B->nireps != T->nireps) {
     mismatch(B, "the mrblib ireps differ from the table's (%u here, %u there)", (unsigned)B->nireps,
              (unsigned)T->nireps);
-    P->ireps = (girep_perm*)shrink(mrb, B->ireps, sizeof(girep_perm) * B->nireps);
+    irep_link_table(mrb, P, T);
   }
-  B->ireps = NULL;
-  pm_free(mrb, &B->obj2name); pm_free(mrb, &B->func2name); pm_free(mrb, &B->irep2idx);
-  P->obj_idx = table_sorted_index(mrb, P, 0, &P->nobj);
-  P->func_idx = table_sorted_index(mrb, P, 1, &P->nfunc);
-  if (P->nireps > 0) {
-    keyed *k = (keyed*)mrb_malloc(mrb, sizeof(keyed) * P->nireps);
-    for (uint32_t i = 0; i < P->nireps; i++) {
-      k[i].key = (uintptr_t)(P->irepp ? P->irepp[i] : P->ireps[i].irep);
-      k[i].idx = i;
-    }
-    qsort(k, P->nireps, sizeof(keyed), cmp_keyed);
-    P->irep_idx = (uint32_t*)mrb_malloc(mrb, sizeof(uint32_t) * P->nireps);
-    for (uint32_t i = 0; i < P->nireps; i++) P->irep_idx[i] = k[i].idx;
-    mrb_free(mrb, k);
-  }
+  make_indices(mrb, P);
   /* the stamp is the table's only when this state has the table's names
      and snapshots exactly */
   if (!B->failed) {
     P->stamp = T->stamp;
     P->stamp_set = 1;
   }
-  mrb_free(mrb, B->name2snap);
   mrb_free(mrb, B->xobj);
 }
 
@@ -1620,12 +1997,25 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
   B->P = P;
   if (T) {
     P->ptrs = (const void**)mrb_calloc(mrb, T->nnames ? T->nnames : 1, sizeof(void*));
-    B->name2snap = (uint32_t*)mrb_calloc(mrb, T->nnames ? T->nnames : 1, sizeof(uint32_t));
-    for (uint32_t k = 0; k < T->nsnaps; k++) {
-      if (T->snaps[k].name < T->nnames) B->name2snap[T->snaps[k].name] = k + 1;
+    /* a table writes its snapshots in the order of their names (a search
+       finds the snapshot of a name); another order takes a table of them */
+    int sorted = 1;
+    for (uint32_t k = 1; sorted && k < T->nsnaps; k++) sorted = T->snaps[k - 1].name < T->snaps[k].name;
+    if (!sorted) {
+      B->name2snap = (uint32_t*)mrb_calloc(mrb, T->nnames ? T->nnames : 1, sizeof(uint32_t));
+      for (uint32_t k = 0; k < T->nsnaps; k++) {
+        if (T->snaps[k].name < T->nnames) B->name2snap[T->snaps[k].name] = k + 1;
+      }
     }
     P->slotv = (uint64_t*)mrb_calloc(mrb, T->nslots ? T->nslots : 1, sizeof(uint64_t));
     P->slott = (uint8_t*)mrb_calloc(mrb, T->nslots ? T->nslots : 1, 1);
+    /* the hash tables at the size the table says, and the ireps */
+    imap_reserve(B, &B->names2, T->nnames, T->nnames);
+    imap_reserve(B, &B->irep2idx, T->nireps, T->nireps);
+    if (T->nireps > 0) {
+      B->irepv = (const mrb_irep**)mrb_malloc(mrb, sizeof(void*) * T->nireps);
+      B->capireps = T->nireps;
+    }
   }
 
   /* every heap object alive now is permanent, named or not. None of them
@@ -1639,6 +2029,9 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
      value each, and the GC's root hook marks them (checkpoint_perm_mark). */
   {
     heap_acc h = { B, NULL, 0, 0 };
+    /* counted first, to take the room once */
+    mrb_objspace_each_objects(mrb, heap_count_cb, &h.cap);
+    if (h.cap > 0) h.a = (uintptr_t*)mrb_malloc(mrb, sizeof(uintptr_t) * h.cap);
     mrb_objspace_each_objects(mrb, heap_cb, &h);
     if (h.n > 1) qsort(h.a, h.n, sizeof(uintptr_t), cmp_uintptr);
     if (T || g->for_table) {
@@ -1671,22 +2064,22 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
      (static functions there; found through a class made for the purpose) */
   /* (the functions of the classes gems make at run time come last) */
 
-  add_name(B, "T", mrb->top_self, 0);
+  uint32_t ti = add_name(B, "T", mrb->top_self, 0);
   snap_object(B, (struct RBasic*)mrb->top_self);
-  seed(B, (struct RBasic*)mrb->top_self, "T");
+  seed(B, (struct RBasic*)mrb->top_self, ti);
   visit_class(B, mrb->object_class, "Object");
   if (mrb->top_self->c && mrb->top_self->c->tt == MRB_TT_SCLASS) {
     visit_class(B, mrb->top_self->c, "S:T");
   }
   if (mrb->nomem_err) {
-    add_name(B, "X:nomem_err", mrb->nomem_err, 0);
+    uint32_t i = add_name(B, "X:nomem_err", mrb->nomem_err, 0);
     snap_object(B, (struct RBasic*)mrb->nomem_err);
-    seed(B, (struct RBasic*)mrb->nomem_err, "X:nomem_err");
+    seed(B, (struct RBasic*)mrb->nomem_err, i);
   }
   if (mrb->stack_err) {
-    add_name(B, "X:stack_err", mrb->stack_err, 0);
+    uint32_t i = add_name(B, "X:stack_err", mrb->stack_err, 0);
     snap_object(B, (struct RBasic*)mrb->stack_err);
-    seed(B, (struct RBasic*)mrb->stack_err, "X:stack_err");
+    seed(B, (struct RBasic*)mrb->stack_err, i);
   }
 
   /* globals */
@@ -1713,13 +2106,13 @@ build_perm(mrb_state *mrb, checkpoint_state *g, pbuild *B)
   checkpoint_collect_free(mrb, gv);
 
   for (int i = 0; i < g->nmade; i++) {
-    if (!pm_get(&B->func2name, (const void*)g->made[i].f, NULL)) {
+    if (!named_func(B, (const void*)g->made[i].f)) {
       add_name(B, g->made[i].name, (const void*)g->made[i].f, 1);
     }
   }
   /* the embedder's (mrb_checkpoint_register_func) */
   for (int i = 0; i < g->nfuncs; i++) {
-    if (!pm_get(&B->func2name, (const void*)g->funcs[i], NULL)) {
+    if (!named_func(B, (const void*)g->funcs[i])) {
       add_name(B, g->fnames[i], (const void*)g->funcs[i], 1);
     }
   }
@@ -1781,7 +2174,7 @@ checkpoint_perm_build(mrb_state *mrb, checkpoint_state *g)
     snprintf(g->table_why, sizeof(g->table_why), "not used: no table");
   }
   B.mrb = mrb;
-  pm_init(&B.obj2name); pm_init(&B.func2name); pm_init(&B.irep2idx);
+  B.irep2idx.kind = IMAP_IREPS;
   return build_perm(mrb, g, &B);
 }
 
@@ -1791,11 +2184,12 @@ perm_free_parts(mrb_state *mrb, checkpoint_perm *P)
   mrb_free(mrb, P->names); mrb_free(mrb, P->name_off);
   mrb_free(mrb, (void*)P->ptrs); mrb_free(mrb, P->is_func);
   mrb_free(mrb, P->obj_idx); mrb_free(mrb, P->func_idx);
-  mrb_free(mrb, P->ireps); mrb_free(mrb, P->irep_idx);
+  mrb_free(mrb, (void*)P->irepp); mrb_free(mrb, P->irep_idx);
+  mrb_free(mrb, P->ireph); mrb_free(mrb, P->irep_tix); mrb_free(mrb, P->irep_own);
   mrb_free(mrb, P->snaps); mrb_free(mrb, P->mt); mrb_free(mrb, P->iv);
   mrb_free(mrb, P->gv);
   mrb_free(mrb, P->keepp);
-  mrb_free(mrb, (void*)P->irepp); mrb_free(mrb, P->slotv); mrb_free(mrb, P->slott);
+  mrb_free(mrb, P->slotv); mrb_free(mrb, P->slott);
   mrb_free(mrb, P->snap_over); mrb_free(mrb, P->xsnap);
 }
 
@@ -1815,21 +2209,6 @@ checkpoint_perm_mark(mrb_state *mrb, checkpoint_perm *P)
 }
 
 /* ---- looking things up ---- */
-
-/* the entry of idx[0..n) whose key (keys of an index) is k, or -1 */
-static int64_t
-idx_find(const uint32_t *idx, uint32_t n, const void *const *keys, uintptr_t k)
-{
-  uint32_t lo = 0, hi = n;
-  while (lo < hi) {
-    uint32_t mid = lo + (hi - lo) / 2;
-    uintptr_t m = (uintptr_t)keys[idx[mid]];
-    if (m == k) return idx[mid];
-    if (m < k) lo = mid + 1;
-    else hi = mid;
-  }
-  return -1;
-}
 
 static const char*
 name_str(checkpoint_perm *P, uint32_t i)
@@ -1851,7 +2230,7 @@ const char*
 checkpoint_perm_name_of(checkpoint_perm *P, const void *obj)
 {
   if (!obj) return NULL;
-  int64_t i = idx_find(P->obj_idx, P->nobj, P->ptrs, (uintptr_t)obj);
+  int64_t i = ix_find(P->obj_idx, P->idx16, P->nobj, name_key, P, (uintptr_t)obj);
   return i < 0 ? NULL : name_str(P, (uint32_t)i);
 }
 
@@ -1859,7 +2238,7 @@ const char*
 checkpoint_perm_func_name(checkpoint_perm *P, mrb_func_t f)
 {
   if (!f) return NULL;
-  int64_t i = idx_find(P->func_idx, P->nfunc, P->ptrs, (uintptr_t)f);
+  int64_t i = ix_find(P->func_idx, P->idx16, P->nfunc, name_key, P, (uintptr_t)f);
   return i < 0 ? NULL : name_str(P, (uint32_t)i);
 }
 
@@ -1956,33 +2335,39 @@ checkpoint_perm_ref(checkpoint_perm *P, uint32_t ref)
   return (ref == 0 || ref > P->n) ? NULL : P->ptrs[ref - 1];
 }
 
+/* the content hash of irep i */
+static uint64_t
+irep_hash_at(checkpoint_perm *P, uint32_t i)
+{
+  if (P->ireph) return P->ireph[i];
+  if (P->irep_tix) {
+    if (P->irep_tix[i] != UINT16_MAX) return P->T->irep_hash[P->irep_tix[i]];
+    uint32_t lo = 0, hi = P->nirep_own;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      if (P->irep_own[mid].i == i) return P->irep_own[mid].h;
+      if (P->irep_own[mid].i < i) lo = mid + 1;
+      else hi = mid;
+    }
+    return 0;
+  }
+  return P->T->irep_hash[i];
+}
+
 int
 checkpoint_perm_irep(checkpoint_perm *P, const mrb_irep *irep, uint64_t *hash)
 {
-  uint32_t lo = 0, hi = P->nireps;
-  uintptr_t k = (uintptr_t)irep;
-  while (lo < hi) {
-    uint32_t mid = lo + (hi - lo) / 2;
-    uint32_t i = P->irep_idx[mid];
-    uintptr_t m = (uintptr_t)(P->irepp ? P->irepp[i] : P->ireps[i].irep);
-    if (m == k) {
-      if (hash) *hash = P->irepp ? P->T->irep_hash[i] : P->ireps[i].hash;
-      return 1;
-    }
-    if (m < k) lo = mid + 1;
-    else hi = mid;
-  }
-  return 0;
+  int64_t i = ix_find(P->irep_idx, P->idx16, P->nireps, irep_key, P, (uintptr_t)irep);
+  if (i < 0) return 0;
+  if (hash) *hash = irep_hash_at(P, (uint32_t)i);
+  return 1;
 }
 
 const mrb_irep*
 checkpoint_perm_irep_by_hash(checkpoint_perm *P, uint64_t hash)
 {
   for (uint32_t i = 0; i < P->nireps; i++) {
-    if (P->irepp) {
-      if (P->T->irep_hash[i] == hash) return P->irepp[i];
-    }
-    else if (P->ireps[i].hash == hash) return P->ireps[i].irep;
+    if (irep_hash_at(P, i) == hash) return P->irepp[i];
   }
   return NULL;
 }
@@ -2001,7 +2386,13 @@ own_of(checkpoint_perm *P, uint32_t k)
 {
   if (!P->T) return &P->snaps[k];
   if (k >= P->T->nsnaps) return &P->snaps[P->xsnap[k - P->T->nsnaps]];
-  if (P->snap_over && P->snap_over[k]) return &P->snaps[P->snap_over[k] - 1];
+  uint32_t lo = 0, hi = P->nsnap_over;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    if (P->snap_over[mid].k == k) return &P->snaps[P->snap_over[mid].s];
+    if (P->snap_over[mid].k < k) lo = mid + 1;
+    else hi = mid;
+  }
   return NULL;
 }
 
@@ -2161,7 +2552,7 @@ sort_by_str(checkpoint_state *G, uint32_t *idx, uint32_t n, const char *base, co
 static int64_t
 obj_index(checkpoint_perm *P, const void *p)
 {
-  return p ? idx_find(P->obj_idx, P->nobj, P->ptrs, (uintptr_t)p) : -1;
+  return p ? ix_find(P->obj_idx, P->idx16, P->nobj, name_key, P, (uintptr_t)p) : -1;
 }
 
 static uint64_t
@@ -2305,7 +2696,7 @@ table_from_perm(mrb_state *mrb, checkpoint_state *G, checkpoint_perm *P, tbuild 
   t->syms = tb->syms ? tb->syms : "";
 
   tb->irep_hash = (uint64_t*)ck_malloc(G, sizeof(uint64_t) * (P->nireps ? P->nireps : 1));
-  for (uint32_t i = 0; i < P->nireps; i++) tb->irep_hash[i] = P->ireps[i].hash;
+  for (uint32_t i = 0; i < P->nireps; i++) tb->irep_hash[i] = irep_hash_at(P, i);
   t->nireps = P->nireps; t->irep_hash = tb->irep_hash;
   t->stamp = table_digest(t);
   return 0;
@@ -2477,17 +2868,20 @@ mrb_checkpoint_baseline_size(mrb_state *mrb, mrb_checkpoint_size_fn fn, void *ud
   PART(P->T ? "name_off (own)" : "name_off", nown + 1, nown ? sizeof(uint32_t) * (nown + 1) : 0);
   PART(P->T ? "is_func (own)" : "is_func", nown, nown ? (nown + 7) / 8 + 1 : 0);
   PART("ptrs", P->n, sizeof(void*) * P->n);
-  PART("obj_idx", P->nobj, sizeof(uint32_t) * P->nobj);
-  PART("func_idx", P->nfunc, sizeof(uint32_t) * P->nfunc);
+  size_t ixw = P->idx16 ? sizeof(uint16_t) : sizeof(uint32_t);
+  PART("obj_idx", P->nobj, ixw * P->nobj);
+  PART("func_idx", P->nfunc, ixw * P->nfunc);
   if (P->keep) PART("keep (Array)", ARY_LEN(P->keep), sizeof(struct RArray) + sizeof(mrb_value) * ARY_CAPA(P->keep));
   if (P->keepp) PART("keep (addresses)", P->nkeep, sizeof(uintptr_t) * P->nkeep);
-  if (P->irepp) PART("ireps", P->nireps, sizeof(void*) * P->nireps);
-  else PART("ireps", P->nireps, sizeof(girep_perm) * P->nireps);
-  PART("irep_idx", P->nireps, sizeof(uint32_t) * P->nireps);
+  PART("ireps", P->nireps, sizeof(void*) * P->nireps);
+  if (P->ireph) PART("irep hashes", P->nireps, sizeof(uint64_t) * P->nireps);
+  if (P->irep_tix) PART("irep table entries", P->nireps, sizeof(uint16_t) * P->nireps);
+  PART("irep hashes (own)", P->nirep_own, sizeof(girep_own) * P->nirep_own);
+  PART("irep_idx", P->nireps, ixw * P->nireps);
   uint32_t nown_snaps = P->T ? P->nxsnap : P->nsnaps;
   if (P->T) {
-    for (uint32_t k = 0; P->snap_over && k < P->T->nsnaps; k++) if (P->snap_over[k]) nown_snaps++;
-    PART("snap_over", P->T->nsnaps, P->snap_over ? sizeof(uint32_t) * P->T->nsnaps : 0);
+    nown_snaps += P->nsnap_over;
+    PART("snap_over", P->nsnap_over, sizeof(gsnap_over) * P->nsnap_over);
     PART("xsnap", P->nxsnap, sizeof(uint32_t) * P->nxsnap);
     PART("slots", P->T->nslots, (sizeof(uint64_t) + 1) * P->T->nslots);
   }
