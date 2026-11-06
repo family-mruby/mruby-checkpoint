@@ -178,7 +178,7 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 | F5 | Asterism で分けて送り、受け取った側で起動する (ネットワーク越し) | Family mruby の側で検収済 (2026-11-04、ブラウザ版とは 2026-11-05、fmruby-core `doc/checkpoint/report/f5.md`) |
 | Ff | 基準の表をファームを作るときに作り、固定の表として渡す (`mrb_checkpoint_set_table`・`mrb_checkpoint_write_table`、`doc/format_v1.md` §8.1 と `TBL0`)。生かしておくオブジェクトはアドレスの配列にして GC の root の hook (`patches/0004`) で印を付ける | Family mruby の側で検収済 (2026-11-05、fmruby-core `doc/checkpoint/report/ff.md`) |
 | Fu | 名前の無い基準のもの (定数の Hash の中の Hash など) への変更が黙って落ちる不具合 (2026-11-06 に Family mruby の `FmrbI18n` で見つかった) を直す。名前のあるものから届くものに経路の名前 (`V:FmrbI18n@STRINGS/{"en"}`) を付けて snapshot を取り、要素・値としてだけ持たれる String は名前を付けず新しい String として運んで持ち主を書き直す。Struct・Set・Env・Exception の中身と特異クラスの変更も運ぶ。運べない形 (中の変わった C のデータ、名前の付かない Set の要素) は理由をつけて断る (`doc/report/unnamed_baseline.md`、名前の決まりの版 2) | 実装済・検収待ち |
-| F6 | 実機 (まず P4-Nano (ESP32-P4)、その後 S3。2026-11-05 に Tab5 から P4-Nano に変えた) | P4 は Family mruby の側で検収済 (2026-11-06、P4-Nano で実機の場面が全部通った。fmruby-core `doc/checkpoint/report/f6.md`)。hook の関数ポインタと切り替えの要求の数は `mrb_state` のフィールドに (全ビルド同じ形、`patches/0001`・`0004`)。S3 は未着手 |
+| F6 | 実機 (まず P4-Nano (ESP32-P4)、その後 S3。2026-11-05 に Tab5 から P4-Nano に変えた) | P4 は Family mruby の側で検収済 (2026-11-06、P4-Nano で実機の場面が全部通った。fmruby-core `doc/checkpoint/report/f6.md`)。hook の関数ポインタと切り替えの要求の数は `mrb_state` のフィールドに (全ビルド同じ形、`patches/0001`・`0004`)。S3 は実装済・検収待ち (実機は未確認): S3 のアプリのプール (500 KB) のため、基準を作る間の一時的な量を減らした (表あり 32 bit で 65,995 → 9,830 B、`doc/report/s3_baseline.md`。Family mruby の側は fmruby-core `doc/checkpoint/report/f6_s3.md`) |
 
 ## 決まったこと (2026-11-03、Family mruby への持ち込み。ユーザが選択肢から選んだ)
 
