@@ -1,6 +1,6 @@
 # mruby-checkpoint: mruby の VM の実行状態を運ぶ原理検証
 
-> 状態: 進行中 | 更新: 2026-11-03 (P5b まで検収済、P6 (ソースを表示用にイメージへ) は実装済・検収待ち) | mruby 単体と SabiRuby 単体で、VM の実行状態を書き出して続きから動かせることを確かめる
+> 状態: 進行中 | 更新: 2026-11-06 (P5b まで検収済、P6 (ソースを表示用にイメージへ) は実装済・検収待ち。Family mruby への持ち込みは F0〜F5・Ff が検収済、F6 は P4 で検収済) | mruby 単体と SabiRuby 単体で、VM の実行状態を書き出して続きから動かせることを確かめる
 
 ## 目的
 
@@ -37,7 +37,7 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 4. mruby → SabiRuby の片道。
 5. mruby の試験一式をランダムなセーフポイントで往復させ、往復なしと完全に一致するか。
 
-範囲外 (後の段か Family mruby 側): 窓・APU などの資源の作り直し、PSRAM の使い方、
+範囲外 (後の段か Family mruby 側): Window・APU などの資源の作り直し、PSRAM の使い方、
 ネットワーク越しの転送、pre-copy、暗号化。
 
 ## 受け入れ条件
@@ -169,15 +169,15 @@ mruby の VM で動いているプログラムを、アプリの協力なしに�
 
 | 段 | 内容 | 状態 |
 |---|---|---|
-| F0 | patch と gem を Family mruby に入れる (まずネイティブ版と sim) | 実装済・検収待ち |
-| F1 | ネイティブ版の 1 プロセスの中で、窓のないアプリを止めて同じ所で続ける | 実装済・検収待ち (gem に作業の領域のアロケータと埋め込む側のセクション `EMB0`。fmruby-core `doc/checkpoint/report/f1.md`) |
+| F0 | patch と gem を Family mruby に入れる (まずネイティブ版と sim) | Family mruby の側で検収済 (2026-11-03、fmruby-core `doc/checkpoint/report/f0.md`) |
+| F1 | ネイティブ版の 1 プロセスの中で、Window のないアプリを止めて同じ所で続ける | Family mruby の側で検収済 (2026-11-03。gem に作業の領域のアロケータと埋め込む側のセクション `EMB0`。fmruby-core `doc/checkpoint/report/f1.md`) |
 | F1b | F1 の残り: 基準の表を小さくする (平らな表に。名前は 1 つの塊)、Family mruby の側の入口を増やす | 実装済・検収待ち (基準の常駐の費用は Family mruby のネイティブ版 (64 bit) の 1 VM で 1,018,640 → 354,784 B。fmruby-core `doc/checkpoint/report/f1b.md`) |
-| F2 | ネイティブ版の 2 プロセスの間で受け渡す (ヘッドレスのデモ) | 未着手 |
-| F3 | 窓のあるアプリ (画面つきのデモ) | 未着手 |
+| F2 | ネイティブ版の 2 プロセスの間で受け渡す (ヘッドレスのデモ) | Family mruby の側で検収済 (2026-11-04、fmruby-core `doc/checkpoint/report/f2.md`) |
+| F3 | Window のあるアプリ (画面つきのデモ) | Family mruby の側で検収済 (2026-11-04、fmruby-core `doc/checkpoint/report/f3.md`。2026-11-06 に、移した Window の枠が着いた側のテーマで描かれるよう直した) |
 | F4 | ビルドの違う端末の間 (sim ⇔ ネイティブ版、ブラウザ版 ⇔ ネイティブ版)。gem はプログラムのコードが呼ぶメソッドの名前をイメージに入れる (`SND0`、`doc/format_v1.md` §13)。読む側は足りない名前を埋め込む側に渡すだけで断らない (`mrb_checkpoint_missing_names`)。同じ一覧はイメージを書かずに取れる (`mrb_checkpoint_sent_names`、F5 の止める前の確認のため) | Family mruby の側で検収済 (2026-11-04、fmruby-core `doc/checkpoint/report/f4.md`) |
-| F5 | Asterism で分けて送り、受け取った側で起動する (ネットワーク越し) | 未着手 |
-| Ff | 基準の表をファームを作るときに作り、固定の表として渡す (`mrb_checkpoint_set_table`・`mrb_checkpoint_write_table`、`doc/format_v1.md` §8.1 と `TBL0`)。生かしておくオブジェクトはアドレスの配列にして GC の root の hook (`patches/0004`) で印を付ける | 実装済・検収待ち (fmruby-core `doc/checkpoint/report/ff.md`) |
-| F6 | 実機 (まず Tab5、その後 S3) | 未着手 |
+| F5 | Asterism で分けて送り、受け取った側で起動する (ネットワーク越し) | Family mruby の側で検収済 (2026-11-04、ブラウザ版とは 2026-11-05、fmruby-core `doc/checkpoint/report/f5.md`) |
+| Ff | 基準の表をファームを作るときに作り、固定の表として渡す (`mrb_checkpoint_set_table`・`mrb_checkpoint_write_table`、`doc/format_v1.md` §8.1 と `TBL0`)。生かしておくオブジェクトはアドレスの配列にして GC の root の hook (`patches/0004`) で印を付ける | Family mruby の側で検収済 (2026-11-05、fmruby-core `doc/checkpoint/report/ff.md`) |
+| F6 | 実機 (まず P4-Nano (ESP32-P4)、その後 S3。2026-11-05 に Tab5 から P4-Nano に変えた) | P4 は Family mruby の側で検収済 (2026-11-06、P4-Nano で実機の場面が全部通った。fmruby-core `doc/checkpoint/report/f6.md`)。hook の関数ポインタと切り替えの要求の数は `mrb_state` のフィールドに (全ビルド同じ形、`patches/0001`・`0004`)。S3 は未着手 |
 
 ## 決まったこと (2026-11-03、Family mruby への持ち込み。ユーザが選択肢から選んだ)
 
