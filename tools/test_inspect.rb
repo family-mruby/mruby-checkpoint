@@ -686,6 +686,61 @@ end
 
 part_done
 
+# ---- mrblib of another version (another version of a library) ----
+# The driver's CkLib (CHECKPOINT_FIXTURE_LIB=1, 2, 3) stands for a library
+# whose methods change between builds. A frame inside one of its methods is
+# refused by a reader whose build has another version of that method (its
+# frames would run other code from the writer's pc). A block made in one is
+# carried with the writer's code and runs on a reader of another version,
+# unless it calls a name the reader's build does not define: then the
+# restore refuses, instead of a NoMethodError after it.
+puts 'mrblib of another version:'
+Dir.mktmpdir('checkpoint-inspect') do |dir|
+  File.write(File.join(dir, 'frame.rb'), <<~RUBY)
+    v = CkLib.new.wrap(1) do |x|
+      Checkpoint.suspend("frame.ckpt")
+      x * 10
+    end
+    puts v
+  RUBY
+  File.write(File.join(dir, 'block.rb'), <<~RUBY)
+    pr = CkLib.new.make
+    Checkpoint.suspend("block.ckpt")
+    puts pr.call
+  RUBY
+  lib = ->(n) { { 'CHECKPOINT_FIXTURE_LIB' => n.to_s } }
+  %w(frame block).each do |k|
+    _, err, st = Open3.capture3(lib.(1), NORMAL['64'], 'run', "#{k}.rb", chdir: dir)
+    check("#{k}.rb suspends (version 1)", st.exitstatus == 0 && File.exist?(File.join(dir, "#{k}.ckpt")), err)
+  end
+  %w(64 32).each do |arch|
+    out, err, st = Open3.capture3(lib.(1), NORMAL[arch], 'resume', File.join(dir, 'frame.ckpt'), chdir: dir)
+    check("#{arch}: frame: the same version resumes it", st.exitstatus == 0 && out == "11\n", err)
+    [3, 2].each do |v|
+      out, err, st = Open3.capture3(lib.(v), NORMAL[arch], 'resume', File.join(dir, 'frame.ckpt'), chdir: dir)
+      check("#{arch}: frame: version #{v} refuses it, naming the method",
+            st.exitstatus != 0 && out.empty? && err.include?('restore failed') &&
+            err.include?("'M:CkLib#wrap'") && err.include?('another version'), err)
+    end
+    out, err, st = Open3.capture3(lib.(1), NORMAL[arch], 'resume', File.join(dir, 'block.ckpt'), chdir: dir)
+    check("#{arch}: block: the same version resumes it", st.exitstatus == 0 && out == "2\n", err)
+    out, err, st = Open3.capture3(lib.(3), NORMAL[arch], 'resume', File.join(dir, 'block.ckpt'), chdir: dir)
+    check("#{arch}: block: another version whose names are all there runs the carried block",
+          st.exitstatus == 0 && out == "2\n", err)
+    out, err, st = Open3.capture3(lib.(2), NORMAL[arch], 'resume', File.join(dir, 'block.ckpt'), chdir: dir)
+    check("#{arch}: block: a version without what the block calls refuses it, naming the call",
+          st.exitstatus != 0 && out.empty? && err.include?('restore failed') && err.include?('_old_step') &&
+          !err.include?('undefined method'), err)
+  end
+  # the image of version 2 on version 1: step_raw is not there
+  _, err, st = Open3.capture3(lib.(2), NORMAL['64'], 'run', '--out', File.join(dir, 'block2.ckpt'), 'block.rb', chdir: dir)
+  out, err2, st2 = Open3.capture3(lib.(1), NORMAL['64'], 'resume', File.join(dir, 'block2.ckpt'), chdir: dir)
+  check('block: the newer image on the older version is refused too (step_raw)',
+        st.exitstatus == 0 && st2.exitstatus != 0 && out.empty? && err2.include?('step_raw'), err + err2)
+end
+
+part_done
+
 puts
 puts "inspect: #{$pass} passed, #{$fail} failed"
 exit($fail == 0 ? 0 : 1)

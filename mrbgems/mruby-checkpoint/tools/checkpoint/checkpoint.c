@@ -272,6 +272,40 @@ static const char fixture_rb[] =
   "end\n"
   "$ck_global = [['g']]\n";
 
+/* CHECKPOINT_FIXTURE_LIB=1, 2 or 3: a library method in three versions, the
+   way an embedder's mrblib changes between its builds (a wrapper that calls
+   what the library calls something else in the next version), for the test
+   of mrblib code of another version (tools/test_inspect.rb). 1 and 3 have
+   other code in CkLib#wrap and in the block of CkLib#make that calls the same
+   names; 2 renamed what they call. Without the variable the baseline has no
+   CkLib (the other tests are unchanged). */
+static const char *const fixture_lib_rb[] = {
+  "class CkLib\n"
+  "  def wrap(x)\n"
+  "    r = yield(x)\n"
+  "    _old_step(r)\n"
+  "  end\n"
+  "  def make = proc { _old_step(1) }\n"
+  "  def _old_step(x) = x + 1\n"
+  "end\n",
+  "class CkLib\n"
+  "  def wrap(x)\n"
+  "    r = yield(x)\n"
+  "    step_raw(r, 1)\n"
+  "  end\n"
+  "  def make = proc { step_raw(1, 1) }\n"
+  "  def step_raw(x, d) = x + d\n"
+  "end\n",
+  "class CkLib\n"
+  "  def wrap(x)\n"
+  "    r = yield(x)\n"
+  "    _old_step(r).to_i\n"
+  "  end\n"
+  "  def make = proc { _old_step(1).to_i }\n"
+  "  def _old_step(x) = x + 1\n"
+  "end\n",
+};
+
 static void
 load_fixture(mrb_state *mrb)
 {
@@ -280,6 +314,10 @@ load_fixture(mrb_state *mrb)
   if (getenv("CHECKPOINT_NO_FIXTURE")) return;
   mrb_checkpoint_open(mrb);   /* (Checkpoint::Box) */
   mrb_load_string(mrb, fixture_rb);
+  const char *lib = getenv("CHECKPOINT_FIXTURE_LIB");
+  if (!mrb->exc && lib && lib[0] >= '1' && lib[0] <= '3' && lib[1] == 0) {
+    mrb_load_string(mrb, fixture_lib_rb[lib[0] - '1']);
+  }
   if (mrb->exc) {
     mrb_print_error(mrb);
     exit(2);

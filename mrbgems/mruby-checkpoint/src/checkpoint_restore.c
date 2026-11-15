@@ -31,6 +31,8 @@
 #include <mruby/presym.h>
 #include <mruby/throw.h>
 #include <mruby/numeric.h>
+#include <mruby/opcode.h>
+#include <mruby/gc.h>
 #include "checkpoint_internal.h"
 #include "task.h"
 
@@ -73,6 +75,9 @@ typedef struct {
 
   mrb_sym *syms; uint32_t nsym;
   mrb_irep **ireps; uint8_t *irep_perm; uint32_t *irep_parents; uint32_t nirep;
+  /* the writer's mrblib ireps this build does not have, built from the
+     carried content (IREP_FOREIGN in irep_perm) */
+  uint32_t nforeign;
   struct RBasic **objs; uint8_t *okind; uint8_t *ofrozen; uint32_t nobj;
 
   hent *hents; size_t nhent, caphent;
@@ -88,6 +93,10 @@ typedef struct {
   rctx *ctxs; uint32_t nctx;
   rtask *tasks; uint32_t ntask;
 } reader;
+
+/* irep_perm: this build's own permanent irep, or a permanent irep of the
+   writer built here from its carried content */
+enum { IREP_OWN = 1, IREP_FOREIGN = 2 };
 
 static void
 rfail(reader *r, const char *fmt, ...)
@@ -262,7 +271,7 @@ r_ireps(reader *r)
       if (pi) {
         if (kind == GR_PERM_CARRIED) skip_irep_content(r);
         r->ireps[i] = (mrb_irep*)pi;
-        r->irep_perm[i] = 1;
+        r->irep_perm[i] = IREP_OWN;
         continue;
       }
       if (kind == GR_PERM) {
@@ -270,6 +279,10 @@ r_ireps(reader *r)
               (unsigned long long)hash);
         break;
       }
+      /* built below like a program's irep; checked before the restore ends
+         (check_foreign_sends) */
+      r->irep_perm[i] = IREP_FOREIGN;
+      r->nforeign++;
     }
     else if (kind != GR_CARRIED) {
       rfail(r, "bad irep kind %u (@%u)", kind, i + 1);
@@ -351,7 +364,7 @@ r_ireps(reader *r)
 
   /* link children */
   for (uint32_t i = 0; i < r->nirep && !r->failed; i++) {
-    if (r->irep_perm[i]) continue;
+    if (r->irep_perm[i] == IREP_OWN) continue;
     mrb_irep *irep = r->ireps[i];
     if (irep->rlen == 0) continue;
     const mrb_irep **reps = (const mrb_irep**)mrb_calloc(mrb, irep->rlen, sizeof(mrb_irep*));
@@ -361,7 +374,7 @@ r_ireps(reader *r)
       if (c > r->nirep) { rfail(r, "irep #%u out of range", c); break; }
       reps[k] = r->ireps[c - 1];
       /* a new irep starts with one reference: its first parent's */
-      if (r->irep_perm[c - 1] || r->irep_parents[c - 1]++ > 0) {
+      if (r->irep_perm[c - 1] == IREP_OWN || r->irep_parents[c - 1]++ > 0) {
         mrb_irep_incref(mrb, r->ireps[c - 1]);
       }
     }
@@ -370,7 +383,7 @@ r_ireps(reader *r)
 
   /* the content hash must match what the writer computed */
   for (uint32_t i = 0; i < r->nirep && !r->failed; i++) {
-    if (r->irep_perm[i]) continue;
+    if (r->irep_perm[i] == IREP_OWN) continue;
     uint64_t h = checkpoint_irep_hash(mrb, r->ireps[i]);
     if (h != hashes[i]) {
       rfail(r, "irep #%u content hash mismatch", i + 1);
@@ -524,7 +537,19 @@ r_object(reader *r, uint32_t id)
     uint32_t len; const uint8_t *name = r_str(r, &len);
     /* GK_PERM_BODY also names the irep the frames run; this reader binds the
        Proc by name and its frames use that Proc's own irep (the same build) */
-    if (kind == GK_PERM_BODY) r_u32(r);
+    if (kind == GK_PERM_BODY) {
+      uint32_t ir = r_u32(r);
+      /* The frames of this reader run the Proc it binds by name, at the
+         writer's pc: right only with the same code. A method of the writer's
+         mrblib that this build has in another version (another version of
+         the library) would run other code from that pc, so the image is
+         refused, naming the method. */
+      if (!r->fill && !r->failed && ir > 0 && ir <= r->nirep && r->irep_perm[ir - 1] == IREP_FOREIGN) {
+        rfail(r, "a frame is inside '%.*s' of the writer's mrblib, and this build has another "
+                 "version of that method (its code differs here)", (int)len, name);
+        return;
+      }
+    }
     if (!r->fill) {
       int is_func = 0;
       const void *p = checkpoint_perm_lookup(r->P, (const char*)name, len, &is_func);
@@ -1474,6 +1499,145 @@ r_vm(reader *r)
 }
 
 /* line numbers of carried ireps (section 13) */
+/* ---- the writer's mrblib run from the image ---- */
+
+/* A Proc made in a method of the writer's mrblib (a block of the library)
+   comes with that code (GR_PERM_CARRIED). When this build's mrblib has other
+   code there (another version of the library), the carried code runs here
+   as it was. It may call methods the writer's build had and this one does
+   not -- a library renames what its wrappers call -- and would then raise
+   NoMethodError some time after a successful restore, in code the program
+   did not write. The restore refuses such an image instead. (A frame inside
+   such a method is refused where its Proc is read, GK_PERM_BODY.)
+
+   The test is the one of SND0 (checkpoint_sends.c), by name: the names the
+   carried mrblib code sends (OP_SEND, OP_SEND0, OP_SENDB, OP_SSEND, OP_SSEND0,
+   OP_SSENDB, in the irep and its blocks) that no class or module of this
+   state defines once the image is in (this build's and the program's own).
+   Unlike SND0 it refuses: the program cannot prepare for a call it did not
+   write. The carried code that calls only names this build has still runs.
+   What a name-level test does not see is the same as for SND0 (a name another
+   class defines, super, operators the VM handles, send with a computed
+   name). */
+
+typedef struct {
+  mrb_sym *want; uint32_t nwant;   /* sorted, no repeats */
+  uint8_t *have;
+} foreign_walk;
+
+static int
+sym_index(const mrb_sym *s, uint32_t n, mrb_sym k)
+{
+  uint32_t lo = 0, hi = n;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    if (s[mid] == k) return (int)mid;
+    if (s[mid] < k) lo = mid + 1;
+    else hi = mid;
+  }
+  return -1;
+}
+
+static int
+cmp_sym_v(const void *a, const void *b)
+{
+  mrb_sym x = *(const mrb_sym*)a, y = *(const mrb_sym*)b;
+  return x < y ? -1 : x > y;
+}
+
+static int
+foreign_have_cb(mrb_state *mrb, struct RBasic *obj, void *ud)
+{
+  foreign_walk *w = (foreign_walk*)ud;
+  if (obj->tt != MRB_TT_CLASS && obj->tt != MRB_TT_MODULE && obj->tt != MRB_TT_SCLASS) {
+    return MRB_EACH_OBJ_OK;
+  }
+  gmt_entry *mt; int n;
+  checkpoint_collect_mt(mrb, (struct RClass*)obj, &mt, &n);
+  for (int i = 0; i < n; i++) {
+    if (!mt[i].ptr) continue;
+    int k = sym_index(w->want, w->nwant, mt[i].sym);
+    if (k >= 0) w->have[k] = 1;
+  }
+  checkpoint_collect_free(mrb, mt);
+  return MRB_EACH_OBJ_OK;
+}
+
+/* the send operands of an irep and its blocks */
+static uint32_t
+foreign_sends(reader *r, const mrb_irep *irep, mrb_sym **s, uint32_t n, uint32_t *cap, int depth)
+{
+  if (!irep || depth > 64) return n;
+  uint32_t pos = 0;
+  while (pos < irep->ilen) {
+    uint32_t end; uint8_t op; uint32_t a, b, c;
+    if (!checkpoint_insn_at(irep, pos, &end, &op, &a, &b, &c)) break;
+    pos = end;
+    switch (op) {
+    case OP_SEND: case OP_SEND0: case OP_SENDB:
+    case OP_SSEND: case OP_SSEND0: case OP_SSENDB:
+      break;
+    default:
+      continue;
+    }
+    if (!irep->syms || b >= irep->slen) continue;
+    if (n == *cap) {
+      *cap = *cap ? *cap * 2 : 32;
+      *s = (mrb_sym*)ck_realloc(r->G, *s, sizeof(mrb_sym) * *cap);
+    }
+    (*s)[n++] = irep->syms[b];
+  }
+  for (int i = 0; irep->reps && i < irep->rlen; i++) n = foreign_sends(r, irep->reps[i], s, n, cap, depth + 1);
+  return n;
+}
+
+static void
+check_foreign_sends(reader *r)
+{
+  if (r->nforeign == 0) return;
+  mrb_state *mrb = r->mrb;
+  mrb_sym *want = NULL; uint32_t nwant = 0, cap = 0;
+  for (uint32_t i = 0; i < r->nirep; i++) {
+    if (r->irep_perm[i] == IREP_FOREIGN) nwant = foreign_sends(r, r->ireps[i], &want, nwant, &cap, 0);
+  }
+  if (nwant == 0) { ck_free(r->G, want); return; }
+  qsort(want, nwant, sizeof(mrb_sym), cmp_sym_v);
+  uint32_t k = 1;
+  for (uint32_t i = 1; i < nwant; i++) if (want[i] != want[k - 1]) want[k++] = want[i];
+  nwant = k;
+
+  foreign_walk w;
+  w.want = want; w.nwant = nwant;
+  w.have = (uint8_t*)ck_calloc(r->G, nwant, 1);
+  mrb_objspace_each_objects(mrb, foreign_have_cb, &w);   /* (the GC is off here) */
+
+  /* the first carried method (by its name) that calls a name nobody has */
+  for (uint32_t i = 0; i < r->nirep && !r->failed; i++) {
+    if (r->irep_perm[i] != IREP_FOREIGN) continue;
+    mrb_sym *s = NULL; uint32_t sc = 0;
+    uint32_t ns = foreign_sends(r, r->ireps[i], &s, 0, &sc, 0);
+    char names[200]; size_t nl = 0; uint32_t nmiss = 0;
+    names[0] = 0;
+    for (uint32_t j = 0; j < ns; j++) {
+      int x = sym_index(want, nwant, s[j]);
+      if (x < 0 || w.have[x] != 0) continue;
+      w.have[x] = 2;   /* named once */
+      mrb_int l; const char *nm = mrb_sym_name_len(mrb, s[j], &l);
+      if (nl + (size_t)l + 3 < sizeof(names)) {
+        nl += (size_t)snprintf(names + nl, sizeof(names) - nl, "%s%.*s", nmiss ? ", " : "", (int)l, nm);
+      }
+      nmiss++;
+    }
+    ck_free(r->G, s);
+    if (nmiss == 0) continue;
+    rfail(r, "the image carries a block of the writer's mrblib (irep #%u) that this build has in "
+             "another version, and that block calls %s, which no class of this build defines",
+          i + 1, names);
+  }
+  ck_free(r->G, w.have);
+  ck_free(r->G, want);
+}
+
 static void
 r_debug(reader *r)
 {
@@ -1484,7 +1648,7 @@ r_debug(reader *r)
     uint16_t nf = r_u16(r);
     if (id == 0 || id > r->nirep) { rfail(r, "debug info for irep #%u out of range", id); return; }
     mrb_irep *irep = r->ireps[id - 1];
-    int use = !r->irep_perm[id - 1] && !irep->debug_info;
+    int use = r->irep_perm[id - 1] != IREP_OWN && !irep->debug_info;
     uint16_t *lines = NULL;
     mrb_irep_debug_info *di = NULL;
     if (use) {
@@ -1606,7 +1770,7 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
        a root irep (no parent here) the Procs now hold it, so drop that one
        (a root no Proc holds is not used: it goes) */
     for (uint32_t i = 0; i < r.nirep; i++) {
-      if (!r.irep_perm[i] && r.irep_parents[i] == 0) mrb_irep_decref(mrb, r.ireps[i]);
+      if (r.irep_perm[i] != IREP_OWN && r.irep_parents[i] == 0) mrb_irep_decref(mrb, r.ireps[i]);
     }
     r.roots_done = 1;
   }
@@ -1718,6 +1882,8 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
   }
   if (!r.failed && !has_end) rfail(&r, "truncated image (no end mark)");
   if (!r.failed && r.p != r.end) rfail(&r, "%d bytes left after the image", (int)(r.end - r.p));
+  /* the writer's mrblib code that runs here must find what it calls */
+  if (!r.failed) check_foreign_sends(&r);
 
 #ifndef MRB_NO_METHOD_CACHE
   memset(mrb->cache, 0, sizeof(mrb->cache));
@@ -1790,7 +1956,7 @@ mrb_checkpoint_restore(mrb_state *mrb, const uint8_t *buf, size_t len)
   if (r.failed) {
     /* the root ireps' own reference (their Procs, now garbage, hold the rest) */
     for (uint32_t i = 0; !r.roots_done && r.ireps && i < r.nirep; i++) {
-      if (!r.ireps[i] || r.irep_perm[i] || r.irep_parents[i] != 0) continue;
+      if (!r.ireps[i] || r.irep_perm[i] == IREP_OWN || r.irep_parents[i] != 0) continue;
       mrb_irep_decref(mrb, r.ireps[i]);
     }
     /* leave the root context idle again */

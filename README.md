@@ -52,6 +52,10 @@ Run a program through the driver, `build/mruby/host/bin/checkpoint run prog.rb`.
   restored side continues the context that was running (a Fiber, or a Task and the scheduler).
 - `checkpoint run --as-task prog.rb` starts the program the way Family mruby starts an
   app (its body as a Task, then `mrb_task_run`).
+- Between builds whose mrblib differs (another version of a library), a restore refuses an
+  image that stops inside a library method whose code differs on the reader, and an image
+  whose carried library blocks call a method name the reader's build does not define
+  (`doc/format_v1.md` 6.2 and 7). Otherwise library code is bound by name and runs.
 - `Checkpoint.save("x.ckpt", source: true)` (and `suspend`) also puts the program's source
   into the image, as an optional section (`SRC0`) for display only: the inspector shows the
   lines around each frame. `checkpoint run --with-source` makes that the default for calls

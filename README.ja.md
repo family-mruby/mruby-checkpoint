@@ -62,6 +62,9 @@ rake fuzz:sabiruby[seed,points]   # その一部を SabiRuby で続ける
     コンテキスト (Fiber、または Task とスケジューラ) から。
   - `checkpoint run --as-task prog.rb` は、Family mruby のアプリと同じ起動の形 (プログラムの
     本体を Task にして `mrb_task_run`) で動かす。
+  - mrblib の違うビルドの間 (ライブラリの別の版) では、読み手で中身の違うライブラリのメソッドの中で
+    止まったイメージと、運んだライブラリのブロックが読み手のビルドに無いメソッド名を呼ぶイメージを、
+    復元の時に断る (`doc/format_v1.md` の 6.2 と 7)。それ以外のライブラリのコードは名前で結んで動かす。
   - `Checkpoint.save("x.ckpt", source: true)` (`suspend` も同じ) は、プログラムのソースもイメージに
     入れる (任意のセクション `SRC0`。表示用で、実行には使わない。インスペクタが各フレームの行の前後を出す)。
     `checkpoint run --with-source` は、`source:` を書かない呼び出しの既定を「入れる」にする。既定は入れない。
